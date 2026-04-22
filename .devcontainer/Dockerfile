@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     htop \
     tmux \
     nano \
+    xvfb \
+    x11-utils \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 
 ARG PIXI_VERSION=v0.66.0
