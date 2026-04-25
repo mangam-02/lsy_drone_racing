@@ -19,3 +19,43 @@ c_generated_code/
 !.pixi/config.toml
 ros_ws/
 acados/
+
+# Python virtual environments (local development)
+venv_drone/
+venv/
+env/
+.env
+ENV/
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+
+# IDE and Editor files
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+*.code-workspace
+
+# pytest and testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Built files
+*.pyc
+*.pyo
+dist/
+build/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS files
+Thumbs.db
