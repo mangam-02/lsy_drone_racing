@@ -1,24 +1,17 @@
-"""This module implements an example MPC using attitude control for a quadrotor.
+"""RL controller trained with train_race_rl_level2.py."""
 
-It utilizes the collective thrust interface for drone control to compute control commands based on
-current state observations and desired waypoints.
+from __future__ import annotations
 
-The waypoints are generated using cubic spline interpolation from a set of predefined waypoints.
-Note that the trajectory uses pre-defined waypoints instead of dynamically generating a good path.
-"""
-
-from __future__ import annotations  # Python 3.10 type hints
-
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import scipy
-from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+import torch
+import torch.nn as nn
+from torch import Tensor
+from torch.distributions.normal import Normal
+
 from drone_models.core import load_params
-from drone_models.so_rpy import symbolic_dynamics_euler
-from drone_models.utils.rotation import ang_vel2rpy_rates
-from scipy.interpolate import CubicSpline
-from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 
@@ -26,261 +19,170 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def create_acados_model(parameters: dict) -> AcadosModel:
-    """Creates an acados model from a symbolic drone_model."""
-    # For more info on the models, check out https://github.com/utiasDSL/drone-models
-    X_dot, X, U, _ = symbolic_dynamics_euler(
-        mass=parameters["mass"],
-        gravity_vec=parameters["gravity_vec"],
-        J=parameters["J"],
-        J_inv=parameters["J_inv"],
-        acc_coef=parameters["acc_coef"],
-        cmd_f_coef=parameters["cmd_f_coef"],
-        rpy_coef=parameters["rpy_coef"],
-        rpy_rates_coef=parameters["rpy_rates_coef"],
-        cmd_rpy_coef=parameters["cmd_rpy_coef"],
-    )
-
-    # Initialize the nonlinear model for NMPC formulation
-    model = AcadosModel()
-    model.name = "basic_example_mpc"
-    model.f_expl_expr = X_dot
-    model.f_impl_expr = None
-    model.x = X
-    model.u = U
-
-    return model
+def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Module:
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
 
 
-def create_ocp_solver(
-    Tf: float, N: int, parameters: dict, verbose: bool = False
-) -> tuple[AcadosOcpSolver, AcadosOcp]:
-    """Creates an acados Optimal Control Problem and Solver."""
-    ocp = AcadosOcp()
+class Agent(nn.Module):
+    def __init__(self, obs_shape: tuple[int, ...], action_shape: tuple[int, ...]):
+        super().__init__()
 
-    # Set model
-    ocp.model = create_acados_model(parameters)
+        obs_dim = int(np.prod(obs_shape))
+        action_dim = int(np.prod(action_shape))
 
-    # Get Dimensions
-    nx = ocp.model.x.rows()
-    nu = ocp.model.u.rows()
-    ny = nx + nu
-    ny_e = nx
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 1), std=1.0),
+        )
 
-    # Set dimensions
-    ocp.solver_options.N_horizon = N
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, action_dim), std=0.01),
+            nn.Tanh(),
+        )
 
-    ## Set Cost
-    # For more Information regarding Cost Function Definition in Acados:
-    # https://github.com/acados/acados/blob/main/docs/problem_formulation/problem_formulation_ocp_mex.pdf
-    #
+        self.actor_logstd = nn.Parameter(
+            torch.tensor([[-1.0, -1.0, -2.0, 0.5]], dtype=torch.float32)
+        )
 
-    # Cost Type
-    ocp.cost.cost_type = "LINEAR_LS"
-    ocp.cost.cost_type_e = "LINEAR_LS"
+    def get_value(self, x: Tensor) -> Tensor:
+        return self.critic(x)
 
-    # Weights
-    # State weights
-    Q = np.diag(
-        [
-            50.0,  # pos
-            50.0,  # pos
-            400.0,  # pos
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
-            10.0,  # vel
-            10.0,  # vel
-            10.0,  # vel
-            5.0,  # drpy
-            5.0,  # drpy
-            5.0,  # drpy
-        ]
-    )
-    # Input weights (reference is upright orientation and hover thrust)
-    R = np.diag(
-        [
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
-            50.0,  # thrust
-        ]
-    )
+    def get_action_and_value(
+        self,
+        x: Tensor,
+        action: Tensor | None = None,
+        deterministic: bool = False,
+    ):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
 
-    Q_e = Q.copy()
-    ocp.cost.W = scipy.linalg.block_diag(Q, R)
-    ocp.cost.W_e = Q_e
+        if action is None:
+            action = action_mean if deterministic else probs.sample()
 
-    Vx = np.zeros((ny, nx))
-    Vx[0:nx, 0:nx] = np.eye(nx)  # Select all states
-    ocp.cost.Vx = Vx
-
-    Vu = np.zeros((ny, nu))
-    Vu[nx : nx + nu, :] = np.eye(nu)  # Select all actions
-    ocp.cost.Vu = Vu
-
-    Vx_e = np.zeros((ny_e, nx))
-    Vx_e[0:nx, 0:nx] = np.eye(nx)  # Select all states
-    ocp.cost.Vx_e = Vx_e
-
-    # Set initial references. We will overwrite these later to track the trajectory
-    ocp.cost.yref, ocp.cost.yref_e = np.zeros((ny,)), np.zeros((ny_e,))
-
-    # Set State Constraints (rpy < 30°)
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5])
-    ocp.constraints.idxbx = np.array([3, 4, 5])
-
-    # Set Input Constraints (rpy < 30°)
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
-    ocp.constraints.idxbu = np.array([0, 1, 2, 3])
-
-    # We have to set x0 even though we will overwrite it later on.
-    ocp.constraints.x0 = np.zeros((nx))
-
-    # Solver Options
-    ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"  # FULL_, PARTIAL_ ,_HPIPM, _QPOASES
-    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
-    ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.nlp_solver_type = "SQP"  # SQP, SQP_RTI
-    ocp.solver_options.tol = 1e-6
-
-    ocp.solver_options.qp_solver_cond_N = N
-    ocp.solver_options.qp_solver_warm_start = 1
-
-    ocp.solver_options.qp_solver_iter_max = 20
-    ocp.solver_options.nlp_solver_max_iter = 50
-
-    # set prediction horizon
-    ocp.solver_options.tf = Tf
-
-    acados_ocp_solver = AcadosOcpSolver(
-        ocp,
-        json_file="c_generated_code/lsy_example_mpc.json",
-        verbose=verbose,
-        build=True,
-        generate=True,
-    )
-
-    return acados_ocp_solver, ocp
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
 
-class AttitudeMPC(Controller):
-    """Example of a MPC using the collective thrust and attitude interface."""
+class AttitudeRL(Controller):
+    """Controller for policies trained with train_race_rl_level2.py."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
-        """Initialize the attitude controller.
-
-        Args:
-            obs: The initial observation of the environment's state. See the environment's
-                observation space for details.
-            info: Additional environment information from the reset.
-            config: The configuration of the environment.
-        """
         super().__init__(obs, info, config)
-        self._N = 25
-        self._dt = 1 / config.env.freq
-        self._T_HORIZON = self._N * self._dt
 
-        # Same waypoints as in the trajectory controller. Determined by trial and error.
-        waypoints = np.array(
-            [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
-        )
-        self._t_total = 15  # s
-        t = np.linspace(0, self._t_total, len(waypoints))
-        self._des_pos_spline = CubicSpline(t, waypoints)
-        self._des_vel_spline = self._des_pos_spline.derivative()
-        self._waypoints_pos = self._des_pos_spline(
-            np.linspace(0, self._t_total, int(config.env.freq * self._t_total))
-        )
-        self._waypoints_vel = self._des_vel_spline(
-            np.linspace(0, self._t_total, int(config.env.freq * self._t_total))
-        )
-#        self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
-# yaw looks in flight-direction and is not just 0
-        vel_xy = self._waypoints_vel[:, :2]
-        self._waypoints_yaw = np.arctan2(vel_xy[:, 1], vel_xy[:, 0])  
+        drone_params = load_params(config.sim.physics, config.sim.drone_model)
+        self.drone_mass = drone_params["mass"]
+        self.thrust_min = drone_params["thrust_min"] * 4
+        self.thrust_max = drone_params["thrust_max"] * 4
+        self.hover_thrust = self.drone_mass * 9.81
+        self.takeoff_steps = int(0.35 * config.env.freq)
 
-        self.drone_params = load_params("so_rpy", config.sim.drone_model)
-        self._acados_ocp_solver, self._ocp = create_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params
-        )
-        self._nx = self._ocp.model.x.rows()
-        self._nu = self._ocp.model.u.rows()
-        self._ny = self._nx + self._nu
-        self._ny_e = self._nx
-
-        self._tick = 0
-        self._tick_max = len(self._waypoints_pos) - 1 - self._N
-        self._config = config
         self._finished = False
+        self._tick = 0
+
+        obs_vec = self._flatten_obs(obs)
+        obs_dim = obs_vec.shape[0]
+
+        self.agent = Agent((obs_dim,), (4,)).to("cpu")
+
+        model_path = Path(__file__).parent / "ppo_race_level2.ckpt"
+        self.agent.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+        self.agent.eval()
 
     def compute_control(
-        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
+        self,
+        obs: dict[str, NDArray[np.floating]],
+        info: dict | None = None,
     ) -> NDArray[np.floating]:
-        """Compute the next desired collective thrust and roll/pitch/yaw of the drone.
 
-        Args:
-            obs: The current observation of the environment. See the environment's observation space
-                for details.
-            info: Optional additional information as a dictionary.
+        # Takeoff guard: first second, go straight up with zero attitude.
+        if self._tick < self.takeoff_steps:
+            return np.array(
+                [
+                    0.0,                         # roll
+                    0.0,                         # pitch
+                    0.0,                         # yaw
+                    1.25 * self.hover_thrust,    # thrust
+                ],
+                dtype=np.float32,
+            )
 
-        Returns:
-            The orientation as roll, pitch, yaw angles, and the collective thrust
-            [r_des, p_des, y_des, t_des] as a numpy array.
+        obs_vec = self._flatten_obs(obs)
+        obs_tensor = torch.tensor(obs_vec, dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            action, _, _, _ = self.agent.get_action_and_value(obs_tensor, deterministic=True)
+
+        action_np = action.squeeze(0).numpy().astype(np.float32)
+
+        # yaw is not needed
+        action_np[2] = 0.0
+
+        action_scaled = self._scale_actions(action_np).astype(np.float32)
+        action_scaled[2] = 0.0
+
+        return action_scaled
+
+    def _scale_actions(self, actions: NDArray) -> NDArray:
+        """Rescale actions from [-1, 1] to conservative attitude/thrust commands."""
+
+        max_roll_pitch = 0.35  # rad, about 20 degrees
+        max_yaw = 0.0
+
+        scale = np.array(
+            [
+                max_roll_pitch,
+                max_roll_pitch,
+                max_yaw,
+                0.35 * self.hover_thrust,
+            ],
+            dtype=np.float32,
+        )
+
+        mean = np.array(
+            [
+                0.0,
+                0.0,
+                0.0,
+                1.05 * self.hover_thrust,
+            ],
+            dtype=np.float32,
+        )
+
+        action = np.clip(actions, -1.0, 1.0) * scale + mean
+
+        action[3] = np.clip(action[3], self.thrust_min, self.thrust_max)
+
+        return action
+
+    def _flatten_obs(self, obs: dict[str, NDArray[np.floating]]) -> NDArray[np.float32]:
+        """Flatten dict observation exactly like train_race_rl_level2.py.
+
+        Important: this relies on the same obs dict insertion order as VecDroneRaceEnv.
         """
-        i = min(self._tick, self._tick_max)
-        if self._tick >= self._tick_max:
-            self._finished = True
 
-        # Setting initial state
-        obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
-        obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        x0 = np.concatenate((obs["pos"], obs["rpy"], obs["vel"], obs["drpy"]))
-        self._acados_ocp_solver.set(0, "lbx", x0)
-        self._acados_ocp_solver.set(0, "ubx", x0)
+        parts = []
 
-        # Setting state reference
-        yref = np.zeros((self._N, self._ny))
-        yref[:, 0:3] = self._waypoints_pos[i : i + self._N]  # position
-        # zero roll, pitch
-        yref[:, 5] = self._waypoints_yaw[i : i + self._N]  # yaw
-        yref[:, 6:9] = self._waypoints_vel[i : i + self._N]  # velocity
-        # zero drpy
+        for value in obs.values():
+            arr = np.asarray(value)
 
-        # Setting input reference (index > self._nx)
-        # zero rpy
-        # hover thrust
-        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
-        for j in range(self._N):
-            self._acados_ocp_solver.set(j, "yref", yref[j])
+            # Single env: no batch dimension.
+            arr = arr.reshape(-1)
+            parts.append(arr)
 
-        # Setting final state reference
-        yref_e = np.zeros((self._ny_e))
-        yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
-        # zero roll, pitch
-        yref_e[5] = self._waypoints_yaw[i + self._N]  # yaw
-        yref_e[6:9] = self._waypoints_vel[i + self._N]  # velocity
-        # zero drpy
-        self._acados_ocp_solver.set(self._N, "y_ref", yref_e)
+        flat = np.concatenate(parts, axis=-1).astype(np.float32)
+        flat = np.nan_to_num(flat, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # Solving problem and getting first input
-        self._acados_ocp_solver.solve()
-        u0 = self._acados_ocp_solver.get(0, "u")
-
-        return u0
+        return flat
 
     def step_callback(
         self,
@@ -291,11 +193,14 @@ class AttitudeMPC(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Increment the tick counter."""
         self._tick += 1
+
+        # Stop if race env says all gates are done
+        if "target_gate" in obs and int(obs["target_gate"]) == -1:
+            self._finished = True
 
         return self._finished
 
     def episode_callback(self):
-        """Reset the integral error."""
         self._tick = 0
+        self._finished = False
