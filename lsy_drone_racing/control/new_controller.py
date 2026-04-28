@@ -280,7 +280,7 @@ class NewController(Controller):
             before_gate, after_gate = self._gate_direction_points(gate_pos[2], gate_angles[2])
             checkpoints = [
                 gate_pos[1],
-                np.array([0.8, 1, 1]),
+                np.array([0.7, 0.95, 1]),
                 np.array([0.2, 0.4, 1]),
                 before_gate,
                 gate_pos[2],
@@ -291,7 +291,7 @@ class NewController(Controller):
             before_gate, after_gate = self._gate_direction_points(gate_pos[3], gate_angles[3])
             checkpoints = [
                 gate_pos[2],
-                np.array([-0.6, -0.5, 1]),
+                np.array([-0.6, -0.5, 0.8]),
                 #before_gate,
                 gate_pos[3],
                 after_gate,
