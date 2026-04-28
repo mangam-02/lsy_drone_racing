@@ -7,7 +7,7 @@ on:
       - main
   workflow_dispatch:
 
-jobs:pixi lock --environment tests
+jobs:
   online-competition:
     # Skip this job if running on the main repo to prevent failing CI/CD. Only run on student forks.
     if: ${{ github.repository != 'utiasDSL/lsy_drone_racing' }}
