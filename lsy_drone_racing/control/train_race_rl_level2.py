@@ -1,3 +1,4 @@
+# ruff: noqa
 """PPO training on the real Level-2 vectorized drone racing environment.
 
 This script trains directly on VecDroneRaceEnv instead of a random spline-following DroneEnv.
@@ -20,21 +21,20 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import jax
 
 import fire
 import gymnasium as gym
+import jax
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from gymnasium.spaces import flatten_space
+from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from gymnasium.vector import VectorEnv, VectorObservationWrapper, VectorRewardWrapper
 from gymnasium.wrappers.vector.jax_to_torch import JaxToTorch
 from torch import Tensor
 from torch.distributions.normal import Normal
 
-from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
 from lsy_drone_racing.utils import load_config
 
@@ -121,17 +121,11 @@ class FlattenDictObservation(VectorObservationWrapper):
                 flat_dim += int(np.prod(space.shape))
 
         self.single_observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(flat_dim,),
-            dtype=np.float32,
+            low=-np.inf, high=np.inf, shape=(flat_dim,), dtype=np.float32
         )
 
         self.observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.num_envs, flat_dim),
-            dtype=np.float32,
+            low=-np.inf, high=np.inf, shape=(self.num_envs, flat_dim), dtype=np.float32
         )
 
     def observations(self, obs: dict[str, Any]) -> np.ndarray:
@@ -176,7 +170,9 @@ class RaceRewardShaping(VectorRewardWrapper):
         self.gate_safe_margin = gate_safe_margin
         self.gate_edge_coef = gate_edge_coef
         self.action_smooth_coef = action_smooth_coef
-        self._last_action = np.zeros((self.num_envs, self.single_action_space.shape[0]), dtype=np.float32)
+        self._last_action = np.zeros(
+            (self.num_envs, self.single_action_space.shape[0]), dtype=np.float32
+        )
         self._last_obs: dict[str, Any] | None = None
         self._current_action: np.ndarray | None = None
 
@@ -192,7 +188,7 @@ class RaceRewardShaping(VectorRewardWrapper):
         self._last_gate_dist = self._compute_gate_distance(obs)
 
         return obs, info
-    
+
     def _compute_gate_distance(self, obs: dict[str, Any]) -> np.ndarray:
         """Compute distance from drone to current target gate center."""
         pos = _as_np(obs["pos"]).astype(np.float32)
@@ -256,7 +252,7 @@ class RaceRewardShaping(VectorRewardWrapper):
         # ------------------------------------------------------------
         target_height = 0.8
         height_error = pos[:, 2] - target_height
-        reward_np -= 4.0 * (height_error ** 2)
+        reward_np -= 4.0 * (height_error**2)
 
         # Strong penalty for being near/on the ground
         ground_penalty = np.where(pos[:, 2] < 0.25, (0.25 - pos[:, 2]) ** 2, 0.0)
@@ -303,7 +299,11 @@ class RaceRewardShaping(VectorRewardWrapper):
 
             # Only apply near the gate, otherwise this can punish normal approach.
             near_gate_plane = np.abs(gate_rel[:, 0]) < 0.5
-            reward_np -= self.gate_edge_coef * edge_penalty.astype(np.float32) * near_gate_plane.astype(np.float32)
+            reward_np -= (
+                self.gate_edge_coef
+                * edge_penalty.astype(np.float32)
+                * near_gate_plane.astype(np.float32)
+            )
         except Exception:
             pass
 
@@ -397,20 +397,18 @@ class Agent(nn.Module):
         # Bias thrust output slightly upward at initialization.
 
         with torch.no_grad():
-
             self.actor_mean[-2].bias[3] = 0.25
 
         # roll, pitch, yaw, thrust std in normalized action space
-        self.actor_logstd = nn.Parameter(torch.tensor([[-3.0, -3.0, -4.0, -2.0]], dtype=torch.float32))
+        self.actor_logstd = nn.Parameter(
+            torch.tensor([[-3.0, -3.0, -4.0, -2.0]], dtype=torch.float32)
+        )
 
     def get_value(self, x: Tensor) -> Tensor:
         return self.critic(x)
 
     def get_action_and_value(
-        self,
-        x: Tensor,
-        action: Tensor | None = None,
-        deterministic: bool = False,
+        self, x: Tensor, action: Tensor | None = None, deterministic: bool = False
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
@@ -428,17 +426,25 @@ def train_ppo(args: Args, model_path: Path, device: torch.device) -> list[float]
 
     print(f"Training on device: {device} | Environment device: {args.device_env}")
     print(f"Training config: {args.config}")
-    print(f"num_envs={args.num_envs}, num_steps={args.num_steps}, total_timesteps={args.total_timesteps}")
+    print(
+        f"num_envs={args.num_envs}, num_steps={args.num_steps}, total_timesteps={args.total_timesteps}"
+    )
 
     envs = make_envs(args, torch_device=device)
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "Only continuous action spaces supported."
+    assert isinstance(envs.single_action_space, gym.spaces.Box), (
+        "Only continuous action spaces supported."
+    )
 
     agent = Agent(envs.single_observation_space.shape, envs.single_action_space.shape).to(device)
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device)
+    obs = torch.zeros(
+        (args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device
+    )
+    actions = torch.zeros(
+        (args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device
+    )
     logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
     rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
@@ -448,7 +454,11 @@ def train_ppo(args: Args, model_path: Path, device: torch.device) -> list[float]
     start_train = time.time()
 
     next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = next_obs.to(device).float() if isinstance(next_obs, torch.Tensor) else torch.tensor(next_obs, dtype=torch.float32, device=device)
+    next_obs = (
+        next_obs.to(device).float()
+        if isinstance(next_obs, torch.Tensor)
+        else torch.tensor(next_obs, dtype=torch.float32, device=device)
+    )
     next_done = torch.zeros(args.num_envs, device=device)
 
     episode_rewards = torch.zeros(args.num_envs, device=device)
@@ -476,10 +486,26 @@ def train_ppo(args: Args, model_path: Path, device: torch.device) -> list[float]
 
             next_obs, reward, terminated, truncated, info = envs.step(action)
 
-            next_obs = next_obs.to(device).float() if isinstance(next_obs, torch.Tensor) else torch.tensor(next_obs, dtype=torch.float32, device=device)
-            reward = reward.to(device).float() if isinstance(reward, torch.Tensor) else torch.tensor(reward, dtype=torch.float32, device=device)
-            terminated = terminated.to(device) if isinstance(terminated, torch.Tensor) else torch.tensor(terminated, device=device)
-            truncated = truncated.to(device) if isinstance(truncated, torch.Tensor) else torch.tensor(truncated, device=device)
+            next_obs = (
+                next_obs.to(device).float()
+                if isinstance(next_obs, torch.Tensor)
+                else torch.tensor(next_obs, dtype=torch.float32, device=device)
+            )
+            reward = (
+                reward.to(device).float()
+                if isinstance(reward, torch.Tensor)
+                else torch.tensor(reward, dtype=torch.float32, device=device)
+            )
+            terminated = (
+                terminated.to(device)
+                if isinstance(terminated, torch.Tensor)
+                else torch.tensor(terminated, device=device)
+            )
+            truncated = (
+                truncated.to(device)
+                if isinstance(truncated, torch.Tensor)
+                else torch.tensor(truncated, device=device)
+            )
 
             next_done = (terminated | truncated).float()
             rewards[step] = reward
@@ -489,7 +515,9 @@ def train_ppo(args: Args, model_path: Path, device: torch.device) -> list[float]
             done_mask = next_done.bool()
             if done_mask.any():
                 finished_rewards = episode_rewards[done_mask]
-                episode_reward_hist.extend([float(x) for x in finished_rewards.detach().cpu().tolist()])
+                episode_reward_hist.extend(
+                    [float(x) for x in finished_rewards.detach().cpu().tolist()]
+                )
                 episode_rewards[done_mask] = 0.0
 
         with torch.no_grad():
@@ -530,8 +558,7 @@ def train_ppo(args: Args, model_path: Path, device: torch.device) -> list[float]
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds],
-                    b_actions[mb_inds],
+                    b_obs[mb_inds], b_actions[mb_inds]
                 )
 
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -549,16 +576,16 @@ def train_ppo(args: Args, model_path: Path, device: torch.device) -> list[float]
                     )
 
                 pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
+                        newvalue - b_values[mb_inds], -args.clip_coef, args.clip_coef
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
@@ -617,7 +644,11 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[list[float]
     with torch.no_grad():
         for ep in range(n_eval):
             obs, _ = env.reset(seed=args.seed + ep + 123)
-            obs = obs.float() if isinstance(obs, torch.Tensor) else torch.tensor(obs, dtype=torch.float32)
+            obs = (
+                obs.float()
+                if isinstance(obs, torch.Tensor)
+                else torch.tensor(obs, dtype=torch.float32)
+            )
 
             done = torch.zeros(1, dtype=torch.bool)
             ep_reward = 0.0
@@ -626,10 +657,16 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[list[float]
             while not done.any():
                 action, _, _, _ = agent.get_action_and_value(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = env.step(action)
-                obs = obs.float() if isinstance(obs, torch.Tensor) else torch.tensor(obs, dtype=torch.float32)
+                obs = (
+                    obs.float()
+                    if isinstance(obs, torch.Tensor)
+                    else torch.tensor(obs, dtype=torch.float32)
+                )
 
                 done = terminated | truncated
-                ep_reward += float(reward[0].item() if isinstance(reward, torch.Tensor) else reward[0])
+                ep_reward += float(
+                    reward[0].item() if isinstance(reward, torch.Tensor) else reward[0]
+                )
                 ep_len += 1
 
                 try:
@@ -646,11 +683,7 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[list[float]
     return rewards_out, lengths_out
 
 
-def main(
-    train: bool = True,
-    eval: int = 3,
-    **kwargs: Any,
-) -> None:
+def main(train: bool = True, eval: int = 3, **kwargs: Any) -> None:
     args = Args.create(**kwargs)
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     model_path = Path(__file__).parent / "ppo_race_level2.ckpt"

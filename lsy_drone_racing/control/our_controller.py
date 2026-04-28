@@ -1,3 +1,4 @@
+# ruff: noqa
 """RL controller trained with train_race_rl_level2.py."""
 
 from __future__ import annotations
@@ -8,10 +9,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
+from drone_models.core import load_params
 from torch import Tensor
 from torch.distributions.normal import Normal
-
-from drone_models.core import load_params
 
 from lsy_drone_racing.control import Controller
 
@@ -57,10 +57,7 @@ class Agent(nn.Module):
         return self.critic(x)
 
     def get_action_and_value(
-        self,
-        x: Tensor,
-        action: Tensor | None = None,
-        deterministic: bool = False,
+        self, x: Tensor, action: Tensor | None = None, deterministic: bool = False
     ):
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
@@ -99,19 +96,17 @@ class AttitudeRL(Controller):
         self.agent.eval()
 
     def compute_control(
-        self,
-        obs: dict[str, NDArray[np.floating]],
-        info: dict | None = None,
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
 
         # Takeoff guard: first second, go straight up with zero attitude.
         if self._tick < self.takeoff_steps:
             return np.array(
                 [
-                    0.0,                         # roll
-                    0.0,                         # pitch
-                    0.0,                         # yaw
-                    1.25 * self.hover_thrust,    # thrust
+                    0.0,  # roll
+                    0.0,  # pitch
+                    0.0,  # yaw
+                    1.25 * self.hover_thrust,  # thrust
                 ],
                 dtype=np.float32,
             )
@@ -134,29 +129,14 @@ class AttitudeRL(Controller):
 
     def _scale_actions(self, actions: NDArray) -> NDArray:
         """Rescale actions from [-1, 1] to conservative attitude/thrust commands."""
-
         max_roll_pitch = 0.35  # rad, about 20 degrees
         max_yaw = 0.0
 
         scale = np.array(
-            [
-                max_roll_pitch,
-                max_roll_pitch,
-                max_yaw,
-                0.35 * self.hover_thrust,
-            ],
-            dtype=np.float32,
+            [max_roll_pitch, max_roll_pitch, max_yaw, 0.35 * self.hover_thrust], dtype=np.float32
         )
 
-        mean = np.array(
-            [
-                0.0,
-                0.0,
-                0.0,
-                1.05 * self.hover_thrust,
-            ],
-            dtype=np.float32,
-        )
+        mean = np.array([0.0, 0.0, 0.0, 1.05 * self.hover_thrust], dtype=np.float32)
 
         action = np.clip(actions, -1.0, 1.0) * scale + mean
 
@@ -169,7 +149,6 @@ class AttitudeRL(Controller):
 
         Important: this relies on the same obs dict insertion order as VecDroneRaceEnv.
         """
-
         parts = []
 
         for value in obs.values():

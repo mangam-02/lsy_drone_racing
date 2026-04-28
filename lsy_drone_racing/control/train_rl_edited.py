@@ -1,3 +1,4 @@
+# ruff: noqa
 """A naive RL pipeline for drone racing."""
 
 import random
@@ -14,7 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from crazyflow.envs.drone_env import DroneEnv
 from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from crazyflow.sim.data import SimData
@@ -33,10 +33,9 @@ from scipy.interpolate import CubicSpline
 from torch import Tensor
 from torch.distributions.normal import Normal
 
+import wandb
 from lsy_drone_racing.envs.race_core import build_dynamics_disturbance_fn, rng_spec2fn
 from lsy_drone_racing.utils import load_config
-
-from jax.scipy.spatial.transform import Rotation as R
 
 
 # region Arguments
@@ -58,17 +57,17 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
-    #total_timesteps: int = 1_500_000
+    # total_timesteps: int = 1_500_000
     total_timesteps: int = 5_000_000
 
     """total timesteps of the experiments"""
-    #learning_rate: float = 1.5e-3
+    # learning_rate: float = 1.5e-3
     learning_rate: float = 5e-4
 
     """the learning rate of the optimizer"""
     num_envs: int = 1024
     """the number of parallel game environments"""
-    #num_steps: int = 8
+    # num_steps: int = 8
     num_steps: int = 16
 
     """the number of steps to run in each environment per policy rollout"""
@@ -90,7 +89,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    #ent_coef: float = 0.007
+    # ent_coef: float = 0.007
     ent_coef: float = 0.003
 
     """coefficient of the entropy"""
@@ -209,7 +208,6 @@ class RandTrajEnv(DroneEnv):
             )
             self.sim.build_step_fn()
 
-
         spec = {k: v for k, v in self.single_observation_space.items()}
 
         spec["local_samples"] = spaces.Box(-np.inf, np.inf, shape=(3 * self.n_samples,))
@@ -274,7 +272,6 @@ class RandTrajEnv(DroneEnv):
         draw_points(self.sim, next_trajectory[0], rgba=np.array([1.0, 0, 0, 1]), size=0.01)
         self.sim.render()
 
-
     def obs(self) -> dict[str, Array]:
         """Observations."""
         obs = super().obs()
@@ -285,9 +282,7 @@ class RandTrajEnv(DroneEnv):
         # Trajectory samples
         # --------------------------------------------------------
         idx = np.clip(
-            self.steps + self.sample_offsets[None, ...],
-            0,
-            self.trajectories[0].shape[0] - 1,
+            self.steps + self.sample_offsets[None, ...], 0, self.trajectories[0].shape[0] - 1
         )
 
         dpos = (
@@ -301,8 +296,8 @@ class RandTrajEnv(DroneEnv):
         # --------------------------------------------------------
         obstacles_pos = self.sim.data.obstacles_pos  # (num_envs, n_obstacles, 3)
 
-        d_obs = obstacles_pos - pos[:, None, :]      # relative obstacle position
-        dist_obs = jp.linalg.norm(d_obs, axis=-1)    # (num_envs, n_obstacles)
+        d_obs = obstacles_pos - pos[:, None, :]  # relative obstacle position
+        dist_obs = jp.linalg.norm(d_obs, axis=-1)  # (num_envs, n_obstacles)
         nearest_idx = jp.argmin(dist_obs, axis=1)
 
         batch_idx = jp.arange(self.num_envs)
@@ -333,7 +328,6 @@ class RandTrajEnv(DroneEnv):
 
         return obs
 
-
     def reward(self) -> Array:
         """Rewards."""
         obs = self.obs()
@@ -356,9 +350,7 @@ class RandTrajEnv(DroneEnv):
         safe_obstacle_dist = 0.35
 
         obstacle_penalty = jp.where(
-            obstacle_dist < safe_obstacle_dist,
-            (safe_obstacle_dist - obstacle_dist) ** 2,
-            0.0,
+            obstacle_dist < safe_obstacle_dist, (safe_obstacle_dist - obstacle_dist) ** 2, 0.0
         )
 
         reward -= 8.0 * obstacle_penalty
@@ -375,11 +367,7 @@ class RandTrajEnv(DroneEnv):
 
         dist_to_edge = half_gate - jp.max(jp.abs(gate_yz), axis=-1)
 
-        edge_penalty = jp.where(
-            dist_to_edge < safe_margin,
-            (safe_margin - dist_to_edge) ** 2,
-            0.0,
-        )
+        edge_penalty = jp.where(dist_to_edge < safe_margin, (safe_margin - dist_to_edge) ** 2, 0.0)
 
         reward -= 12.0 * edge_penalty
 

@@ -1,3 +1,4 @@
+# ruff: noqa
 """A naive RL pipeline for drone racing."""
 
 import random
@@ -14,7 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from crazyflow.envs.drone_env import DroneEnv
 from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from crazyflow.sim.data import SimData
@@ -33,6 +33,7 @@ from scipy.interpolate import CubicSpline
 from torch import Tensor
 from torch.distributions.normal import Normal
 
+import wandb
 from lsy_drone_racing.envs.race_core import build_dynamics_disturbance_fn, rng_spec2fn
 from lsy_drone_racing.utils import load_config
 

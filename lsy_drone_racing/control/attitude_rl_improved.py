@@ -1,3 +1,4 @@
+# ruff: noqa
 """Gate- and obstacle-aware RL trajectory-tracking controller.
 
 This controller keeps the existing trained RL policy:
@@ -28,14 +29,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as scipy_R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.train_rl import Agent
-
-from crazyflow.sim.visualize import draw_line, draw_points
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -70,8 +70,7 @@ class AttitudeRL(Controller):
         self.basic_obs_key = ["pos", "quat", "vel", "ang_vel"]
 
         self.sample_offsets = np.array(
-            np.arange(self.n_samples) * self.freq * self.samples_dt,
-            dtype=int,
+            np.arange(self.n_samples) * self.freq * self.samples_dt, dtype=int
         )
 
         # ============================================================
@@ -110,9 +109,8 @@ class AttitudeRL(Controller):
         # Prevents replanning from suddenly pointing backwards while the drone has momentum
         # ============================================================
         self.replan_velocity_lookahead_time = 0.35  # seconds
-        self.replan_velocity_max_shift = 0.35       # meters
-        self.replan_velocity_min_speed = 0.15       # m/s
-
+        self.replan_velocity_max_shift = 0.35  # meters
+        self.replan_velocity_min_speed = 0.15  # m/s
 
         # ============================================================
         # 7. Gate trajectory planning
@@ -214,9 +212,7 @@ class AttitudeRL(Controller):
         self.prev_obs = np.tile(basic_obs[None, :], (self.n_obs, 1)).astype(np.float32)
 
     def compute_control(
-        self,
-        obs: dict[str, NDArray[np.floating]],
-        info: dict | None = None,
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
         """Compute desired [roll, pitch, yaw, thrust]."""
         self._last_obs_for_render = obs
@@ -228,7 +224,7 @@ class AttitudeRL(Controller):
         # Replan only if:
         # 1. we passed a gate, or
         # 2. detected gates/obstacles changed position enough
-        #should_replan = gate_advanced or environment_changed
+        # should_replan = gate_advanced or environment_changed
         should_replan = environment_changed
         if should_replan:
             self.trajectory = self._build_safe_gate_trajectory(obs)
@@ -342,8 +338,7 @@ class AttitudeRL(Controller):
 
         search_start = max(0, self.current_traj_index - self.nearest_search_back)
         search_end = min(
-            self.trajectory.shape[0],
-            self.current_traj_index + self.nearest_search_forward,
+            self.trajectory.shape[0], self.current_traj_index + self.nearest_search_forward
         )
 
         local_traj = self.trajectory[search_start:search_end]
@@ -365,10 +360,7 @@ class AttitudeRL(Controller):
 
         dynamic_lookahead = min(dynamic_lookahead, self.global_max_lookahead)
 
-        sample_index_spacing = min(
-            self.sample_index_spacing,
-            self.global_sample_index_spacing,
-        )
+        sample_index_spacing = min(self.sample_index_spacing, self.global_sample_index_spacing)
 
         idx = (
             self.current_traj_index
@@ -391,17 +383,12 @@ class AttitudeRL(Controller):
         obs_rl["prev_obs"] = self.prev_obs.reshape(-1)
         obs_rl["last_action"] = self.last_action
 
-        self.prev_obs = np.concatenate(
-            [self.prev_obs[1:, :], obs_rl["basic_obs"][None, :]],
-            axis=0,
-        )
+        self.prev_obs = np.concatenate([self.prev_obs[1:, :], obs_rl["basic_obs"][None, :]], axis=0)
 
         return np.concatenate([v for v in obs_rl.values()], axis=-1).astype(np.float32)
 
     def _gate_based_lookahead(
-        self,
-        obs: dict[str, NDArray[np.floating]],
-        current_lookahead: int,
+        self, obs: dict[str, NDArray[np.floating]], current_lookahead: int
     ) -> int:
         """Reduce lookahead near current gate to slow down before passing it."""
         if "gates_pos" not in obs:
@@ -425,9 +412,8 @@ class AttitudeRL(Controller):
 
         alpha = dist_xy / self.gate_slowdown_radius
 
-        lookahead = (
-            self.gate_slowdown_min_lookahead
-            + alpha * (current_lookahead - self.gate_slowdown_min_lookahead)
+        lookahead = self.gate_slowdown_min_lookahead + alpha * (
+            current_lookahead - self.gate_slowdown_min_lookahead
         )
 
         return int(np.clip(lookahead, self.gate_slowdown_min_lookahead, current_lookahead))
@@ -468,25 +454,9 @@ class AttitudeRL(Controller):
             max_roll_pitch = self.replan_slowdown_max_roll_pitch
             thrust_delta = self.thrust_delta * self.replan_slowdown_thrust_delta_factor
 
-        scale = np.array(
-            [
-                max_roll_pitch,
-                max_roll_pitch,
-                0.0,
-                thrust_delta,
-            ],
-            dtype=np.float32,
-        )
+        scale = np.array([max_roll_pitch, max_roll_pitch, 0.0, thrust_delta], dtype=np.float32)
 
-        mean = np.array(
-            [
-                0.0,
-                0.0,
-                0.0,
-                self.thrust_mean,
-            ],
-            dtype=np.float32,
-        )
+        mean = np.array([0.0, 0.0, 0.0, self.thrust_mean], dtype=np.float32)
 
         action = np.clip(actions, -1.0, 1.0) * scale + mean
         action[3] = np.clip(action[3], self.thrust_min, self.thrust_max)
@@ -494,9 +464,7 @@ class AttitudeRL(Controller):
         return action.astype(np.float32)
 
     def _velocity_aware_replan_start(
-        self,
-        obs: dict[str, NDArray[np.floating]],
-        current_pos: NDArray[np.float32],
+        self, obs: dict[str, NDArray[np.floating]], current_pos: NDArray[np.float32]
     ) -> NDArray[np.float32]:
         """Return a replanning start point that respects current drone velocity."""
         start_pos = current_pos.copy()
@@ -528,11 +496,9 @@ class AttitudeRL(Controller):
         return start_pos.astype(np.float32)
 
     def _build_safe_gate_trajectory(
-        self,
-        obs: dict[str, NDArray[np.floating]],
+        self, obs: dict[str, NDArray[np.floating]]
     ) -> NDArray[np.float32]:
         """Build trajectory through dynamically observed gate centers."""
-
         current_pos = np.asarray(obs["pos"], dtype=np.float32).copy()
         current_pos[2] = np.clip(current_pos[2], self.min_z, self.max_z)
 
@@ -562,7 +528,7 @@ class AttitudeRL(Controller):
         if gates_pos.shape[0] == 0:
             return self._default_trajectory(start_pos)
 
-        #gates_pos[:, 2] = np.clip(gates_pos[:, 2], 0.55, 1.20)
+        # gates_pos[:, 2] = np.clip(gates_pos[:, 2], 0.55, 1.20)
 
         gates_quat = None
         if "gates_quat" in obs:
@@ -575,10 +541,7 @@ class AttitudeRL(Controller):
 
         for i, gate_pos in enumerate(gates_pos):
             gate_normal = self._gate_normal(
-                gate_index=i,
-                gates_pos=gates_pos,
-                gates_quat=gates_quat,
-                current_pos=current_pos,
+                gate_index=i, gates_pos=gates_pos, gates_quat=gates_quat, current_pos=current_pos
             )
 
             pre_gate = gate_pos - self.approach_dist * gate_normal
@@ -633,9 +596,7 @@ class AttitudeRL(Controller):
 
         if obstacles_pos is not None:
             waypoints = self._avoid_obstacles_in_waypoints(
-                waypoints=waypoints,
-                obstacles_pos=obstacles_pos,
-                gate_centers=gates_pos,
+                waypoints=waypoints, obstacles_pos=obstacles_pos, gate_centers=gates_pos
             )
 
         trajectory = self._spline_from_waypoints(waypoints)
@@ -643,15 +604,11 @@ class AttitudeRL(Controller):
         # Then push the dense trajectory away from real obstacles.
         if obstacles_pos is not None:
             trajectory = self._repel_trajectory_from_obstacles(
-                trajectory=trajectory,
-                obstacles_pos=obstacles_pos,
-                gate_centers=gates_pos,
+                trajectory=trajectory, obstacles_pos=obstacles_pos, gate_centers=gates_pos
             )
 
             trajectory = self._enforce_min_obstacle_distance(
-                trajectory=trajectory,
-                obstacles_pos=obstacles_pos,
-                gate_centers=gates_pos,
+                trajectory=trajectory, obstacles_pos=obstacles_pos, gate_centers=gates_pos
             )
 
         trajectory = self._smooth_xy(trajectory, window=31)
@@ -660,22 +617,18 @@ class AttitudeRL(Controller):
         trajectory = self._resample_trajectory_by_arclength(trajectory)
 
         trajectory = self._enforce_gate_center_hard_constraints(
-            trajectory=trajectory,
-            gates_pos=gates_pos_raw,
+            trajectory=trajectory, gates_pos=gates_pos_raw
         )
 
-        #trajectory[:, 2] = np.clip(trajectory[:, 2], self.min_z, self.max_z)
+        # trajectory[:, 2] = np.clip(trajectory[:, 2], self.min_z, self.max_z)
 
         self._last_traj = trajectory.copy()
         return trajectory.astype(np.float32)
 
     def _enforce_gate_center_hard_constraints(
-        self,
-        trajectory: NDArray[np.float32],
-        gates_pos: NDArray[np.float32],
+        self, trajectory: NDArray[np.float32], gates_pos: NDArray[np.float32]
     ) -> NDArray[np.float32]:
         """Force trajectory to pass through gate centers in correct gate order."""
-
         traj = trajectory.copy()
 
         if gates_pos.shape[0] == 0 or traj.shape[0] < 2:
@@ -733,7 +686,6 @@ class AttitudeRL(Controller):
         current_pos: NDArray[np.float32],
     ) -> NDArray[np.float32]:
         """Return gate normal direction used for pre/post gate points."""
-
         if gates_quat is not None and gate_index < gates_quat.shape[0]:
             rot = scipy_R.from_quat(gates_quat[gate_index])
             normal = rot.apply(np.array([1.0, 0.0, 0.0], dtype=np.float32))
@@ -792,9 +744,7 @@ class AttitudeRL(Controller):
         for obstacle in obstacles_pos:
             # Check distance from obstacle to segment gate_pos -> helper_point.
             dist = self._distance_point_to_segment_xy(
-                point=obstacle[:2],
-                a=gate_pos[:2],
-                b=helper[:2],
+                point=obstacle[:2], a=gate_pos[:2], b=helper[:2]
             )
 
             if dist < self.gate_corridor_width:
@@ -808,20 +758,20 @@ class AttitudeRL(Controller):
         candidate_left = helper + self.gate_lateral_shift * tangent
         candidate_right = helper - self.gate_lateral_shift * tangent
 
-        score_left = np.min(np.linalg.norm(obstacles_pos[:, :2] - candidate_left[None, :2], axis=-1))
-        score_right = np.min(np.linalg.norm(obstacles_pos[:, :2] - candidate_right[None, :2], axis=-1))
+        score_left = np.min(
+            np.linalg.norm(obstacles_pos[:, :2] - candidate_left[None, :2], axis=-1)
+        )
+        score_right = np.min(
+            np.linalg.norm(obstacles_pos[:, :2] - candidate_right[None, :2], axis=-1)
+        )
 
         helper = candidate_left if score_left > score_right else candidate_right
         helper[2] = np.clip(helper[2], self.min_z, self.max_z)
 
         return helper.astype(np.float32)
 
-
     def _distance_point_to_segment_xy(
-        self,
-        point: NDArray[np.float32],
-        a: NDArray[np.float32],
-        b: NDArray[np.float32],
+        self, point: NDArray[np.float32], a: NDArray[np.float32], b: NDArray[np.float32]
     ) -> float:
         """Distance from xy point to xy line segment."""
         ab = b - a
@@ -843,7 +793,6 @@ class AttitudeRL(Controller):
         gate_centers: NDArray[np.float32],
     ) -> NDArray[np.float32]:
         """Move helper waypoints away from obstacles while preserving gate centers."""
-
         adjusted = waypoints.copy()
 
         for _ in range(self.obstacle_repulsion_iterations):
@@ -912,8 +861,6 @@ class AttitudeRL(Controller):
 
         return traj.astype(np.float32)
 
-
-
     def _repel_trajectory_from_obstacles(
         self,
         trajectory: NDArray[np.float32],
@@ -921,7 +868,6 @@ class AttitudeRL(Controller):
         gate_centers: NDArray[np.float32],
     ) -> NDArray[np.float32]:
         """Repel dense trajectory from obstacle centers while protecting gate centers."""
-
         traj = trajectory.copy()
 
         for _ in range(self.obstacle_repulsion_iterations):
@@ -956,7 +902,6 @@ class AttitudeRL(Controller):
 
     def _spline_from_waypoints(self, waypoints: NDArray[np.float32]) -> NDArray[np.float32]:
         """Create smooth trajectory from waypoints."""
-
         path_length = float(np.sum(np.linalg.norm(np.diff(waypoints, axis=0), axis=1)))
 
         reference_speed = 0.4  # m/s, higher = faster trajectory
@@ -964,9 +909,7 @@ class AttitudeRL(Controller):
         max_trajectory_time = self.trajectory_time
 
         trajectory_time = np.clip(
-            path_length / reference_speed,
-            min_trajectory_time,
-            max_trajectory_time,
+            path_length / reference_speed, min_trajectory_time, max_trajectory_time
         )
 
         n_steps = int(self.freq * trajectory_time)
@@ -978,7 +921,7 @@ class AttitudeRL(Controller):
         distances = np.maximum(distances, 1e-3)
 
         t_waypoints = np.concatenate([[0.0], np.cumsum(distances)])
-        
+
         t_waypoints = t_waypoints / t_waypoints[-1] * trajectory_time
 
         ts = np.linspace(0.0, trajectory_time, n_steps)
@@ -1005,11 +948,7 @@ class AttitudeRL(Controller):
 
         return traj.astype(np.float32)
 
-    def _smooth_xy(
-        self,
-        trajectory: NDArray[np.float32],
-        window: int = 31,
-    ) -> NDArray[np.float32]:
+    def _smooth_xy(self, trajectory: NDArray[np.float32], window: int = 31) -> NDArray[np.float32]:
         """Smooth x/y trajectory after obstacle projection."""
         if window < 3 or trajectory.shape[0] < window:
             return trajectory.astype(np.float32)
@@ -1027,8 +966,7 @@ class AttitudeRL(Controller):
         return traj.astype(np.float32)
 
     def _resample_trajectory_by_arclength(
-        self,
-        trajectory: NDArray[np.float32],
+        self, trajectory: NDArray[np.float32]
     ) -> NDArray[np.float32]:
         """Resample trajectory so consecutive points have approximately equal spatial distance."""
         if trajectory.shape[0] < 2:
@@ -1050,11 +988,7 @@ class AttitudeRL(Controller):
 
         return resampled.astype(np.float32)
 
-
-    def _remove_duplicate_waypoints(
-        self,
-        waypoints: NDArray[np.float32],
-    ) -> NDArray[np.float32]:
+    def _remove_duplicate_waypoints(self, waypoints: NDArray[np.float32]) -> NDArray[np.float32]:
         filtered = [waypoints[0]]
 
         for p in waypoints[1:]:
@@ -1065,7 +999,6 @@ class AttitudeRL(Controller):
 
     def _default_trajectory(self, current_pos: NDArray[np.float32]) -> NDArray[np.float32]:
         """Fallback trajectory if gate observations are unavailable."""
-
         waypoints = np.array(
             [
                 current_pos,
@@ -1109,10 +1042,7 @@ class AttitudeRL(Controller):
                 )
 
                 draw_points(
-                    sim,
-                    self.trajectory[::25],
-                    rgba=np.array([1.0, 0.0, 0.0, 1.0]),
-                    size=0.02,
+                    sim, self.trajectory[::25], rgba=np.array([1.0, 0.0, 0.0, 1.0]), size=0.02
                 )
 
             if self.current_target_point is not None:
@@ -1138,12 +1068,7 @@ class AttitudeRL(Controller):
 
                     # Draw all detected gates in cyan
                     if gates_pos.shape[0] > 0:
-                        draw_points(
-                            sim,
-                            gates_pos,
-                            rgba=np.array([0.0, 1.0, 1.0, 1.0]),
-                            size=0.06,
-                        )
+                        draw_points(sim, gates_pos, rgba=np.array([0.0, 1.0, 1.0, 1.0]), size=0.06)
 
                     # Draw current target gate larger in yellow
                     if 0 <= target_gate < gates_pos.shape[0]:
@@ -1166,10 +1091,7 @@ class AttitudeRL(Controller):
 
                     if obstacles_pos.shape[0] > 0:
                         draw_points(
-                            sim,
-                            obstacles_pos,
-                            rgba=np.array([1.0, 0.0, 1.0, 1.0]),
-                            size=0.10,
+                            sim, obstacles_pos, rgba=np.array([1.0, 0.0, 1.0, 1.0]), size=0.10
                         )
         except Exception:
             pass

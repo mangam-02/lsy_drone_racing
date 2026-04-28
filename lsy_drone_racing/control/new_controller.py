@@ -5,21 +5,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 
-from crazyflow.sim.visualize import draw_line, draw_points
-
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
 
 class NewController(Controller):
     """Self-contained slow and stable attitude controller."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        """Initialize the controller."""
         super().__init__(obs, info, config)
 
         self.freq = float(config.env.freq)
@@ -38,12 +39,7 @@ class NewController(Controller):
         self.ref_acc_limit = 3.5
 
         self.fixed_obstacle_pos = np.array(
-            [
-                [0.08, 0.72, 1.60],
-                [0.95, 0.32, 1.60],
-                [-1.42, -0.18, 1.60],
-                [-0.58, -0.70, 1.60],
-            ],
+            [[0.08, 0.72, 1.60], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
             dtype=np.float64,
         )
         self._initial_gate_positions: NDArray[np.floating] | None = None
@@ -68,15 +64,13 @@ class NewController(Controller):
         self._cached_gate_positions: NDArray[np.floating] | None = None
         self._cached_obstacle_positions: NDArray[np.floating] | None = None
         self._previous_command = np.array(
-            [0.0, 0.0, 0.0, self.drone_mass * self.gravity_const],
-            dtype=np.float32,
+            [0.0, 0.0, 0.0, self.drone_mass * self.gravity_const], dtype=np.float32
         )
 
     def compute_control(
-        self,
-        obs: dict[str, NDArray[np.floating]],
-        info: dict | None = None,
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
+        """Compute the next control command."""
         del info
 
         sim_time = min(self._tick / self.freq, self.max_episode_time)
@@ -109,14 +103,16 @@ class NewController(Controller):
 
         gate_pos_changed = (
             self._cached_gate_positions is None
-            or np.max(np.linalg.norm(measured_gate_pos - self._cached_gate_positions, axis=1)) > 0.01
+            or np.max(np.linalg.norm(measured_gate_pos - self._cached_gate_positions, axis=1))
+            > 0.01
         )
 
         obstacle_pos_changed = (
             self._cached_obstacle_positions is None
             or np.max(
                 np.linalg.norm(measured_obstacle_pos - self._cached_obstacle_positions, axis=1)
-            ) > 0.01
+            )
+            > 0.01
         )
 
         should_rebuild_path = (
@@ -188,16 +184,14 @@ class NewController(Controller):
 
         roll_cmd = np.arcsin(
             np.clip(
-                (acc_cmd[0] * np.sin(yaw_cmd) - acc_cmd[1] * np.cos(yaw_cmd))
-                / self.gravity_const,
+                (acc_cmd[0] * np.sin(yaw_cmd) - acc_cmd[1] * np.cos(yaw_cmd)) / self.gravity_const,
                 -1.0,
                 1.0,
             )
         )
 
         pitch_cmd = np.arctan2(
-            acc_cmd[0] * np.cos(yaw_cmd) + acc_cmd[1] * np.sin(yaw_cmd),
-            acc_cmd[2],
+            acc_cmd[0] * np.cos(yaw_cmd) + acc_cmd[1] * np.sin(yaw_cmd), acc_cmd[2]
         )
 
         roll_cmd = np.clip(roll_cmd, -self.tilt_limit_rad, self.tilt_limit_rad)
@@ -251,17 +245,14 @@ class NewController(Controller):
         return spline, end_time
 
     def _make_checkpoint_list(
-        self,
-        gate_idx: int,
-        gate_pos: NDArray[np.floating],
-        gate_angles: NDArray[np.floating],
+        self, gate_idx: int, gate_pos: NDArray[np.floating], gate_angles: NDArray[np.floating]
     ) -> NDArray[np.floating]:
         if gate_idx == 0:
             before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0])
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
                 np.array([-1, 0.6, 0.45]),
-                #before_gate,
+                # before_gate,
                 gate_pos[0],
                 after_gate,
             ]
@@ -292,7 +283,7 @@ class NewController(Controller):
             checkpoints = [
                 gate_pos[2],
                 np.array([-0.6, -0.5, 0.8]),
-                #before_gate,
+                # before_gate,
                 gate_pos[3],
                 after_gate,
             ]
@@ -302,10 +293,8 @@ class NewController(Controller):
 
         return np.asarray(checkpoints, dtype=np.float64)
 
-
     def _push_points_away_from_obstacles(
-        self,
-        path_points: NDArray[np.floating],
+        self, path_points: NDArray[np.floating]
     ) -> NDArray[np.floating]:
         pushed_points = path_points.copy()
 
@@ -347,10 +336,7 @@ class NewController(Controller):
     ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
         yaw = float(gate_angles[2])
 
-        forward_xy = np.array(
-            [np.cos(yaw), np.sin(yaw)],
-            dtype=np.float64,
-        )
+        forward_xy = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
 
         forward_xy /= np.linalg.norm(forward_xy) + 1e-9
 
@@ -384,82 +370,44 @@ class NewController(Controller):
     def _store_path_points(self, path_points: NDArray[np.floating]) -> None:
         self._debug_path_points = path_points.copy()
 
-    def _store_sampled_path(
-        self,
-        spline: CubicSpline,
-        start_time: float,
-        end_time: float,
-    ) -> None:
+    def _store_sampled_path(self, spline: CubicSpline, start_time: float, end_time: float) -> None:
         sample_times = np.linspace(start_time, end_time, 80)
         self._debug_sampled_path = spline(sample_times)
 
-    def render_callback(self, sim) -> None:
+    def render_callback(self, sim: object) -> None:
+        """Render debug trajectory information."""
         if not self._debug_enabled:
             return
 
         # Initial gate positions: small blue points
         if self._initial_gate_positions is not None:
-            draw_points(
-                sim,
-                self._initial_gate_positions,
-                rgba=(0.0, 0.2, 1.0, 1.0),
-                size=0.035,
-            )
+            draw_points(sim, self._initial_gate_positions, rgba=(0.0, 0.2, 1.0, 1.0), size=0.035)
 
         # Current/randomized gate positions: larger cyan points
         if self._latest_gate_positions is not None:
-            draw_points(
-                sim,
-                self._latest_gate_positions,
-                rgba=(0.0, 1.0, 1.0, 1.0),
-                size=0.055,
-            )
+            draw_points(sim, self._latest_gate_positions, rgba=(0.0, 1.0, 1.0, 1.0), size=0.055)
 
         # Initial obstacle positions: orange points
         if self._initial_obstacle_positions is not None:
-            draw_points(
-                sim,
-                self._initial_obstacle_positions,
-                rgba=(1.0, 0.5, 0.0, 1.0),
-                size=0.04,
-            )
+            draw_points(sim, self._initial_obstacle_positions, rgba=(1.0, 0.5, 0.0, 1.0), size=0.04)
 
         # Current obstacle positions: red points
         if self._latest_obstacle_positions is not None:
-            draw_points(
-                sim,
-                self._latest_obstacle_positions,
-                rgba=(1.0, 0.0, 0.0, 1.0),
-                size=0.06,
-            )
+            draw_points(sim, self._latest_obstacle_positions, rgba=(1.0, 0.0, 0.0, 1.0), size=0.06)
 
         # Planned checkpoint points: magenta points
         if self._debug_path_points is not None:
-            draw_points(
-                sim,
-                self._debug_path_points,
-                rgba=(1.0, 0.0, 1.0, 1.0),
-                size=0.035,
-            )
+            draw_points(sim, self._debug_path_points, rgba=(1.0, 0.0, 1.0, 1.0), size=0.035)
 
         # Planned spline trajectory: green line
         if self._debug_sampled_path is not None:
-            draw_line(
-                sim,
-                self._debug_sampled_path,
-                rgba=(0.0, 1.0, 0.0, 1.0),
-            )
+            draw_line(sim, self._debug_sampled_path, rgba=(0.0, 1.0, 0.0, 1.0))
 
         # Current setpoint on trajectory: yellow point
         if self._path_spline is not None:
             t_now = min(self._tick / self.freq, self._path_end_time)
             current_setpoint = self._path_spline(t_now).reshape(1, 3)
-            draw_points(
-                sim,
-                current_setpoint,
-                rgba=(1.0, 1.0, 0.0, 1.0),
-                size=0.05,
-            )
+            draw_points(sim, current_setpoint, rgba=(1.0, 1.0, 0.0, 1.0), size=0.05)
 
     def step_callback(
         self,
@@ -470,6 +418,7 @@ class NewController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
+        """Update controller state after each simulation step."""
         del action, obs, reward, info
         self._tick += 1
         if terminated or truncated:
@@ -477,6 +426,7 @@ class NewController(Controller):
         return self._finished
 
     def episode_callback(self) -> None:
+        """Reset controller state at the start of an episode."""
         self._tick = 0
         self._finished = False
         self._current_target_idx = -1
@@ -485,7 +435,5 @@ class NewController(Controller):
         self._cached_gate_positions = None
         self._cached_obstacle_positions = None
         self._previous_command = np.array(
-            [0.0, 0.0, 0.0, self.drone_mass * self.gravity_const],
-            dtype=np.float32,
+            [0.0, 0.0, 0.0, self.drone_mass * self.gravity_const], dtype=np.float32
         )
-
