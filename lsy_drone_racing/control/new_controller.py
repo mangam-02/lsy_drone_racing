@@ -52,7 +52,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([7.0, 7.0, 6.0, 5.0], dtype=np.float64)
+        self.segment_durations = np.array([5.0, 5.0, 6.0, 5.0], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
