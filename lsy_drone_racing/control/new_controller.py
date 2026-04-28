@@ -1,4 +1,4 @@
-"""Robust attitude controller for level-2 drone racing."""
+"""Robust attitude controller for level-2 drone racing.."""
 
 from __future__ import annotations
 
