@@ -176,9 +176,7 @@ class NewController(Controller):
         dt = 1.0 / self.freq
         self._pos_error_integral += pos_error * dt
         self._pos_error_integral = np.clip(
-            self._pos_error_integral,
-            -self.integral_error_limit,
-            self.integral_error_limit,
+            self._pos_error_integral, -self.integral_error_limit, self.integral_error_limit
         )
 
         force_cmd = (
@@ -341,7 +339,7 @@ class NewController(Controller):
                 np.array([-0.4, -0.4, 1.1]),
                 # before_gate,
                 gate_pos[3],
-                #after_gate,
+                # after_gate,
             ]
 
         else:
