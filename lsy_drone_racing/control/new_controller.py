@@ -307,12 +307,15 @@ class NewController(Controller):
         elif gate_idx == 2:
             before_gate, after_gate = self._gate_direction_points(gate_pos[2], gate_angles[2])
             # tmp_gate = before_gate
+            goal_gate = gate_pos[2]
+            goal_gate[2] = goal_gate[2] - 0.07
+            #before_gate[2] = before_gate[2] - 0.035
             checkpoints = [
                 gate_pos[1],
                 np.array([0.7, 0.85, 1.1]),
                 np.array([0.0, 0.2, 0.9]),
                 before_gate,
-                gate_pos[2],
+                goal_gate,
                 # after_gate,
             ]
 
