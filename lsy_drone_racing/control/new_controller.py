@@ -191,7 +191,8 @@ class NewController(Controller):
         )
 
         pitch_cmd = np.arctan2(
-            acc_cmd[0] * np.cos(yaw_cmd) + acc_cmd[1] * np.sin(yaw_cmd), acc_cmd[2]
+            acc_cmd[0] * np.cos(yaw_cmd) + acc_cmd[1] * np.sin(yaw_cmd),
+            self.gravity_const + acc_cmd[2],
         )
 
         roll_cmd = np.clip(roll_cmd, -self.tilt_limit_rad, self.tilt_limit_rad)
