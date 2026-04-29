@@ -36,7 +36,7 @@ class NewController(Controller):
         self.vel_gain = np.array([0.75, 0.75, 0.70], dtype=np.float64)
 
         self.tilt_limit_rad = np.deg2rad(28.0)
-        self.ref_acc_limit = 3.5
+        self.ref_acc_limit = 4.5
 
         self.fixed_obstacle_pos = np.array(
             [[0.08, 0.72, 1.60], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
@@ -52,7 +52,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([5.0, 5.0, 6.0, 5.0], dtype=np.float64)
+        self.segment_durations = np.array([5.0, 5.0, 5.0, 3.0], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -282,7 +282,8 @@ class NewController(Controller):
             before_gate, after_gate = self._gate_direction_points(gate_pos[3], gate_angles[3])
             checkpoints = [
                 gate_pos[2],
-                np.array([-0.6, -0.5, 0.8]),
+                np.array([-0.4, -0.4, 0.8]),
+                np.array([-0.4, -0.4, 1.1]),
                 # before_gate,
                 gate_pos[3],
                 after_gate,
