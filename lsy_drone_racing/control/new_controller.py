@@ -35,6 +35,10 @@ class NewController(Controller):
         self.pos_gain = np.array([0.55, 0.55, 1.25], dtype=np.float64)
         self.vel_gain = np.array([0.95, 0.95, 0.85], dtype=np.float64)
 
+        self.int_gain = np.array([0.015, 0.015, 0.04], dtype=np.float64)
+        self.integral_error_limit = np.array([1.5, 1.5, 0.8], dtype=np.float64)
+        self._pos_error_integral = np.zeros(3, dtype=np.float64)
+
         self.tilt_limit_rad = np.deg2rad(30.0)
         self.ref_acc_limit = 4.5
 
@@ -52,7 +56,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([1.5, 1.75, 2.15, 2.3], dtype=np.float64)
+        self.segment_durations = np.array([1.5, 1.75, 2.15, 2.35], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -169,9 +173,18 @@ class NewController(Controller):
         pos_error = wanted_pos - drone_pos
         vel_error = wanted_vel - drone_vel
 
+        dt = 1.0 / self.freq
+        self._pos_error_integral += pos_error * dt
+        self._pos_error_integral = np.clip(
+            self._pos_error_integral,
+            -self.integral_error_limit,
+            self.integral_error_limit,
+        )
+
         force_cmd = (
             self.pos_gain * pos_error
             + self.vel_gain * vel_error
+            + self.int_gain * self._pos_error_integral
             + 0.25 * self.drone_mass * wanted_acc
         )
         force_cmd[2] += self.drone_mass * self.gravity_const
@@ -482,3 +495,4 @@ class NewController(Controller):
         self._previous_command = np.array(
             [0.0, 0.0, 0.0, self.drone_mass * self.gravity_const], dtype=np.float32
         )
+        self._pos_error_integral = np.zeros(3, dtype=np.float64)
