@@ -32,10 +32,10 @@ class NewController(Controller):
         self.thrust_min = float(drone_params["thrust_min"] * 4.0)
         self.thrust_max = float(drone_params["thrust_max"] * 4.0)
 
-        self.pos_gain = np.array([0.42, 0.42, 1.10], dtype=np.float64)
-        self.vel_gain = np.array([0.75, 0.75, 0.70], dtype=np.float64)
+        self.pos_gain = np.array([0.55, 0.55, 1.25], dtype=np.float64)
+        self.vel_gain = np.array([0.95, 0.95, 0.85], dtype=np.float64)
 
-        self.tilt_limit_rad = np.deg2rad(28.0)
+        self.tilt_limit_rad = np.deg2rad(36.0)
         self.ref_acc_limit = 4.5
 
         self.fixed_obstacle_pos = np.array(
@@ -52,7 +52,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([4.0, 5.0, 5.0, 3.0], dtype=np.float64)
+        self.segment_durations = np.array([3.0, 4.0, 5.0, 3.0], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
