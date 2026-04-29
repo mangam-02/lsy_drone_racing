@@ -35,7 +35,7 @@ class NewController(Controller):
         self.pos_gain = np.array([0.55, 0.55, 1.25], dtype=np.float64)
         self.vel_gain = np.array([0.95, 0.95, 0.85], dtype=np.float64)
 
-        self.tilt_limit_rad = np.deg2rad(36.0)
+        self.tilt_limit_rad = np.deg2rad(30.0)
         self.ref_acc_limit = 4.5
 
         self.fixed_obstacle_pos = np.array(
