@@ -238,26 +238,43 @@ class NewController(Controller):
         self._store_path_points(path_points)
 
         end_time = start_time + travel_time
-        knot_times = np.linspace(start_time, end_time, len(path_points))
-        velocities = self._make_spline_tangents(path_points)
+
+        segment_lengths = np.linalg.norm(np.diff(path_points, axis=0), axis=1)
+        total_length = float(np.sum(segment_lengths))
+
+        if total_length < 1e-9:
+            knot_times = np.linspace(start_time, end_time, len(path_points))
+        else:
+            relative_distances = np.concatenate(([0.0], np.cumsum(segment_lengths) / total_length))
+            knot_times = start_time + relative_distances * travel_time
+
+        velocities = self._make_spline_tangents(path_points, knot_times)
         spline = CubicHermiteSpline(knot_times, path_points, velocities)
 
         self._store_sampled_path(spline, start_time, end_time)
 
         return spline, end_time
     
-    def _make_spline_tangents(self, path_points: NDArray[np.floating]) -> NDArray[np.floating]:
+    def _make_spline_tangents(
+        self,
+        path_points: NDArray[np.floating],
+        knot_times: NDArray[np.floating],
+    ) -> NDArray[np.floating]:
         tangents = np.zeros_like(path_points)
 
         for i in range(len(path_points)):
             if i == 0:
-                tangents[i] = path_points[1] - path_points[0]
-            elif i == len(path_points) - 1:
-                tangents[i] = path_points[-1] - path_points[-2]
-            else:
-                tangents[i] = 0.5 * (path_points[i + 1] - path_points[i - 1])
+                dt = knot_times[1] - knot_times[0]
+                tangents[i] = (path_points[1] - path_points[0]) / max(dt, 1e-6)
 
-        # Make tangents smaller to reduce overshoot near gates.
+            elif i == len(path_points) - 1:
+                dt = knot_times[-1] - knot_times[-2]
+                tangents[i] = (path_points[-1] - path_points[-2]) / max(dt, 1e-6)
+
+            else:
+                dt = knot_times[i + 1] - knot_times[i - 1]
+                tangents[i] = (path_points[i + 1] - path_points[i - 1]) / max(dt, 1e-6)
+
         return 0.65 * tangents
 
     def _make_checkpoint_list(
@@ -265,7 +282,7 @@ class NewController(Controller):
     ) -> NDArray[np.floating]:
         if gate_idx == 0:
             before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0],
-                                                                   dist_before=0.4)
+                                                                   dist_before=0.25)
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
                 np.array([-1, 0.6, 0.45]),
