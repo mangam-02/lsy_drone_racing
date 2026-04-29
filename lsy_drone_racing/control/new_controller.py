@@ -264,7 +264,8 @@ class NewController(Controller):
         self, gate_idx: int, gate_pos: NDArray[np.floating], gate_angles: NDArray[np.floating]
     ) -> NDArray[np.floating]:
         if gate_idx == 0:
-            before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0], dist_before=0.4)
+            before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0],
+                                                                   dist_before=0.4)
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
                 np.array([-1, 0.6, 0.45]),
@@ -388,7 +389,8 @@ class NewController(Controller):
     def _store_path_points(self, path_points: NDArray[np.floating]) -> None:
         self._debug_path_points = path_points.copy()
 
-    def _store_sampled_path(self, spline: CubicHermiteSpline, start_time: float, end_time: float) -> None:
+    def _store_sampled_path(self, spline: CubicHermiteSpline, 
+                            start_time: float, end_time: float) -> None:
         sample_times = np.linspace(start_time, end_time, 80)
         self._debug_sampled_path = spline(sample_times)
 
