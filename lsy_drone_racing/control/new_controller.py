@@ -52,7 +52,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([3.0, 3.0, 3.5, 3.0], dtype=np.float64)
+        self.segment_durations = np.array([2.0, 2.5, 2.5, 2.5], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -280,6 +280,8 @@ class NewController(Controller):
     def _make_checkpoint_list(
         self, gate_idx: int, gate_pos: NDArray[np.floating], gate_angles: NDArray[np.floating]
     ) -> NDArray[np.floating]:
+        
+        #tmp_gate = None
         if gate_idx == 0:
             before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0],
                                                                    dist_before=0.25)
@@ -304,6 +306,7 @@ class NewController(Controller):
 
         elif gate_idx == 2:
             before_gate, after_gate = self._gate_direction_points(gate_pos[2], gate_angles[2])
+            #tmp_gate = before_gate
             checkpoints = [
                 gate_pos[1],
                 np.array([0.7, 0.95, 1]),
@@ -317,6 +320,7 @@ class NewController(Controller):
             before_gate, after_gate = self._gate_direction_points(gate_pos[3], gate_angles[3])
             checkpoints = [
                 gate_pos[2],
+                #tmp_gate,
                 np.array([-0.4, -0.25, 0.8]),
                 np.array([-0.4, -0.4, 1.1]),
                 # before_gate,
