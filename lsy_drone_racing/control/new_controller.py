@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicHermiteSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
@@ -59,7 +59,7 @@ class NewController(Controller):
         self._current_target_idx = -1
         self._segment_start_times = np.zeros(4, dtype=np.float64)
 
-        self._path_spline: CubicSpline | None = None
+        self._path_spline: CubicHermiteSpline | None = None        
         self._path_end_time = self.max_episode_time
         self._cached_gate_positions: NDArray[np.floating] | None = None
         self._cached_obstacle_positions: NDArray[np.floating] | None = None
@@ -231,7 +231,7 @@ class NewController(Controller):
         gate_angles: NDArray[np.floating],
         start_time: float,
         travel_time: float,
-    ) -> tuple[CubicSpline, float]:
+    ) -> tuple[CubicHermiteSpline, float]:
         path_points = self._make_checkpoint_list(gate_idx, gate_pos, gate_angles)
         path_points = self._push_points_away_from_obstacles(path_points)
 
@@ -239,11 +239,26 @@ class NewController(Controller):
 
         end_time = start_time + travel_time
         knot_times = np.linspace(start_time, end_time, len(path_points))
-        spline = CubicSpline(knot_times, path_points)
+        velocities = self._make_spline_tangents(path_points)
+        spline = CubicHermiteSpline(knot_times, path_points, velocities)
 
         self._store_sampled_path(spline, start_time, end_time)
 
         return spline, end_time
+    
+    def _make_spline_tangents(self, path_points: NDArray[np.floating]) -> NDArray[np.floating]:
+        tangents = np.zeros_like(path_points)
+
+        for i in range(len(path_points)):
+            if i == 0:
+                tangents[i] = path_points[1] - path_points[0]
+            elif i == len(path_points) - 1:
+                tangents[i] = path_points[-1] - path_points[-2]
+            else:
+                tangents[i] = 0.5 * (path_points[i + 1] - path_points[i - 1])
+
+        # Make tangents smaller to reduce overshoot near gates.
+        return 0.65 * tangents
 
     def _make_checkpoint_list(
         self, gate_idx: int, gate_pos: NDArray[np.floating], gate_angles: NDArray[np.floating]
@@ -284,7 +299,7 @@ class NewController(Controller):
             before_gate, after_gate = self._gate_direction_points(gate_pos[3], gate_angles[3])
             checkpoints = [
                 gate_pos[2],
-                np.array([-0.4, -0.4, 0.8]),
+                np.array([-0.4, -0.25, 0.8]),
                 np.array([-0.4, -0.4, 1.1]),
                 # before_gate,
                 gate_pos[3],
@@ -356,7 +371,7 @@ class NewController(Controller):
         gate_obs = np.asarray(obs["target_gate"])
         return int(gate_obs.reshape(-1)[0])
 
-    def _get_path_spline(self) -> CubicSpline:
+    def _get_path_spline(self) -> CubicHermiteSpline:
         if self._path_spline is None:
             raise RuntimeError("Path spline requested before initialization.")
         return self._path_spline
@@ -373,7 +388,7 @@ class NewController(Controller):
     def _store_path_points(self, path_points: NDArray[np.floating]) -> None:
         self._debug_path_points = path_points.copy()
 
-    def _store_sampled_path(self, spline: CubicSpline, start_time: float, end_time: float) -> None:
+    def _store_sampled_path(self, spline: CubicHermiteSpline, start_time: float, end_time: float) -> None:
         sample_times = np.linspace(start_time, end_time, 80)
         self._debug_sampled_path = spline(sample_times)
 
