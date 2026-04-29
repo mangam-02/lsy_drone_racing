@@ -52,7 +52,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([2.0, 2.5, 2.5, 2.5], dtype=np.float64)
+        self.segment_durations = np.array([2.0, 2.5, 2.0, 2.5], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -308,7 +308,7 @@ class NewController(Controller):
             # tmp_gate = before_gate
             checkpoints = [
                 gate_pos[1],
-                np.array([0.7, 0.95, 1]),
+                np.array([0.7, 0.88, 1]),
                 np.array([0.2, 0.4, 1]),
                 before_gate,
                 gate_pos[2],
