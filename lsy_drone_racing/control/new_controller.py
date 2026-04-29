@@ -152,7 +152,7 @@ class NewController(Controller):
 
     def _make_attitude_command(
         self,
-        spline: CubicSpline,
+        spline: CubicHermiteSpline,
         drone_pos: NDArray[np.floating],
         drone_vel: NDArray[np.floating],
         drone_quat: NDArray[np.floating],
@@ -264,13 +264,13 @@ class NewController(Controller):
         self, gate_idx: int, gate_pos: NDArray[np.floating], gate_angles: NDArray[np.floating]
     ) -> NDArray[np.floating]:
         if gate_idx == 0:
-            before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0])
+            before_gate, after_gate = self._gate_direction_points(gate_pos[0], gate_angles[0], dist_before=0.4)
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
                 np.array([-1, 0.6, 0.45]),
-                # before_gate,
+                before_gate,
                 gate_pos[0],
-                after_gate,
+                #after_gate,
             ]
 
         elif gate_idx == 1:
@@ -278,10 +278,10 @@ class NewController(Controller):
             checkpoints = [
                 gate_pos[0],
                 np.array([1, -0.4, 1]),
-                np.array([1.5, -0.4, 1]),
+                np.array([1.5, -0.1, 1]),
                 before_gate,
                 gate_pos[1],
-                after_gate,
+                #after_gate,
             ]
 
         elif gate_idx == 2:
@@ -292,7 +292,7 @@ class NewController(Controller):
                 np.array([0.2, 0.4, 1]),
                 before_gate,
                 gate_pos[2],
-                after_gate,
+                #after_gate,
             ]
 
         elif gate_idx == 3:
@@ -303,7 +303,7 @@ class NewController(Controller):
                 np.array([-0.4, -0.4, 1.1]),
                 # before_gate,
                 gate_pos[3],
-                after_gate,
+                #after_gate,
             ]
 
         else:
