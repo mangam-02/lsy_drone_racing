@@ -32,18 +32,21 @@ class NewController(Controller):
         self.thrust_min = float(drone_params["thrust_min"] * 4.0)
         self.thrust_max = float(drone_params["thrust_max"] * 4.0)
 
-        self.pos_gain = np.array([0.55, 0.55, 1.25], dtype=np.float64)
-        self.vel_gain = np.array([0.95, 0.95, 0.85], dtype=np.float64)
+        self.pos_gain = np.array([0.65, 0.65, 1.45], dtype=np.float64)
+        self.vel_gain = np.array([0.70, 0.70, 0.70], dtype=np.float64)
 
-        self.int_gain = np.array([0.015, 0.015, 0.04], dtype=np.float64)
+        self.int_gain = np.array([0.025, 0.025, 0.04], dtype=np.float64)
         self.integral_error_limit = np.array([1.5, 1.5, 0.8], dtype=np.float64)
         self._pos_error_integral = np.zeros(3, dtype=np.float64)
 
-        self.tilt_limit_rad = np.deg2rad(30.0)
-        self.ref_acc_limit = 4.5
+        self.tilt_limit_rad = np.deg2rad(35.0)
+        self.ref_acc_lateral_limit = 12.0
+        self.ref_acc_vertical_limit = 7.0
+        self.ref_acc_feedforward_scale = 0.65
 
         self.fixed_obstacle_pos = np.array(
-            [[0.08, 0.72, 1.60], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
+            #[[0.08, 0.72, 1.60], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
+            [[0.0, 0.75, 1.55], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
             dtype=np.float64,
         )
         self._initial_gate_positions: NDArray[np.floating] | None = None
@@ -56,7 +59,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([1.5, 1.75, 2.15, 2.1], dtype=np.float64)
+        self.segment_durations = np.array([1.55, 2.0, 2.00, 1.55], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -166,9 +169,14 @@ class NewController(Controller):
         wanted_vel = spline.derivative(1)(spline_time)
         wanted_acc = spline.derivative(2)(spline_time)
 
-        wanted_acc_norm = np.linalg.norm(wanted_acc)
-        if wanted_acc_norm > self.ref_acc_limit:
-            wanted_acc = wanted_acc * self.ref_acc_limit / (wanted_acc_norm + 1e-9)
+        lateral_acc_norm = np.linalg.norm(wanted_acc[:2])
+        if lateral_acc_norm > self.ref_acc_lateral_limit:
+            wanted_acc = wanted_acc.copy()
+            wanted_acc[:2] *= self.ref_acc_lateral_limit / (lateral_acc_norm + 1e-9)
+        wanted_acc[2] = np.clip(
+            wanted_acc[2], -self.ref_acc_vertical_limit, self.ref_acc_vertical_limit
+        )
+        
 
         pos_error = wanted_pos - drone_pos
         vel_error = wanted_vel - drone_vel
@@ -183,7 +191,7 @@ class NewController(Controller):
             self.pos_gain * pos_error
             + self.vel_gain * vel_error
             + self.int_gain * self._pos_error_integral
-            + 0.25 * self.drone_mass * wanted_acc
+            + self.ref_acc_feedforward_scale * self.drone_mass * wanted_acc
         )
         force_cmd[2] += self.drone_mass * self.gravity_const
 
@@ -293,19 +301,20 @@ class NewController(Controller):
         # tmp_gate = None
         if gate_idx == 0:
             before_gate, after_gate = self._gate_direction_points(
-                gate_pos[0], gate_angles[0], dist_before=0.25
+                gate_pos[0], gate_angles[0], dist_before=0.15
             )
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
-                #np.array([-1, 0.6, 0.45]),
-                np.array([0.1, 0.5, 0.6]),
+                np.array([-1, 0.6, 0.45]),
+                #np.array([0.1, 0.5, 0.6]),
                 before_gate,
                 gate_pos[0],
                 # after_gate,
             ]
 
         elif gate_idx == 1:
-            before_gate, after_gate = self._gate_direction_points(gate_pos[1], gate_angles[1])
+            before_gate, after_gate = self._gate_direction_points(gate_pos[1], gate_angles[1], 
+                                                                  dist_before=0.5)
             checkpoints = [
                 gate_pos[0],
                 # np.array([1, -0.4, 1]),
@@ -313,18 +322,18 @@ class NewController(Controller):
                 # np.array([1.5, -0.1, 1]),
                 before_gate,
                 gate_pos[1],
-                # after_gate,
+                after_gate,
             ]
 
         elif gate_idx == 2:
             before_gate, after_gate = self._gate_direction_points(gate_pos[2], gate_angles[2])
             # tmp_gate = before_gate
-            goal_gate = gate_pos[2]
-            goal_gate[2] = goal_gate[2] - 0.07
+            goal_gate = gate_pos[2].copy()
+            goal_gate[2] = goal_gate[2] - 0.08
             # before_gate[2] = before_gate[2] - 0.035
             checkpoints = [
                 gate_pos[1],
-                np.array([0.7, 0.85, 1.1]),
+                np.array([0.65, 0.82, 1.1]),
                 #np.array([0.0, 0.2, 0.9]),
                 before_gate,
                 goal_gate,
@@ -337,8 +346,10 @@ class NewController(Controller):
             checkpoints = [
                 gate_pos[2],
                 # tmp_gate,
-                np.array([-0.2, -0.25, 0.8]),
-                np.array([-0.2, -0.4, 1.1]),
+                # np.array([-0.2, -0.25, 0.8]),
+                # np.array([-0.2, -0.4, 1.1]),
+                np.array([-0.3, -0.25, 0.7]),
+                np.array([-0.3, -0.4, 1.1]),
                 # before_gate,
                 gate_pos[3],
                 after_gate,
