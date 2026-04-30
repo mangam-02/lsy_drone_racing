@@ -61,7 +61,7 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([1.4, 1.74, 1.4, 1.55], dtype=np.float64)
+        self.segment_durations = np.array([1.4, 1.72, 1.4, 1.55], dtype=np.float64)
         self.segment_tangent_scales = np.array([0.80, 0.90, 0.6, 0.6], dtype=np.float64)
         self.segment_speed_profiles = np.array(
             [[1.8, 1.25, 0.6], [1.30, 1.0, 0.5], [0.8, 1.8, 0.85], [0.85, 1.05, 0.75]],
