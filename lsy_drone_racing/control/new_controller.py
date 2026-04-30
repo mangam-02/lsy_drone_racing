@@ -61,8 +61,12 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([1.3, 1.75, 2.00, 1.55], dtype=np.float64)
+        self.segment_durations = np.array([1.3, 1.75, 1.7, 1.55], dtype=np.float64)
         self.segment_tangent_scales = np.array([0.80, 0.90, 0.6, 0.6], dtype=np.float64)
+        self.segment_speed_profiles = np.array(
+            [[1.5, 1.25, 0.6], [1.00, 1.35, 0.95], [0.8, 1.5, 0.85], [0.85, 1.05, 0.75]],
+            dtype=np.float64,
+        )
 
         self._tick = 0
         self._finished = False
@@ -266,8 +270,13 @@ class NewController(Controller):
         if total_length < 1e-9:
             knot_times = np.linspace(start_time, end_time, len(path_points))
         else:
-            relative_distances = np.concatenate(([0.0], np.cumsum(segment_lengths) / total_length))
-            knot_times = start_time + relative_distances * travel_time
+            speed_profile = self.segment_speed_profiles[gate_idx]
+            knot_times = self._make_speed_profiled_knot_times(
+                segment_lengths=segment_lengths,
+                speed_profile=speed_profile,
+                start_time=start_time,
+                travel_time=travel_time,
+            )
 
         velocities = self._make_spline_tangents(
             path_points, knot_times, tangent_scale=float(self.segment_tangent_scales[gate_idx])
@@ -529,3 +538,34 @@ class NewController(Controller):
             [0.0, 0.0, 0.0, self.drone_mass * self.gravity_const], dtype=np.float32
         )
         self._pos_error_integral = np.zeros(3, dtype=np.float64)
+
+    @staticmethod
+    def _make_speed_profiled_knot_times(
+        segment_lengths: "NDArray[np.floating]",
+        speed_profile: "NDArray[np.floating]",
+        start_time: float,
+        travel_time: float,
+    ) -> "NDArray[np.floating]":
+        """Create knot times using start/mid/end speed weights.
+
+        Higher speed weights give the corresponding path segment less time.
+        The total travel time is preserved.
+        """
+        num_segments = len(segment_lengths)
+        if num_segments == 0:
+            return np.array([start_time], dtype=np.float64)
+
+        segment_positions = (np.arange(num_segments, dtype=np.float64) + 0.5) / num_segments
+        profile_positions = np.array([0.0, 0.5, 1.0], dtype=np.float64)
+        segment_speed_weights = np.interp(segment_positions, profile_positions, speed_profile)
+        segment_speed_weights = np.clip(segment_speed_weights, 0.2, None)
+
+        time_weights = segment_lengths / segment_speed_weights
+        time_weights_sum = float(np.sum(time_weights))
+
+        if time_weights_sum < 1e-9:
+            relative_times = np.linspace(0.0, 1.0, num_segments + 1)
+        else:
+            relative_times = np.concatenate(([0.0], np.cumsum(time_weights) / time_weights_sum))
+
+        return start_time + relative_times * travel_time
