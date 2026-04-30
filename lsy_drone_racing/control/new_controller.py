@@ -45,7 +45,7 @@ class NewController(Controller):
         self.ref_acc_feedforward_scale = 0.65
 
         self.fixed_obstacle_pos = np.array(
-            #[[0.08, 0.72, 1.60], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
+            # [[0.08, 0.72, 1.60], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
             [[0.0, 0.75, 1.55], [0.95, 0.32, 1.60], [-1.42, -0.18, 1.60], [-0.58, -0.70, 1.60]],
             dtype=np.float64,
         )
@@ -179,7 +179,6 @@ class NewController(Controller):
         wanted_acc[2] = np.clip(
             wanted_acc[2], -self.ref_acc_vertical_limit, self.ref_acc_vertical_limit
         )
-        
 
         pos_error = wanted_pos - drone_pos
         vel_error = wanted_vel - drone_vel
@@ -271,9 +270,7 @@ class NewController(Controller):
             knot_times = start_time + relative_distances * travel_time
 
         velocities = self._make_spline_tangents(
-            path_points,
-            knot_times,
-            tangent_scale=float(self.segment_tangent_scales[gate_idx]),
+            path_points, knot_times, tangent_scale=float(self.segment_tangent_scales[gate_idx])
         )
 
         spline = CubicHermiteSpline(knot_times, path_points, velocities)
@@ -284,10 +281,10 @@ class NewController(Controller):
 
     def _make_spline_tangents(
         self,
-            path_points: NDArray[np.floating],
-            knot_times: NDArray[np.floating],
-            tangent_scale: float,
-        ) -> NDArray[np.floating]:
+        path_points: NDArray[np.floating],
+        knot_times: NDArray[np.floating],
+        tangent_scale: float,
+    ) -> NDArray[np.floating]:
         tangents = np.zeros_like(path_points)
 
         for i in range(len(path_points)):
@@ -312,25 +309,23 @@ class NewController(Controller):
         # tmp_gate = None
         if gate_idx == 0:
             before_gate, after_gate = self._gate_direction_points(
-                gate_pos[0], gate_angles[0], dist_before=0.15,
-                dist_after=0.4,
+                gate_pos[0], gate_angles[0], dist_before=0.15, dist_after=0.4
             )
-            self._store_gate_direction_points(gate_idx,
-                                               before_gate, after_gate)
+            self._store_gate_direction_points(gate_idx, before_gate, after_gate)
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
                 np.array([-1, 0.6, 0.45]),
-                #np.array([0.1, 0.5, 0.6]),
+                # np.array([0.1, 0.5, 0.6]),
                 before_gate,
                 gate_pos[0],
                 after_gate,
             ]
 
         elif gate_idx == 1:
-            before_gate, after_gate = self._gate_direction_points(gate_pos[1], gate_angles[1], 
-                                                                  dist_before=0.5, dist_after=0.1)
-            self._store_gate_direction_points(gate_idx,
-                                               before_gate, after_gate)
+            before_gate, after_gate = self._gate_direction_points(
+                gate_pos[1], gate_angles[1], dist_before=0.5, dist_after=0.1
+            )
+            self._store_gate_direction_points(gate_idx, before_gate, after_gate)
             checkpoints = [
                 gate_pos[0],
                 self._after_gate_positions[gate_idx - 1],
@@ -344,8 +339,7 @@ class NewController(Controller):
 
         elif gate_idx == 2:
             before_gate, after_gate = self._gate_direction_points(gate_pos[2], gate_angles[2])
-            self._store_gate_direction_points(gate_idx,
-                                               before_gate, after_gate)
+            self._store_gate_direction_points(gate_idx, before_gate, after_gate)
             # tmp_gate = before_gate
             goal_gate = gate_pos[2].copy()
             goal_gate[2] = goal_gate[2] - 0.08
@@ -353,17 +347,17 @@ class NewController(Controller):
             checkpoints = [
                 gate_pos[1],
                 np.array([0.65, 0.82, 1.1]),
-                #np.array([0.0, 0.2, 0.9]),
+                # np.array([0.0, 0.2, 0.9]),
                 before_gate,
                 goal_gate,
                 # after_gate,
             ]
 
         elif gate_idx == 3:
-            before_gate, after_gate = self._gate_direction_points(gate_pos[3], gate_angles[3], 
-                                                                  dist_after=0.2)
-            self._store_gate_direction_points(gate_idx,
-                                               before_gate, after_gate)
+            before_gate, after_gate = self._gate_direction_points(
+                gate_pos[3], gate_angles[3], dist_after=0.2
+            )
+            self._store_gate_direction_points(gate_idx, before_gate, after_gate)
             checkpoints = [
                 gate_pos[2],
                 self._before_gate_positions[gate_idx - 1],
@@ -383,10 +377,7 @@ class NewController(Controller):
         return np.asarray(checkpoints, dtype=np.float64)
 
     def _store_gate_direction_points(
-        self,
-        gate_idx: int,
-        before_gate: NDArray[np.floating],
-        after_gate: NDArray[np.floating],
+        self, gate_idx: int, before_gate: NDArray[np.floating], after_gate: NDArray[np.floating]
     ) -> None:
         self._before_gate_positions[gate_idx] = before_gate.copy()
         self._after_gate_positions[gate_idx] = after_gate.copy()
