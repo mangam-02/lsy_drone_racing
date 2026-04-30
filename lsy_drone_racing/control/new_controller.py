@@ -297,7 +297,8 @@ class NewController(Controller):
             )
             checkpoints = [
                 np.array([-1.5, 0.8, 0.1]),
-                np.array([-1, 0.6, 0.45]),
+                #np.array([-1, 0.6, 0.45]),
+                np.array([0.1, 0.5, 0.6]),
                 before_gate,
                 gate_pos[0],
                 # after_gate,
@@ -324,7 +325,7 @@ class NewController(Controller):
             checkpoints = [
                 gate_pos[1],
                 np.array([0.7, 0.85, 1.1]),
-                np.array([0.0, 0.2, 0.9]),
+                #np.array([0.0, 0.2, 0.9]),
                 before_gate,
                 goal_gate,
                 # after_gate,
