@@ -328,7 +328,7 @@ class NewController(Controller):
 
         elif gate_idx == 1:
             before_gate, after_gate = self._gate_direction_points(gate_pos[1], gate_angles[1], 
-                                                                  dist_before=0.5)
+                                                                  dist_before=0.5, dist_after=0.1)
             self._store_gate_direction_points(gate_idx,
                                                before_gate, after_gate)
             checkpoints = [
