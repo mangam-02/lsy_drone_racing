@@ -61,8 +61,8 @@ class NewController(Controller):
         self._debug_sampled_path: NDArray[np.floating] | None = None
         self._debug_enabled = True
 
-        self.segment_durations = np.array([1.3, 2.0, 2.00, 1.55], dtype=np.float64)
-        self.segment_tangent_scales = np.array([0.80, 0.80, 0.75, 0.65], dtype=np.float64)
+        self.segment_durations = np.array([1.3, 1.8, 2.00, 1.55], dtype=np.float64)
+        self.segment_tangent_scales = np.array([0.80, 0.90, 0.6, 0.6], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -312,7 +312,8 @@ class NewController(Controller):
         # tmp_gate = None
         if gate_idx == 0:
             before_gate, after_gate = self._gate_direction_points(
-                gate_pos[0], gate_angles[0], dist_before=0.15
+                gate_pos[0], gate_angles[0], dist_before=0.15,
+                dist_after=0.4,
             )
             self._store_gate_direction_points(gate_idx,
                                                before_gate, after_gate)
@@ -322,7 +323,7 @@ class NewController(Controller):
                 #np.array([0.1, 0.5, 0.6]),
                 before_gate,
                 gate_pos[0],
-                # after_gate,
+                after_gate,
             ]
 
         elif gate_idx == 1:
@@ -332,6 +333,7 @@ class NewController(Controller):
                                                before_gate, after_gate)
             checkpoints = [
                 gate_pos[0],
+                self._after_gate_positions[gate_idx - 1],
                 # np.array([1, -0.4, 1]),
                 np.array([1.35, -0.2, 1]),
                 # np.array([1.5, -0.1, 1]),
