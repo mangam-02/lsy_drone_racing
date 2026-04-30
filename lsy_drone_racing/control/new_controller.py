@@ -62,6 +62,7 @@ class NewController(Controller):
         self._debug_enabled = True
 
         self.segment_durations = np.array([1.55, 2.0, 2.00, 1.55], dtype=np.float64)
+        self.segment_tangent_scales = np.array([0.80, 0.80, 0.75, 0.65], dtype=np.float64)
 
         self._tick = 0
         self._finished = False
@@ -269,7 +270,12 @@ class NewController(Controller):
             relative_distances = np.concatenate(([0.0], np.cumsum(segment_lengths) / total_length))
             knot_times = start_time + relative_distances * travel_time
 
-        velocities = self._make_spline_tangents(path_points, knot_times)
+        velocities = self._make_spline_tangents(
+            path_points,
+            knot_times,
+            tangent_scale=float(self.segment_tangent_scales[gate_idx]),
+        )
+
         spline = CubicHermiteSpline(knot_times, path_points, velocities)
 
         self._store_sampled_path(spline, start_time, end_time)
@@ -277,8 +283,11 @@ class NewController(Controller):
         return spline, end_time
 
     def _make_spline_tangents(
-        self, path_points: NDArray[np.floating], knot_times: NDArray[np.floating]
-    ) -> NDArray[np.floating]:
+        self,
+            path_points: NDArray[np.floating],
+            knot_times: NDArray[np.floating],
+            tangent_scale: float,
+        ) -> NDArray[np.floating]:
         tangents = np.zeros_like(path_points)
 
         for i in range(len(path_points)):
@@ -294,7 +303,7 @@ class NewController(Controller):
                 dt = knot_times[i + 1] - knot_times[i - 1]
                 tangents[i] = (path_points[i + 1] - path_points[i - 1]) / max(dt, 1e-6)
 
-        return 0.65 * tangents
+        return tangent_scale * tangents
 
     def _make_checkpoint_list(
         self, gate_idx: int, gate_pos: NDArray[np.floating], gate_angles: NDArray[np.floating]
