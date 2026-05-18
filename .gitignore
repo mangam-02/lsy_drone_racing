@@ -14,6 +14,9 @@ plots/
 c_generated_code/
 /build
 
+# wandb training artifacts
+wandb/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
