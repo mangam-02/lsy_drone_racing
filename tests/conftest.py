@@ -1,5 +1,5 @@
-import os
 import gc
+import os
 
 import jax
 import pytest
@@ -15,13 +15,13 @@ skip_if_headless = pytest.mark.skipif(
     reason="DISPLAY is not set, skipping test in headless environment",
 )
 
+
 @pytest.fixture(autouse=True)
 def wipe_jax_memory():
-    """
-    Globally wipe JAX and Python memory after EVERY test in the project.
+    """Globally wipe JAX and Python memory after EVERY test in the project.
     Prevents Out Of Memory (OOM) crashes during large test runs.
     """
-    yield 
+    yield
     gc.collect()
     if hasattr(jax, "clear_caches"):
         jax.clear_caches()

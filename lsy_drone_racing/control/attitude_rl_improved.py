@@ -23,6 +23,7 @@ import torch
 from drone_models.core import load_params
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as scipy_R
+
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.train_rl import Agent
 
@@ -50,8 +51,7 @@ class AttitudeRL(Controller):
         self.samples_dt = 0.1
         self.trajectory_time = 15.0
         self.sample_offsets = np.array(
-            np.arange(self.n_samples) * self.freq * self.samples_dt,
-            dtype=int,
+            np.arange(self.n_samples) * self.freq * self.samples_dt, dtype=int
         )
 
         self._tick = 0
@@ -78,12 +78,9 @@ class AttitudeRL(Controller):
         self.prev_obs = np.tile(basic_obs[None, :], (self.n_obs, 1)).astype(np.float32)
 
     def compute_control(
-        self,
-        obs: dict[str, NDArray[np.floating]],
-        info: dict | None = None,
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
         """Compute collective thrust and desired roll/pitch/yaw."""
-
         if self._tick % self.replan_interval_steps == 0:
             self.trajectory = self._build_race_trajectory(obs)
 
@@ -112,7 +109,6 @@ class AttitudeRL(Controller):
 
     def _obs_rl(self, obs: dict[str, NDArray[np.floating]]) -> NDArray[np.floating]:
         """Build original train_rl.py policy observation."""
-
         obs_rl = {}
 
         obs_rl["basic_obs"] = np.concatenate([obs[k] for k in self.basic_obs_key], axis=-1)
@@ -124,10 +120,7 @@ class AttitudeRL(Controller):
         obs_rl["prev_obs"] = self.prev_obs.reshape(-1)
         obs_rl["last_action"] = self.last_action
 
-        self.prev_obs = np.concatenate(
-            [self.prev_obs[1:, :], obs_rl["basic_obs"][None, :]],
-            axis=0,
-        )
+        self.prev_obs = np.concatenate([self.prev_obs[1:, :], obs_rl["basic_obs"][None, :]], axis=0)
 
         return np.concatenate([v for v in obs_rl.values()], axis=-1).astype(np.float32)
 
@@ -140,24 +133,10 @@ class AttitudeRL(Controller):
         max_yaw = 0.0
 
         scale = np.array(
-            [
-                max_roll_pitch,
-                max_roll_pitch,
-                max_yaw,
-                0.3 * self.hover_thrust,
-            ],
-            dtype=np.float32,
+            [max_roll_pitch, max_roll_pitch, max_yaw, 0.3 * self.hover_thrust], dtype=np.float32
         )
 
-        mean = np.array(
-            [
-                0.0,
-                0.0,
-                0.0,
-                1.05 * self.hover_thrust,
-            ],
-            dtype=np.float32,
-        )
+        mean = np.array([0.0, 0.0, 0.0, 1.05 * self.hover_thrust], dtype=np.float32)
 
         action = np.clip(actions, -1.0, 1.0) * scale + mean
         action[3] = np.clip(action[3], self.thrust_min, self.thrust_max)
@@ -166,7 +145,6 @@ class AttitudeRL(Controller):
 
     def _build_race_trajectory(self, obs: dict[str, NDArray[np.floating]]) -> NDArray[np.float32]:
         """Build a gate-centered trajectory and push it away from obstacles."""
-
         current_pos = np.asarray(obs["pos"], dtype=np.float32).copy()
 
         if "gates_pos" in obs:
@@ -183,8 +161,7 @@ class AttitudeRL(Controller):
 
             if gates_pos.shape[0] == 0:
                 gates_pos = np.asarray(
-                    [current_pos + np.array([0.5, 0.0, 0.0], dtype=np.float32)],
-                    dtype=np.float32,
+                    [current_pos + np.array([0.5, 0.0, 0.0], dtype=np.float32)], dtype=np.float32
                 )
 
             # Gate centers. Keep z in a reasonable flight range.
@@ -222,12 +199,7 @@ class AttitudeRL(Controller):
 
             gate_waypoints = np.asarray(gate_waypoints, dtype=np.float32)
 
-            waypoints = np.vstack(
-                [
-                    current_pos,
-                    gate_waypoints,
-                ]
-            )
+            waypoints = np.vstack([current_pos, gate_waypoints])
         else:
             waypoints = self._default_waypoints()
 
@@ -240,10 +212,7 @@ class AttitudeRL(Controller):
 
         if waypoints.shape[0] < 2:
             waypoints = np.vstack(
-                [
-                    current_pos,
-                    current_pos + np.array([0.5, 0.0, 0.3], dtype=np.float32),
-                ]
+                [current_pos, current_pos + np.array([0.5, 0.0, 0.3], dtype=np.float32)]
             )
 
         n_steps = int(self.freq * self.trajectory_time)

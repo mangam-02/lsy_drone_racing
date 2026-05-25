@@ -12,12 +12,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.so_rpy import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.spatial.transform import Rotation as R
-
-from crazyflow.sim.visualize import draw_line, draw_points
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.trajectory_planner import TrajectoryPlanner
@@ -121,6 +120,7 @@ class MPCController(Controller):
     """Attitude-mode MPC with minimum-snap gate-to-gate trajectory planning."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        """Initialize attitude-mode MPC racing controller and pre-plan the trajectory."""
         super().__init__(obs, info, config)
         self._N = 25
         self._dt = 1 / config.env.freq
@@ -188,17 +188,19 @@ class MPCController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
+        """Advance tick; replan if new gate/obstacle positions are revealed."""
         self._tick += 1
         if self._planner.update(obs):
             self._tick = 0
             self._warm_started = False
         return self._tick >= self._planner.tick_max
 
-    def render_callback(self, sim):
+    def render_callback(self, sim: object) -> None:
         """Draw the planned trajectory as a green line and current target as a red dot."""
         draw_line(sim, self._planner.pos, rgba=(0.0, 1.0, 0.0, 1.0))
         pos_ref, _ = self._planner.get_reference(self._tick)
         draw_points(sim, pos_ref[:1], rgba=(1.0, 0.0, 0.0, 1.0), size=0.05)
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
+        """Reset tick counter at episode start."""
         self._tick = 0

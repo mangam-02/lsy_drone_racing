@@ -106,11 +106,7 @@ def create_ocp_solver(
     ocp.solver_options.tf = Tf
 
     acados_ocp_solver = AcadosOcpSolver(
-        ocp,
-        json_file="c_generated_code/hover_mpc.json",
-        verbose=verbose,
-        build=True,
-        generate=True,
+        ocp, json_file="c_generated_code/hover_mpc.json", verbose=verbose, build=True, generate=True
     )
 
     return acados_ocp_solver, ocp
@@ -127,6 +123,7 @@ class HoverMPC(Controller):
     HOVER_DURATION = 15  # s
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        """Initialize hover MPC at the drone's initial x/y position."""
         super().__init__(obs, info, config)
         self._N = 25
         self._dt = 1 / config.env.freq
@@ -183,9 +180,19 @@ class HoverMPC(Controller):
         self._acados_ocp_solver.solve()
         return self._acados_ocp_solver.get(0, "u")
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Advance tick; return True when hover duration has elapsed."""
         self._tick += 1
         return self._finished
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
+        """Reset tick counter at episode start."""
         self._tick = 0
