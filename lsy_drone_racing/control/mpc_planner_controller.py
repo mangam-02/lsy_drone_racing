@@ -27,6 +27,8 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
+import scipy.linalg
+from acados_template import AcadosOcp, AcadosOcpSolver
 from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.utils.rotation import ang_vel2rpy_rates
@@ -35,10 +37,81 @@ from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.attitude_mpc import create_ocp_solver
+from lsy_drone_racing.control.attitude_mpc import create_acados_model
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+
+# ── MPC solver with a ground (z) hard constraint ────────────────────────────────
+
+
+def _create_ocp_solver(
+    Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
+    verbose: bool = False,
+) -> tuple[AcadosOcpSolver, AcadosOcp]:
+    """Acados OCP/solver that tracks a reference and keeps the drone above ground.
+
+    Same formulation as ``attitude_mpc.create_ocp_solver`` but adds a hard state
+    bound on the z position (index 2): ``z_min <= z <= z_max`` on every shooting
+    node. With ``z_min = 0`` the MPC can never plan a path through the floor.
+    """
+    ocp = AcadosOcp()
+    ocp.model = create_acados_model(parameters)
+    ocp.model.name = "mpc_planner_ground"  # distinct generated-code name
+
+    nx = ocp.model.x.rows()
+    nu = ocp.model.u.rows()
+    ny = nx + nu
+    ny_e = nx
+    ocp.solver_options.N_horizon = N
+
+    ocp.cost.cost_type = "LINEAR_LS"
+    ocp.cost.cost_type_e = "LINEAR_LS"
+    Q = np.diag([50.0, 50.0, 400.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 5.0, 5.0, 5.0])
+    Rmat = np.diag([1.0, 1.0, 1.0, 50.0])
+    ocp.cost.W = scipy.linalg.block_diag(Q, Rmat)
+    ocp.cost.W_e = Q.copy()
+
+    Vx = np.zeros((ny, nx))
+    Vx[0:nx, 0:nx] = np.eye(nx)
+    ocp.cost.Vx = Vx
+    Vu = np.zeros((ny, nu))
+    Vu[nx : nx + nu, :] = np.eye(nu)
+    ocp.cost.Vu = Vu
+    Vx_e = np.zeros((ny_e, nx))
+    Vx_e[0:nx, 0:nx] = np.eye(nx)
+    ocp.cost.Vx_e = Vx_e
+    ocp.cost.yref, ocp.cost.yref_e = np.zeros((ny,)), np.zeros((ny_e,))
+
+    # State constraints: z floor/ceiling (index 2) + rpy < ~30 deg (indices 3,4,5).
+    ocp.constraints.lbx = np.array([z_min, -0.5, -0.5, -0.5])
+    ocp.constraints.ubx = np.array([z_max, 0.5, 0.5, 0.5])
+    ocp.constraints.idxbx = np.array([2, 3, 4, 5])
+
+    # Input constraints (rpy + collective thrust).
+    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
+    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
+    ocp.constraints.idxbu = np.array([0, 1, 2, 3])
+
+    ocp.constraints.x0 = np.zeros((nx))
+
+    ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
+    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+    ocp.solver_options.integrator_type = "ERK"
+    ocp.solver_options.nlp_solver_type = "SQP"
+    ocp.solver_options.tol = 1e-6
+    ocp.solver_options.qp_solver_cond_N = N
+    ocp.solver_options.qp_solver_warm_start = 1
+    ocp.solver_options.qp_solver_iter_max = 20
+    ocp.solver_options.nlp_solver_max_iter = 50
+    ocp.solver_options.tf = Tf
+
+    solver = AcadosOcpSolver(
+        ocp, json_file="c_generated_code/mpc_planner_ground.json",
+        verbose=verbose, build=True, generate=True,
+    )
+    return solver, ocp
 
 
 # ── Obstacle primitives ─────────────────────────────────────────────────────────
@@ -518,6 +591,10 @@ class MPCPlanner(Controller):
     #: have "changed" and trigger a replan.
     REPLAN_TOL = 1e-3
 
+    #: Hard MPC floor: the drone's z position may never go below this (m). Kept at
+    #: ground level so it stays feasible at takeoff (start height ~0.01 m).
+    GROUND_Z = 0.0
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Build the MPC solver and the initial reference trajectory.
 
@@ -535,8 +612,9 @@ class MPCPlanner(Controller):
         self._T_HORIZON = self._N * self._dt
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
-        self._acados_ocp_solver, self._ocp = create_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params
+        # Solver with a hard ground constraint (z >= GROUND_Z on every node).
+        self._acados_ocp_solver, self._ocp = _create_ocp_solver(
+            self._T_HORIZON, self._N, self.drone_params, z_min=self.GROUND_Z
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
