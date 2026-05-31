@@ -30,7 +30,7 @@ import numpy as np
 from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.utils.rotation import ang_vel2rpy_rates
-from scipy.interpolate import make_interp_spline
+from scipy.interpolate import splev, splprep
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as R
 
@@ -83,6 +83,26 @@ class _GateFrame:
             return False
         return not (abs(local[1]) <= self.hi and abs(local[2]) <= self.hi)
 
+    def penetration(self, points: np.ndarray) -> np.ndarray:
+        """Per-point penetration depth (m) into the solid frame material.
+
+        Returns 0 where a point is safe — i.e. far from the gate plane
+        (outside the depth slab), inside the opening (fly-through), or outside the
+        outer square (flying around). Inside the square frame ring it returns the
+        distance to the nearest safe edge, so the optimizer is pushed either into
+        the opening or out past the frame.
+
+        The frame is a square annulus in the gate plane, so the Chebyshev distance
+        ``m = max(|y|, |z|)`` cleanly separates opening (m<=hi), frame (hi<m<ho)
+        and free space (m>=ho).
+        """
+        local = self.rot_inv.apply(points - self.center)
+        lx, ly, lz = np.abs(local[:, 0]), np.abs(local[:, 1]), np.abs(local[:, 2])
+        m = np.maximum(ly, lz)
+        in_material = (lx <= self.hd) & (m > self.hi) & (m < self.ho)
+        depth = np.minimum(m - self.hi, self.ho - m)
+        return np.where(in_material, depth, 0.0)
+
 
 def _free_3d(p1: np.ndarray, p2: np.ndarray, obstacles: list, n: int = 10) -> bool:
     """True if segment p1→p2 clears all 3D obstacle objects."""
@@ -107,17 +127,27 @@ class BSplinePlanner:
     pos/vel arrays are just indexed by tick.
     """
 
-    TARGET_SPEED = 1.5  # m/s — inter-gate speed for time assignment
-    GATE_SPEED = 1.2  # m/s — crossing speed tag at gate waypoints
+    TARGET_SPEED = 1.5  # m/s — cruise speed of the velocity profile
+    V_EDGE = 0.6  # m/s — speed at trajectory start/end (ramp endpoints)
+    ACCEL_DIST = 0.8  # m — arc length over which to ramp up to cruise speed
+    DECEL_DIST = 0.8  # m — arc length over which to ramp down at the end
+    GATE_SPEED = 1.2  # m/s — crossing speed tag at gate waypoints (marks them fixed)
     APPROACH_DIST = 0.35  # m — fixed orthogonal waypoint before each gate (gate normal)
     DEPART_DIST = 0.35  # m — fixed orthogonal waypoint after each gate (gate normal)
-    DRONE_RADIUS = 0.07  # m — gate frame inflation
+    DRONE_RADIUS = 0.07  # m — gate frame inflation (drone half-extent)
+    FRAME_MARGIN = 0.05  # m — extra gate-frame inflation as tracking reserve
+    GATE_FRAME_WEIGHT = 10.0  # penalty weight for entering gate frame material
+    CYL_WEIGHT = 20.0  # penalty weight for violating obstacle clearance
     PLAN_CLEARANCE = 0.145  # m — physical drone-to-obstacle clearance
     N_INTERMEDIATE = 2  # optimisable waypoints per inter-gate segment
     N_SAMPLE = 100  # trajectory points sampled for obstacle check
     OPT_MAXITER = 300  # max L-BFGS-B iterations
-    REFINE_TIME_BUDGET = 5.0  # seconds — optional time budget when maxiter is set
+    MAX_OPT_TIME = 0.25  # seconds — wall-clock budget for the optimizer (online replan)
     BSPLINE_DEGREE = 3  # cubic B-spline (C2 continuous)
+    SMOOTHING = 0.15  # splprep smoothing factor s (0 = interpolate, larger = smoother)
+    W_ANCHOR = 30.0  # fit weight for the start waypoint (must hold)
+    W_GATE = 4.0  # fit weight for gate entry/center/exit (loose enough to round corners)
+    W_FREE = 1.0  # fit weight for optimized intermediates (free to smooth)
 
     _WP_LO = np.array([-2.4, -1.4, 0.1])
     _WP_HI = np.array([2.4, 1.4, 1.45])
@@ -170,7 +200,7 @@ class BSplinePlanner:
 
         t0 = time.perf_counter()
         opt_intermediates = self._optimize(
-            obs["pos"].copy(), obs["vel"].copy(), gate_data, cyl_tuples
+            obs["pos"].copy(), obs["vel"].copy(), gate_data, cyl_tuples, gate_frames
         )
         print(f"[BSplinePlanner] optimization done in {(time.perf_counter() - t0) * 1e3:.3f} ms")
 
@@ -186,7 +216,7 @@ class BSplinePlanner:
             for opos in obs["obstacles_pos"]
         ]
         gate_frames = [
-            _GateFrame(gpos, gquat, drone_r=self.DRONE_RADIUS)
+            _GateFrame(gpos, gquat, drone_r=self.DRONE_RADIUS + self.FRAME_MARGIN)
             for gpos, gquat in zip(obs["gates_pos"], obs["gates_quat"])
         ]
         return cylinders, gate_frames
@@ -237,6 +267,7 @@ class BSplinePlanner:
         drone_vel: np.ndarray,
         gate_data: list[tuple],
         cyl_tuples: list[tuple],
+        gate_frames: list = (),
         x0_override: np.ndarray | None = None,
         maxiter: int | None = None,
     ) -> np.ndarray:
@@ -254,13 +285,12 @@ class BSplinePlanner:
         def cost(x: np.ndarray) -> float:
             intermediates = x.reshape(n_wps, 3)
             raw = self._build_waypoint_list(drone_pos, drone_vel, gate_data, intermediates)
-            return self._trajectory_cost(raw, cyl_tuples)
+            return self._trajectory_cost(raw, cyl_tuples, gate_frames)
 
         t_start = time.perf_counter()
-        budget = self.REFINE_TIME_BUDGET if maxiter else None
 
         def _time_cb(xk: np.ndarray) -> None:
-            if budget is not None and (time.perf_counter() - t_start) > budget:
+            if (time.perf_counter() - t_start) > self.MAX_OPT_TIME:
                 raise StopIteration
 
         result = minimize(
@@ -320,10 +350,20 @@ class BSplinePlanner:
                     pts[seg_i * self.N_INTERMEDIATE + k] = seg_start + frac * (entry_pt - seg_start)
         return pts
 
-    def _trajectory_cost(self, raw: list[tuple], cyl_tuples: list[tuple]) -> float:
-        """Evaluate obstacle violation along the sampled B-spline trajectory."""
+    def _trajectory_cost(
+        self, raw: list[tuple], cyl_tuples: list[tuple], gate_frames: list = ()
+    ) -> float:
+        """Evaluate obstacle + gate-frame violation along the smoothed B-spline.
+
+        Cylinders use a soft clearance margin; gate frames penalise any point that
+        enters the solid frame material. The frame opening is exempt, so the
+        targeted gate stays fly-through while every gate is avoided otherwise.
+        """
         try:
-            traj_pos, _, _ = self._sample(raw, self.N_SAMPLE)
+            tck = self._fit(raw)
+            u = np.linspace(0.0, 1.0, self.N_SAMPLE)
+            x, y, z = splev(u, tck)
+            traj_pos = np.stack([x, y, z], axis=1)
         except Exception:
             return 1e6
 
@@ -331,7 +371,11 @@ class BSplinePlanner:
         for cx, cy, r in cyl_tuples:
             dist = np.linalg.norm(traj_pos[:, :2] - np.array([cx, cy]), axis=1)
             violation = np.maximum(0.0, r - dist)
-            cost += float(np.sum(violation**2))
+            cost += self.CYL_WEIGHT * float(np.sum(violation**2))
+
+        for gate in gate_frames:
+            pen = gate.penetration(traj_pos)
+            cost += self.GATE_FRAME_WEIGHT * float(np.sum(pen**2))
         return cost
 
     # ── Waypoint assembly ─────────────────────────────────────────────────────
@@ -347,53 +391,121 @@ class BSplinePlanner:
 
         Gate-related waypoints carry a velocity tag (along the gate normal); the
         optimised intermediates carry ``None`` so callers can tell them apart.
+
+        For the current target gate (the first segment), any leading waypoint that
+        the drone has already passed along the gate normal is dropped. This avoids
+        a backward/sideways jog when replanning happens close to the gate (the
+        entry point would otherwise sit behind the drone).
         """
         points = [(drone_pos, drone_vel)]
 
         for seg_i, (gate_center, x_axis, entry_pt, exit_pt) in enumerate(gate_data):
-            for k in range(self.N_INTERMEDIATE):
-                wp = intermediates[seg_i * self.N_INTERMEDIATE + k]
-                points.append((wp.copy(), None))
-            points.append((entry_pt, x_axis * self.GATE_SPEED))
-            points.append((gate_center, x_axis * self.GATE_SPEED))
-            points.append((exit_pt, x_axis * self.GATE_SPEED))
+            gate_wps = [entry_pt, gate_center, exit_pt]
+            skip_intermediates = False
+            if seg_i == 0:
+                while len(gate_wps) > 1 and np.dot(drone_pos - gate_wps[0], x_axis) > 0:
+                    gate_wps.pop(0)
+                skip_intermediates = len(gate_wps) < 3  # entry was dropped
+
+            if not skip_intermediates:
+                for k in range(self.N_INTERMEDIATE):
+                    wp = intermediates[seg_i * self.N_INTERMEDIATE + k]
+                    points.append((wp.copy(), None))
+            for wp in gate_wps:
+                points.append((wp, x_axis * self.GATE_SPEED))
 
         last_x = gate_data[-1][1]
         last_exit = gate_data[-1][3]
         points.append((last_exit + last_x * 0.3, np.zeros(3)))
         return points
 
-    # ── Finalise trajectory (B-spline) ────────────────────────────────────────
+    # ── Finalise trajectory (smoothed B-spline + arc-length speed profile) ─────
 
-    def _finalize(self, raw: list[tuple]):
-        times, _ = self._times_and_positions(raw)
-        t_total = float(times[-1])
-        n_samp = max(int(self.freq * t_total), self.N + 2)
-        self.pos, self.vel, _ = self._sample(raw, n_samp)
-        self.tick_max = n_samp - 1 - self.N
+    def _fit(self, raw: list[tuple]) -> tuple:
+        """Fit a weighted, smoothing B-spline through the waypoints (option A).
 
-    def _times_and_positions(self, raw: list[tuple]) -> tuple[np.ndarray, np.ndarray]:
-        """Cumulative arrival times and positions (strictly increasing times)."""
-        times, P, t = [], [], 0.0
-        prev = np.asarray(raw[0][0])
-        for i, (pos, _vel) in enumerate(raw):
-            pos = np.asarray(pos)
-            if i > 0:
-                t += max(np.linalg.norm(pos - prev) / self.TARGET_SPEED, 0.1)
-            times.append(t)
-            P.append(pos)
-            prev = pos
-        times, P = np.asarray(times), np.asarray(P)
-        keep = np.concatenate(([True], np.diff(times) > 1e-9))
-        return times[keep], P[keep]
-
-    def _sample(self, raw: list[tuple], n_samples: int) -> tuple[np.ndarray, np.ndarray, float]:
-        """Sample (pos, vel, t_total) along the interpolating B-spline."""
-        times, P = self._times_and_positions(raw)
+        Gate/start waypoints get high weights so the curve stays tight to them;
+        optimized intermediates get low weights so the spline can smooth out the
+        sharp kinks that an exact interpolation would create.
+        """
+        P = np.array([np.asarray(p) for p, _ in raw], dtype=float)
+        w = self._fit_weights(raw)
+        # splprep requires distinct consecutive points; drop duplicates (they occur
+        # when e.g. _safe_entry falls back onto the gate center).
+        keep = np.concatenate(([True], np.linalg.norm(np.diff(P, axis=0), axis=1) > 1e-6))
+        P, w = P[keep], w[keep]
         k = min(self.BSPLINE_DEGREE, len(P) - 1)
-        spline = make_interp_spline(times, P, k=k)
-        t_s = np.linspace(0.0, times[-1], n_samples)
-        return spline(t_s), spline.derivative()(t_s), float(times[-1])
+        tck, _ = splprep([P[:, 0], P[:, 1], P[:, 2]], w=w, k=k, s=self.SMOOTHING)
+        return tck
+
+    def _fit_weights(self, raw: list[tuple]) -> np.ndarray:
+        """Per-waypoint fit weights: anchor start, hold gates, free intermediates."""
+        n = len(raw)
+        w = np.empty(n)
+        for i, (_pos, vel) in enumerate(raw):
+            if i == 0:
+                w[i] = self.W_ANCHOR
+            elif i == n - 1:
+                w[i] = 0.5 * self.W_ANCHOR
+            elif vel is not None:  # gate entry / center / exit
+                w[i] = self.W_GATE
+            else:  # optimized intermediate
+                w[i] = self.W_FREE
+        return w
+
+    def _speed_profile(self, s: np.ndarray, length: float) -> np.ndarray:
+        """Trapezoidal speed profile over arc length (option C).
+
+        Cruises at TARGET_SPEED with smooth (smoothstep) ramps from/to V_EDGE at
+        the start and end so the reference speed is continuous and bounded.
+        """
+        v = np.full_like(s, self.TARGET_SPEED)
+        dv = self.TARGET_SPEED - self.V_EDGE
+        a = min(self.ACCEL_DIST, 0.5 * length)
+        d = min(self.DECEL_DIST, 0.5 * length)
+        if a > 1e-6:
+            m = s < a
+            f = s[m] / a
+            v[m] = self.V_EDGE + dv * (3 * f**2 - 2 * f**3)
+        if d > 1e-6:
+            m = s > length - d
+            f = (length - s[m]) / d
+            v[m] = np.minimum(v[m], self.V_EDGE + dv * (3 * f**2 - 2 * f**3))
+        return np.clip(v, self.V_EDGE, None)
+
+    def _finalize(self, raw: list[tuple], n_dense: int = 2000):
+        """Resample the fitted curve at constant time step with the speed profile."""
+        tck = self._fit(raw)
+
+        # Dense geometric sampling + arc length.
+        u = np.linspace(0.0, 1.0, n_dense)
+        x, y, z = splev(u, tck)
+        P = np.stack([x, y, z], axis=1)
+        seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        length = float(s[-1])
+
+        # Speed profile -> time of each dense node (t = ∫ ds / v).
+        v = self._speed_profile(s, length)
+        dt_seg = np.diff(s) / np.clip(0.5 * (v[:-1] + v[1:]), 1e-3, None)
+        t = np.concatenate([[0.0], np.cumsum(dt_seg)])
+        t_total = float(t[-1])
+
+        # Resample at uniform time -> arc length -> spline parameter.
+        n_samp = max(int(self.freq * t_total), self.N + 2)
+        t_q = np.linspace(0.0, t_total, n_samp)
+        s_q = np.interp(t_q, t, s)
+        u_q = np.interp(s_q, s, u)
+
+        xq, yq, zq = splev(u_q, tck)
+        dxq, dyq, dzq = splev(u_q, tck, der=1)
+        tangent = np.stack([dxq, dyq, dzq], axis=1)
+        tangent /= np.clip(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9, None)
+        v_q = np.interp(s_q, s, v)
+
+        self.pos = np.stack([xq, yq, zq], axis=1)
+        self.vel = v_q[:, None] * tangent
+        self.tick_max = n_samp - 1 - self.N
 
 
 # ── Controller ────────────────────────────────────────────────────────────────
@@ -539,6 +651,12 @@ class MPCPlanner(Controller):
                 sim, np.atleast_2d(obs["gates_pos"]),
                 rgba=np.array([1.0, 1.0, 0.0, 1.0]), size=0.08,
             )
+            # Gate frames: outer square (cyan) + opening (white), real dimensions.
+            for gpos, gquat in zip(obs["gates_pos"], obs["gates_quat"]):
+                self._draw_square(sim, gpos, gquat, _GateFrame.OUTER / 2,
+                                   np.array([0.0, 1.0, 1.0, 1.0]))
+                self._draw_square(sim, gpos, gquat, _GateFrame.OPENING / 2,
+                                   np.array([1.0, 1.0, 1.0, 1.0]))
             for opos in np.atleast_2d(obs["obstacles_pos"]):
                 pole = np.array([[opos[0], opos[1], 0.0], [opos[0], opos[1], opos[2]]])
                 orange = np.array([1.0, 0.5, 0.0, 1.0])
@@ -555,10 +673,21 @@ class MPCPlanner(Controller):
             if len(fixed):
                 draw_points(sim, fixed, rgba=np.array([1.0, 0.0, 1.0, 1.0]), size=0.05)
 
-        # Planned trajectory (downsampled to ~30 segments to stay light).
+        # Planned trajectory (downsampled to ~20 segments to stay light).
         traj = self.planner.pos
-        step = max(1, len(traj) // 30)
+        step = max(1, len(traj) // 20)
         draw_line(sim, traj[::step], rgba=np.array([0.0, 1.0, 0.0, 1.0]))
+
+    @staticmethod
+    def _draw_square(sim: object, center: np.ndarray, quat: np.ndarray, half: float,
+                     rgba: np.ndarray) -> None:
+        """Draw an oriented square outline in the gate plane (local y-z plane)."""
+        rot = R.from_quat(quat)
+        local = np.array([
+            [0.0, half, half], [0.0, -half, half],
+            [0.0, -half, -half], [0.0, half, -half], [0.0, half, half],
+        ])
+        draw_line(sim, center + rot.apply(local), rgba=rgba)
 
     def episode_callback(self):
         """Reset the trajectory index after an episode."""
