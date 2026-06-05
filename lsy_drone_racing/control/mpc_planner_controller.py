@@ -24,6 +24,7 @@ state so the trajectory always reflects the latest knowledge of the track.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -259,17 +260,36 @@ class BSplinePlanner:
 
     # ── Build / optimise ──────────────────────────────────────────────────────
 
-    def build(self, obs: dict):
-        """Run offline optimiser and store pre-computed trajectory."""
+    def build(self, obs: dict, v_start: float | None = None):
+        """Run offline optimiser and store pre-computed trajectory (synchronous).
+
+        Thin wrapper that computes a trajectory and applies it to ``self`` in one
+        step. Used for the initial (takeoff) build; online replanning instead calls
+        :meth:`_compute_trajectory` in a worker thread and :meth:`_apply_trajectory`
+        on the main thread (see :class:`MPCPlanner`).
+        """
+        self._apply_trajectory(self._compute_trajectory(obs, v_start))
+
+    def _compute_trajectory(self, obs: dict, v_start: float | None = None) -> dict:
+        """Compute a trajectory without mutating ``self`` (thread-safe worker body).
+
+        Returns a result dict with keys ``pos``/``vel``/``tick_max``/``raw_waypoints``
+        that :meth:`_apply_trajectory` can install. ``v_start`` seeds the speed
+        profile so a replanned trajectory continues at the drone's current speed
+        instead of dropping back to ``V_EDGE`` (defaults to ``V_EDGE``).
+        """
+        if v_start is None:
+            v_start = self.V_EDGE
         target_gate = int(obs["target_gate"])
 
         if target_gate == -1:
             n = self.N + 2
-            self.pos = np.tile(obs["pos"], (n, 1))
-            self.vel = np.zeros((n, 3))
-            self.tick_max = 1
-            self._raw_waypoints = [(obs["pos"].copy(), np.zeros(3))]
-            return
+            return {
+                "pos": np.tile(obs["pos"], (n, 1)),
+                "vel": np.zeros((n, 3)),
+                "tick_max": 1,
+                "raw_waypoints": [(obs["pos"].copy(), np.zeros(3))],
+            }
 
         cylinders, gate_frames = self._build_obstacles(obs)
         gate_data = self._compute_gate_data(obs, target_gate, cylinders, gate_frames)
@@ -284,8 +304,16 @@ class BSplinePlanner:
         raw = self._build_waypoint_list(
             obs["pos"].copy(), obs["vel"].copy(), gate_data, opt_intermediates
         )
-        self._raw_waypoints = raw
-        self._finalize(raw)
+        result = self._finalize(raw, v_start)
+        result["raw_waypoints"] = raw
+        return result
+
+    def _apply_trajectory(self, result: dict) -> None:
+        """Install a trajectory computed by :meth:`_compute_trajectory` (main thread)."""
+        self.pos = result["pos"]
+        self.vel = result["vel"]
+        self.tick_max = result["tick_max"]
+        self._raw_waypoints = result["raw_waypoints"]
 
     def _build_obstacles(self, obs: dict) -> tuple[list, list]:
         cylinders = [
@@ -530,28 +558,38 @@ class BSplinePlanner:
                 w[i] = self.W_FREE
         return w
 
-    def _speed_profile(self, s: np.ndarray, length: float) -> np.ndarray:
+    def _speed_profile(
+        self, s: np.ndarray, length: float, v_start: float | None = None
+    ) -> np.ndarray:
         """Trapezoidal speed profile over arc length (option C).
 
-        Cruises at TARGET_SPEED with smooth (smoothstep) ramps from/to V_EDGE at
-        the start and end so the reference speed is continuous and bounded.
+        Cruises at TARGET_SPEED with smooth (smoothstep) ramps at the start and end
+        so the reference speed is continuous and bounded. The start ramp begins at
+        ``v_start`` (defaults to ``V_EDGE``); seeding it with the drone's current
+        speed avoids a discontinuous jump down to ``V_EDGE`` when replanning in
+        flight. The end ramp always settles to ``V_EDGE``.
         """
+        if v_start is None:
+            v_start = self.V_EDGE
         v = np.full_like(s, self.TARGET_SPEED)
-        dv = self.TARGET_SPEED - self.V_EDGE
         a = min(self.ACCEL_DIST, 0.5 * length)
         d = min(self.DECEL_DIST, 0.5 * length)
         if a > 1e-6:
             m = s < a
             f = s[m] / a
-            v[m] = self.V_EDGE + dv * (3 * f**2 - 2 * f**3)
+            v[m] = v_start + (self.TARGET_SPEED - v_start) * (3 * f**2 - 2 * f**3)
         if d > 1e-6:
             m = s > length - d
             f = (length - s[m]) / d
-            v[m] = np.minimum(v[m], self.V_EDGE + dv * (3 * f**2 - 2 * f**3))
+            v[m] = np.minimum(v[m], self.V_EDGE + (self.TARGET_SPEED - self.V_EDGE) * (3 * f**2 - 2 * f**3))
         return np.clip(v, self.V_EDGE, None)
 
-    def _finalize(self, raw: list[tuple], n_dense: int = 2000):
-        """Resample the fitted curve at constant time step with the speed profile."""
+    def _finalize(self, raw: list[tuple], v_start: float | None = None, n_dense: int = 2000) -> dict:
+        """Resample the fitted curve at constant time step with the speed profile.
+
+        Returns a result dict (``pos``/``vel``/``tick_max``) instead of mutating
+        ``self`` so it can run in a background worker thread.
+        """
         tck = self._fit(raw)
 
         # Dense geometric sampling + arc length.
@@ -563,7 +601,7 @@ class BSplinePlanner:
         length = float(s[-1])
 
         # Speed profile -> time of each dense node (t = ∫ ds / v).
-        v = self._speed_profile(s, length)
+        v = self._speed_profile(s, length, v_start)
         dt_seg = np.diff(s) / np.clip(0.5 * (v[:-1] + v[1:]), 1e-3, None)
         t = np.concatenate([[0.0], np.cumsum(dt_seg)])
         t_total = float(t[-1])
@@ -580,9 +618,11 @@ class BSplinePlanner:
         tangent /= np.clip(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9, None)
         v_q = np.interp(s_q, s, v)
 
-        self.pos = np.stack([xq, yq, zq], axis=1)
-        self.vel = v_q[:, None] * tangent
-        self.tick_max = n_samp - 1 - self.N
+        return {
+            "pos": np.stack([xq, yq, zq], axis=1),
+            "vel": v_q[:, None] * tangent,
+            "tick_max": n_samp - 1 - self.N,
+        }
 
 
 # ── Controller ────────────────────────────────────────────────────────────────
@@ -630,9 +670,20 @@ class MPCPlanner(Controller):
         self.planner = BSplinePlanner(obs, config, N=self._N)
         self._snapshot_objects(obs)  # remember poses we just planned with
 
+        # Background replanning: the heavy planner build runs in a worker thread so
+        # it never stalls the 50 Hz control loop. The drone keeps flying the current
+        # trajectory until the new one is ready, then we swap it in atomically.
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._replan_future = None
+
         self._tick = 0
         self._finished = False
         self._last_obs = obs  # latest observation, for rendering registered poses
+
+        # Solver fallback: last command from a successful solve, plus a hover command
+        # (level attitude + hover thrust) as the very first fallback.
+        self._last_u = None
+        self._hover_cmd = np.array([0.0, 0.0, 0.0, self._hover_thrust])
 
     # ── Re-planning ────────────────────────────────────────────────────────────
 
@@ -650,12 +701,47 @@ class MPCPlanner(Controller):
             or np.any(np.abs(obs["obstacles_pos"] - self._last_obstacles_pos) > self.REPLAN_TOL)
         )
 
+    @staticmethod
+    def _copy_obs(obs: dict) -> dict:
+        """Snapshot the observation so the worker never reads sim-reused buffers."""
+        return {k: (v.copy() if hasattr(v, "copy") else v) for k, v in obs.items()}
+
+    def _nearest_tick(self, drone_pos: np.ndarray) -> int:
+        """Trajectory index closest to the drone, clipped to the valid range.
+
+        After a background replan finishes the drone has moved on from the position
+        the plan was built from, so we resume tracking at the nearest point instead
+        of restarting at 0.
+        """
+        d = np.linalg.norm(self.planner.pos - drone_pos, axis=1)
+        return int(np.clip(np.argmin(d), 0, self.planner.tick_max))
+
     def _maybe_replan(self, obs: dict):
-        """Rebuild the trajectory from the current state if the track changed."""
-        if self._objects_changed(obs):
-            self.planner.build(obs)  # plans from obs["pos"] -> restart tracking at 0
-            self._tick = 0
-            self._snapshot_objects(obs)
+        """Swap in a finished replan and/or kick off a new one — never blocking.
+
+        The heavy build runs in a worker thread. Each tick we (1) install a finished
+        trajectory if one is ready, realigning the tick to the drone's current
+        position, and (2) submit a new build if the track changed and none is in
+        flight. Snapshotting the poses at submit time prevents re-submitting the same
+        change every tick.
+        """
+        # (1) Install a finished replan.
+        if self._replan_future is not None and self._replan_future.done():
+            try:
+                result = self._replan_future.result()
+                self.planner._apply_trajectory(result)
+                self._tick = self._nearest_tick(obs["pos"])
+            except Exception as exc:  # keep flying the current trajectory on failure
+                print(f"[MPCPlanner] background replan failed: {exc!r}")
+            self._replan_future = None
+
+        # (2) Kick off a new replan if the track changed and none is in flight.
+        if self._replan_future is None and self._objects_changed(obs):
+            v_start = max(float(np.linalg.norm(obs["vel"])), BSplinePlanner.V_EDGE)
+            self._replan_future = self._executor.submit(
+                self.planner._compute_trajectory, self._copy_obs(obs), v_start
+            )
+            self._snapshot_objects(obs)  # plan reflects these poses now
 
     # ── Control ─────────────────────────────────────────────────────────────────
 
@@ -699,8 +785,14 @@ class MPCPlanner(Controller):
         self._acados_ocp_solver.set(self._N, "yref", yref_e)
 
         # ── Solve ──────────────────────────────────────────────────────────────
-        self._acados_ocp_solver.solve()
-        return self._acados_ocp_solver.get(0, "u")
+        # On a failed solve (non-zero status) the returned solution may be garbage,
+        # so hold the last good command (hover on the very first failure) instead.
+        status = self._acados_ocp_solver.solve()
+        if status == 0:
+            self._last_u = self._acados_ocp_solver.get(0, "u")
+            return self._last_u
+        print(f"[MPCPlanner] MPC solve failed (status={status}) at tick {self._tick}; holding last command")
+        return self._last_u if self._last_u is not None else self._hover_cmd
 
     def step_callback(
         self,
@@ -771,11 +863,19 @@ class MPCPlanner(Controller):
         ])
         draw_line(sim, center + rot.apply(local), rgba=rgba)
 
+    def _cancel_replan(self):
+        """Drop any pending background replan (keeps the executor for reuse)."""
+        if self._replan_future is not None:
+            self._replan_future.cancel()
+            self._replan_future = None
+
     def episode_callback(self):
         """Reset the trajectory index after an episode."""
         self._tick = 0
+        self._cancel_replan()
 
     def episode_reset(self):
         """Reset internal state for a new episode."""
         self._tick = 0
         self._finished = False
+        self._cancel_replan()
