@@ -207,12 +207,16 @@ class BSplinePlanner:
     GATE_SPEED = 1.2  # m/s — crossing speed tag at gate waypoints (marks them fixed)
     APPROACH_DIST = 0.35  # m — fixed orthogonal waypoint before each gate (gate normal)
     DEPART_DIST = 0.35  # m — fixed orthogonal waypoint after each gate (gate normal)
-    DRONE_RADIUS = 0.07  # m — gate frame inflation (drone half-extent)
+    DRONE_RADIUS = 0.07  # m — drone half-extent (gate inflation & obstacle clearance)
     FRAME_MARGIN = 0.05  # m — extra gate-frame inflation as tracking reserve
+    OBSTACLE_RADIUS = 0.015  # m — physical pole radius (0.03 m diameter)
+    OBSTACLE_BUFFER = 0.06  # m — extra safety gap between drone and obstacle surface
     GATE_FRAME_WEIGHT = 10.0  # penalty weight for entering gate frame material
     CYL_WEIGHT = 20.0  # penalty weight for violating obstacle clearance
-    PLAN_CLEARANCE = 0.145  # m — physical drone-to-obstacle clearance
-    N_INTERMEDIATE = 2  # optimisable waypoints per inter-gate segment
+    # Min center-to-center distance the trajectory must keep from an obstacle:
+    # obstacle radius + drone radius + safety buffer.
+    PLAN_CLEARANCE = OBSTACLE_RADIUS + DRONE_RADIUS + OBSTACLE_BUFFER
+    N_INTERMEDIATE = 4  # optimisable waypoints per inter-gate segment
     N_SAMPLE = 100  # trajectory points sampled for obstacle check
     OPT_MAXITER = 300  # max L-BFGS-B iterations
     MAX_OPT_TIME = 0.25  # seconds — wall-clock budget for the optimizer (online replan)
