@@ -301,6 +301,9 @@ class BSplinePlanner:
     GATE_SPEED = 1.0  # m/s — crossing speed tag at gate waypoints (marks them fixed)
     APPROACH_DIST = 0.35  # m — fixed orthogonal waypoint before each gate (gate normal)
     DEPART_DIST = 0.35  # m — fixed orthogonal waypoint after each gate (gate normal)
+    MIN_GATE_OFFSET = 0.10  # m — smallest entry/exit offset; the waypoint is pulled in to
+    #                           at most this (just past the frame depth) but never onto the
+    #                           gate center, so the spline always crosses straight through
     DRONE_RADIUS = 0.07  # m — drone half-extent (gate inflation & obstacle clearance)
     FRAME_MARGIN = 0.10  # m — extra gate-frame inflation as tracking reserve (was 0.05:
     #                         keeps the reference further from the frame bars)
@@ -314,6 +317,11 @@ class BSplinePlanner:
     # Min center-to-center distance the trajectory must keep from an obstacle:
     # obstacle radius + drone radius + safety buffer.
     PLAN_CLEARANCE = OBSTACLE_RADIUS + DRONE_RADIUS + OBSTACLE_BUFFER
+    # Extra clearance (m) for objects whose true pose is NOT yet revealed. Matches the
+    # track randomization range (gate/obstacle ±0.15 m): until the drone senses an
+    # object within sensor_range it only knows the nominal pose, so the path keeps this
+    # much further away to tolerate the shift. A reveal triggers a replan that tightens.
+    UNCERTAINTY_MARGIN = 0.05
     N_INTERMEDIATE = 4  # optimisable waypoints per inter-gate segment
     N_SAMPLE = 100  # trajectory points sampled for obstacle check
     OPT_MAXITER = 300  # max L-BFGS-B iterations
@@ -393,7 +401,7 @@ class BSplinePlanner:
 
         cylinders, gate_frames = self._build_obstacles(obs)
         gate_data = self._compute_gate_data(obs, target_gate, cylinders, gate_frames)
-        cyl_tuples = [(float(c.xy[0]), float(c.xy[1]), self.PLAN_CLEARANCE) for c in cylinders]
+        cyl_tuples = [(float(c.xy[0]), float(c.xy[1]), c.radius) for c in cylinders]
 
         # Constrain the optimiser to a box around the actual gate-to-gate corridor and
         # anchor it to the straight-line path, so it can't wander off into long detours.
@@ -422,9 +430,18 @@ class BSplinePlanner:
         self._raw_waypoints = result["raw_waypoints"]
 
     def _build_obstacles(self, obs: dict) -> tuple[list, list]:
+        # Obstacles outside sensor_range report their NOMINAL pose, which the track
+        # randomization can shift by up to UNCERTAINTY_MARGIN. Until a pole is actually
+        # seen (obstacles_visited), inflate its keep-out radius by that margin so the
+        # path tolerates the shift; a reveal then triggers a replan with the true pose.
+        seen = np.asarray(obs["obstacles_visited"], bool)
         cylinders = [
-            _Cylinder(pos=opos, radius=self.PLAN_CLEARANCE, height=1.52)
-            for opos in obs["obstacles_pos"]
+            _Cylinder(
+                pos=opos,
+                radius=self.PLAN_CLEARANCE + (0.0 if s else self.UNCERTAINTY_MARGIN),
+                height=1.52,
+            )
+            for opos, s in zip(obs["obstacles_pos"], seen)
         ]
         gate_frames = [
             _GateFrame(gpos, gquat, drone_r=self.DRONE_RADIUS + self.FRAME_MARGIN)
@@ -455,20 +472,38 @@ class BSplinePlanner:
         return gate_data
 
     def _safe_entry(self, gate_pos: np.ndarray, x_axis: np.ndarray, obstacles: list) -> np.ndarray:
-        """Fixed orthogonal waypoint before the gate (falls back if blocked)."""
-        for d in [self.APPROACH_DIST, 0.4, 0.5, 0.2]:
-            pt = gate_pos - x_axis * d
-            if _free_3d(pt, gate_pos, obstacles):
-                return pt
-        return gate_pos.copy()
+        """Before-gate waypoint along the gate normal, pulled toward the gate if blocked.
+
+        Starting at APPROACH_DIST we shrink the offset until the segment to the gate is
+        clear. Because a blocking obstacle is usually *beyond* the waypoint (further from
+        the gate), pulling the point in moves it away from the obstacle. We never collapse
+        onto the gate center: a missing entry point removes the straight-in guidance and
+        lets the spline cut the corner into the frame.
+        """
+        return self._pull_in_waypoint(gate_pos, -x_axis, self.APPROACH_DIST, obstacles)
 
     def _safe_exit(self, gate_pos: np.ndarray, x_axis: np.ndarray, obstacles: list) -> np.ndarray:
-        """Fixed orthogonal waypoint after the gate (falls back if blocked)."""
-        for d in [self.DEPART_DIST, 0.5, 0.3, 0.2]:
-            pt = gate_pos + x_axis * d
+        """After-gate waypoint along the gate normal, pulled toward the gate if blocked.
+
+        Same idea as :meth:`_safe_entry`: shrink the offset until clear instead of
+        collapsing onto the gate center (which caused the spline to turn inside the
+        frame right at the gate on tight U-turns).
+        """
+        return self._pull_in_waypoint(gate_pos, x_axis, self.DEPART_DIST, obstacles)
+
+    def _pull_in_waypoint(
+        self, gate_pos: np.ndarray, direction: np.ndarray, d_max: float, obstacles: list
+    ) -> np.ndarray:
+        """Point at ``gate_pos + direction * d``, shrinking d from d_max until the segment
+        to the gate is obstacle-free. Falls back to the minimum offset (never the center).
+        """
+        d = d_max
+        while d >= self.MIN_GATE_OFFSET:
+            pt = gate_pos + direction * d
             if _free_3d(gate_pos, pt, obstacles):
                 return pt
-        return gate_pos.copy()
+            d -= 0.05
+        return gate_pos + direction * self.MIN_GATE_OFFSET
 
     # ── Offline optimiser ─────────────────────────────────────────────────────
 
