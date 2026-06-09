@@ -304,16 +304,22 @@ class BSplinePlanner:
     MIN_GATE_OFFSET = 0.10  # m — smallest entry/exit offset; the waypoint is pulled in to
     #                           at most this (just past the frame depth) but never onto the
     #                           gate center, so the spline always crosses straight through
-    MOMENTUM_LEAD = 0.25  # m — on an in-flight replan, lead the new path this far along the
-    #                          current velocity before curving toward the gate, so it never
-    #                          commands an abrupt reversal of a moving drone
+    # On an in-flight replan, lead the new path out along the current velocity before it
+    # curves toward the gate, so a moving drone is never asked to reverse at its current
+    # position (the cause of the "fly backwards / zigzag" on replan near a gate). The
+    # lead-in length scales with speed (faster ⇒ commit further), and it carries a fit
+    # weight (like a gate waypoint) so the spline actually follows it instead of smoothing
+    # it away — a weak/short lead-in let the path still form a hairpin at the drone.
+    MOMENTUM_TIME = 0.30  # s — lead-in length = speed × this
+    MOMENTUM_LEAD_MIN = 0.15  # m — lower clamp on the lead-in length
+    MOMENTUM_LEAD_MAX = 0.50  # m — upper clamp on the lead-in length
     MOMENTUM_MIN_SPEED = 0.4  # m/s — below this (e.g. takeoff) no lead-in waypoint is added
     DRONE_RADIUS = 0.09  # m — drone half-extent incl. props (was 0.07: the drone is wide,
     #                         so plan further from poles AND gate frames). Feeds both the
     #                         obstacle clearance and the gate-frame inflation.
-    FRAME_MARGIN = 0.08  # m — extra gate-frame inflation on top of DRONE_RADIUS (lowered
-    #                         from 0.10 so the 0.40 m opening stays threadable as the drone
-    #                         radius grew: opening half-width hi = 0.20 − 0.09 − 0.06 = 0.05)
+    FRAME_MARGIN = 0.08  # m — extra gate-frame inflation on top of DRONE_RADIUS; keeps the
+    #                         0.40 m opening threadable as the drone radius grew (opening
+    #                         half-width hi = 0.20 − 0.09 − 0.08 = 0.03, i.e. central crossing)
     OBSTACLE_RADIUS = 0.015  # m — physical pole radius (0.03 m diameter)
     OBSTACLE_BUFFER = 0.22  # m — extra gap drone↔obstacle surface; with DRONE_RADIUS this
     #                            keeps the reference well clear of poles (planner was still
@@ -694,10 +700,12 @@ class BSplinePlanner:
 
         # In-flight replan: lead the path out along the current heading before curving to
         # the gate, so a moving drone is never asked to reverse abruptly. Skipped at low
-        # speed (takeoff). Kept as a low-weight free point so it only shapes the start.
+        # speed (takeoff). Carries a velocity tag → weighted like a gate waypoint in the
+        # fit, so the spline commits to the current direction instead of forming a hairpin.
         speed = float(np.linalg.norm(drone_vel))
         if speed > self.MOMENTUM_MIN_SPEED:
-            points.append((drone_pos + (drone_vel / speed) * self.MOMENTUM_LEAD, None))
+            lead = float(np.clip(speed * self.MOMENTUM_TIME, self.MOMENTUM_LEAD_MIN, self.MOMENTUM_LEAD_MAX))
+            points.append((drone_pos + (drone_vel / speed) * lead, drone_vel.copy()))
 
         for seg_i, (gate_center, x_axis, entry_pt, exit_pt) in enumerate(gate_data):
             gate_wps = [entry_pt, gate_center, exit_pt]
@@ -838,6 +846,11 @@ class MPCPlanner(Controller):
     #: have "changed" and trigger a replan.
     REPLAN_TOL = 1e-3
 
+    #: Distance "bonus" (m) rewarding a resume point whose trajectory tangent aligns with
+    #: the drone's velocity, so a replan never resumes on a branch running opposite to the
+    #: drone's motion (see :meth:`_nearest_tick`).
+    RESUME_DIR_BONUS = 0.15
+
     #: Hard MPC floor: the drone's z position may never go below this (m). Kept at
     #: ground level so it stays feasible at takeoff (start height ~0.01 m).
     GROUND_Z = 0.0
@@ -930,15 +943,30 @@ class MPCPlanner(Controller):
         """Snapshot the observation so the worker never reads sim-reused buffers."""
         return {k: (v.copy() if hasattr(v, "copy") else v) for k, v in obs.items()}
 
-    def _nearest_tick(self, drone_pos: np.ndarray) -> int:
-        """Trajectory index closest to the drone, clipped to the valid range.
+    def _nearest_tick(self, drone_pos: np.ndarray, drone_vel: np.ndarray | None = None) -> int:
+        """Trajectory index to resume at after a replan: nearest to the drone, but biased
+        toward points whose tangent runs *with* the drone's velocity.
 
-        After a background replan finishes the drone has moved on from the position
-        the plan was built from, so we resume tracking at the nearest point instead
-        of restarting at 0.
+        After a background replan the drone has moved on from the position the plan was
+        built from, so we resume at the nearest point. On a self-looping path (e.g. a
+        U-turn near a gate) the drone can sit close to *two* branches — the incoming one
+        and the returning one. Picking purely by distance can land on the returning
+        branch, whose tangent runs opposite to the drone's motion, so the MPC reference
+        points backward and the drone is told to reverse. A small alignment reward keeps
+        the resume point on the forward-running branch.
         """
-        d = np.linalg.norm(self.planner.pos - drone_pos, axis=1)
-        return int(np.clip(np.argmin(d), 0, self.planner.tick_max))
+        traj = self.planner.pos
+        d = np.linalg.norm(traj - drone_pos, axis=1)
+        speed = 0.0 if drone_vel is None else float(np.linalg.norm(drone_vel))
+        if speed < 0.2:  # too slow for a meaningful heading → nearest by distance
+            idx = int(np.argmin(d))
+        else:
+            vhat = np.asarray(drone_vel, float) / speed
+            tang = np.gradient(traj, axis=0)
+            tn = tang / np.clip(np.linalg.norm(tang, axis=1, keepdims=True), 1e-9, None)
+            align = tn @ vhat  # cos(tangent, velocity) ∈ [-1, 1]
+            idx = int(np.argmin(d - self.RESUME_DIR_BONUS * align))
+        return int(np.clip(idx, 0, self.planner.tick_max))
 
     def _maybe_replan(self, obs: dict):
         """Swap in a finished replan and/or kick off a new one — never blocking.
@@ -954,7 +982,7 @@ class MPCPlanner(Controller):
             try:
                 result = self._replan_future.result()
                 self.planner._apply_trajectory(result)
-                self._tick = self._nearest_tick(obs["pos"])
+                self._tick = self._nearest_tick(obs["pos"], obs["vel"])
             except Exception as exc:  # keep flying the current trajectory on failure
                 print(f"[MPCPlanner] background replan failed: {exc!r}")
             self._replan_future = None
