@@ -766,6 +766,13 @@ class MPCPlanner(Controller):
     #: planned path stays feasible and the constraint only bites on real drift inward.
     MPC_OBS_CLEARANCE = 0.15
 
+    #: Whether the MPC carries its own soft obstacle/gate keep-out constraints.
+    #: Currently OFF: the non-smooth ``fmax``/``fabs`` constraint expressions make the
+    #: Gauss-Newton/HPIPM QP fail to converge (status=2) and run to max iterations every
+    #: tick (slow). The planner already keeps obstacle clearance, so the MPC tracking the
+    #: planned path is enough. Re-enable once the constraints are smoothed (option B).
+    USE_SOFT_CONSTRAINTS = False
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Build the MPC solver and the initial reference trajectory.
 
@@ -785,8 +792,8 @@ class MPCPlanner(Controller):
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         # Solver with a hard ground constraint (z >= GROUND_Z) plus soft obstacle and
         # gate-frame keep-out constraints, parametrised by the live object poses.
-        self._n_obstacles = int(len(obs["obstacles_pos"]))
-        self._n_gates = int(len(obs["gates_pos"]))
+        self._n_obstacles = int(len(obs["obstacles_pos"])) if self.USE_SOFT_CONSTRAINTS else 0
+        self._n_gates = int(len(obs["gates_pos"])) if self.USE_SOFT_CONSTRAINTS else 0
         self._n_con = self._n_obstacles + self._n_gates
         self._acados_ocp_solver, self._ocp = _create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, z_min=self.GROUND_Z,
