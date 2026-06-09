@@ -304,12 +304,20 @@ class BSplinePlanner:
     MIN_GATE_OFFSET = 0.10  # m — smallest entry/exit offset; the waypoint is pulled in to
     #                           at most this (just past the frame depth) but never onto the
     #                           gate center, so the spline always crosses straight through
-    DRONE_RADIUS = 0.07  # m — drone half-extent (gate inflation & obstacle clearance)
-    FRAME_MARGIN = 0.10  # m — extra gate-frame inflation as tracking reserve (was 0.05:
-    #                         keeps the reference further from the frame bars)
+    MOMENTUM_LEAD = 0.25  # m — on an in-flight replan, lead the new path this far along the
+    #                          current velocity before curving toward the gate, so it never
+    #                          commands an abrupt reversal of a moving drone
+    MOMENTUM_MIN_SPEED = 0.4  # m/s — below this (e.g. takeoff) no lead-in waypoint is added
+    DRONE_RADIUS = 0.09  # m — drone half-extent incl. props (was 0.07: the drone is wide,
+    #                         so plan further from poles AND gate frames). Feeds both the
+    #                         obstacle clearance and the gate-frame inflation.
+    FRAME_MARGIN = 0.08  # m — extra gate-frame inflation on top of DRONE_RADIUS (lowered
+    #                         from 0.10 so the 0.40 m opening stays threadable as the drone
+    #                         radius grew: opening half-width hi = 0.20 − 0.09 − 0.06 = 0.05)
     OBSTACLE_RADIUS = 0.015  # m — physical pole radius (0.03 m diameter)
-    OBSTACLE_BUFFER = 0.20  # m — extra gap drone↔obstacle surface (was 0.15: reference
-    #                            stays further from poles so tracking drift is tolerated)
+    OBSTACLE_BUFFER = 0.22  # m — extra gap drone↔obstacle surface; with DRONE_RADIUS this
+    #                            keeps the reference well clear of poles (planner was still
+    #                            routing too close on level 2)
     GATE_FRAME_WEIGHT = 60.0  # penalty for entering gate frame material (raised from 10:
     #                            on U-turns after a gate the smoothed spline used to clip
     #                            the gate's own frame; now strongly routed around it)
@@ -321,7 +329,7 @@ class BSplinePlanner:
     # track randomization range (gate/obstacle ±0.15 m): until the drone senses an
     # object within sensor_range it only knows the nominal pose, so the path keeps this
     # much further away to tolerate the shift. A reveal triggers a replan that tightens.
-    UNCERTAINTY_MARGIN = 0.05
+    UNCERTAINTY_MARGIN = 0.0
     N_INTERMEDIATE = 4  # optimisable waypoints per inter-gate segment
     N_SAMPLE = 100  # trajectory points sampled for obstacle check
     OPT_MAXITER = 300  # max L-BFGS-B iterations
@@ -683,6 +691,13 @@ class BSplinePlanner:
         entry point would otherwise sit behind the drone).
         """
         points = [(drone_pos, drone_vel)]
+
+        # In-flight replan: lead the path out along the current heading before curving to
+        # the gate, so a moving drone is never asked to reverse abruptly. Skipped at low
+        # speed (takeoff). Kept as a low-weight free point so it only shapes the start.
+        speed = float(np.linalg.norm(drone_vel))
+        if speed > self.MOMENTUM_MIN_SPEED:
+            points.append((drone_pos + (drone_vel / speed) * self.MOMENTUM_LEAD, None))
 
         for seg_i, (gate_center, x_axis, entry_pt, exit_pt) in enumerate(gate_data):
             gate_wps = [entry_pt, gate_center, exit_pt]
