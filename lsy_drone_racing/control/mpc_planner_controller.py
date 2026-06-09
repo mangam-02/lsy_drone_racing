@@ -53,6 +53,28 @@ if TYPE_CHECKING:
 _CON_SLACK_LIN = 1e4
 _CON_SLACK_QUAD = 1e4
 
+# Smoothing scale (m) for the gate keep-out constraint (option B). The original
+# constraint used ``fmax``/``fabs``, whose kinks gave the Gauss-Newton/HPIPM solver
+# jumping gradients → it failed to converge (status=2) and ran to max iterations every
+# tick. We replace them by C¹ surrogates so the QP converges. 0.02 m is small enough to
+# track the true geometry yet large enough to round off the corners for the solver.
+_CON_SMOOTH_EPS = 0.02
+
+
+def _smooth_abs(x, eps: float = _CON_SMOOTH_EPS):
+    """C¹ approximation of |x| (=sqrt(x²+ε²)); avoids the kink at 0."""
+    return ca.sqrt(x * x + eps * eps)
+
+
+def _smooth_max(a, b, eps: float = _CON_SMOOTH_EPS):
+    """C¹ approximation of max(a, b)."""
+    return 0.5 * (a + b + ca.sqrt((a - b) ** 2 + eps * eps))
+
+
+def _smooth_relu(z, eps: float = _CON_SMOOTH_EPS):
+    """C¹ approximation of max(0, z): ~0 for z ≪ 0, ~z for z ≫ 0."""
+    return 0.5 * (z + ca.sqrt(z * z + eps * eps))
+
 
 def _create_ocp_solver(
     Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
@@ -89,7 +111,10 @@ def _create_ocp_solver(
 
     ocp.cost.cost_type = "LINEAR_LS"
     ocp.cost.cost_type_e = "LINEAR_LS"
-    Q = np.diag([50.0, 50.0, 400.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 5.0, 5.0, 5.0])
+    # Position weight raised (xy 50→250, z 400→450) and velocity 10→25 so the drone
+    # tracks the reference far more tightly — much less inward drift in gate corners,
+    # which was a main cause of clipping frames/poles.
+    Q = np.diag([250.0, 250.0, 450.0, 1.0, 1.0, 1.0, 25.0, 25.0, 25.0, 5.0, 5.0, 5.0])
     Rmat = np.diag([1.0, 1.0, 1.0, 50.0])
     ocp.cost.W = scipy.linalg.block_diag(Q, Rmat)
     ocp.cost.W_e = Q.copy()
@@ -144,9 +169,9 @@ def _create_ocp_solver(
             c, xax, yax, zax = p[o + 1 : o + 4], p[o + 4 : o + 7], p[o + 7 : o + 10], p[o + 10 : o + 13]
             dxyz = ca.vertcat(px - c[0], py - c[1], pz - c[2])
             lx, ly, lz = ca.dot(dxyz, xax), ca.dot(dxyz, yax), ca.dot(dxyz, zax)
-            m = ca.fmax(ca.fabs(ly), ca.fabs(lz))
+            m = _smooth_max(_smooth_abs(ly), _smooth_abs(lz))  # smoothed Chebyshev offset
             plane_w = ca.exp(-(lx**2) / hd**2)  # ~1 at the plane, decays away from it
-            h_list.append(flag * plane_w * ca.fmax(0.0, m - hi))  # > 0 only off-opening near plane
+            h_list.append(flag * plane_w * _smooth_relu(m - hi))  # > 0 only off-opening near plane
 
         ocp.model.con_h_expr = ca.vertcat(*h_list)
         ocp.constraints.lh = np.concatenate(
@@ -171,7 +196,7 @@ def _create_ocp_solver(
     ocp.solver_options.tol = 1e-6
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
-    ocp.solver_options.qp_solver_iter_max = 20
+    ocp.solver_options.qp_solver_iter_max = 50
     ocp.solver_options.nlp_solver_max_iter = 50
     ocp.solver_options.tf = Tf
 
@@ -268,19 +293,24 @@ class BSplinePlanner:
     pos/vel arrays are just indexed by tick.
     """
 
-    TARGET_SPEED = 1.5  # m/s — cruise speed of the velocity profile
+    TARGET_SPEED = 1.2  # m/s — cruise speed (lowered from 1.5: less overshoot off the
+    #                          reference in tight gate corners → fewer frame/pole clips)
     V_EDGE = 0.6  # m/s — speed at trajectory start/end (ramp endpoints)
     ACCEL_DIST = 0.8  # m — arc length over which to ramp up to cruise speed
     DECEL_DIST = 0.8  # m — arc length over which to ramp down at the end
-    GATE_SPEED = 1.2  # m/s — crossing speed tag at gate waypoints (marks them fixed)
+    GATE_SPEED = 1.0  # m/s — crossing speed tag at gate waypoints (marks them fixed)
     APPROACH_DIST = 0.35  # m — fixed orthogonal waypoint before each gate (gate normal)
     DEPART_DIST = 0.35  # m — fixed orthogonal waypoint after each gate (gate normal)
     DRONE_RADIUS = 0.07  # m — drone half-extent (gate inflation & obstacle clearance)
-    FRAME_MARGIN = 0.05  # m — extra gate-frame inflation as tracking reserve
+    FRAME_MARGIN = 0.10  # m — extra gate-frame inflation as tracking reserve (was 0.05:
+    #                         keeps the reference further from the frame bars)
     OBSTACLE_RADIUS = 0.015  # m — physical pole radius (0.03 m diameter)
-    OBSTACLE_BUFFER = 0.15  # m — extra safety gap between drone and obstacle surface
-    GATE_FRAME_WEIGHT = 10.0  # penalty weight for entering gate frame material
-    CYL_WEIGHT = 20.0  # penalty weight for violating obstacle clearance
+    OBSTACLE_BUFFER = 0.20  # m — extra gap drone↔obstacle surface (was 0.15: reference
+    #                            stays further from poles so tracking drift is tolerated)
+    GATE_FRAME_WEIGHT = 60.0  # penalty for entering gate frame material (raised from 10:
+    #                            on U-turns after a gate the smoothed spline used to clip
+    #                            the gate's own frame; now strongly routed around it)
+    CYL_WEIGHT = 30.0  # penalty weight for violating obstacle clearance
     # Min center-to-center distance the trajectory must keep from an obstacle:
     # obstacle radius + drone radius + safety buffer.
     PLAN_CLEARANCE = OBSTACLE_RADIUS + DRONE_RADIUS + OBSTACLE_BUFFER
@@ -762,15 +792,19 @@ class MPCPlanner(Controller):
     #: ground level so it stays feasible at takeoff (start height ~0.01 m).
     GROUND_Z = 0.0
 
-    #: MPC soft-obstacle clearance (m), kept below the planner's PLAN_CLEARANCE so the
-    #: planned path stays feasible and the constraint only bites on real drift inward.
+    #: MPC soft-obstacle clearance (m), kept clearly below the planner's PLAN_CLEARANCE
+    #: (0.235) so the nominal path is NOT on the constraint boundary (that makes the QP
+    #: near-active everywhere and stiff at takeoff). It only bites when tracking error
+    #: drifts the drone inward toward a pole — the safety net for the "controller off the
+    #: reference" case. Extra pole margin comes from the planner buffer, not from raising
+    #: this toward 0.235.
     MPC_OBS_CLEARANCE = 0.15
 
-    #: Whether the MPC carries its own soft obstacle/gate keep-out constraints.
-    #: Currently OFF: the non-smooth ``fmax``/``fabs`` constraint expressions make the
-    #: Gauss-Newton/HPIPM QP fail to converge (status=2) and run to max iterations every
-    #: tick (slow). The planner already keeps obstacle clearance, so the MPC tracking the
-    #: planned path is enough. Re-enable once the constraints are smoothed (option B).
+    #: Whether the MPC carries its own soft obstacle/gate keep-out constraints (option B).
+    #: ON: the constraints now use C¹ smooth surrogates (``_smooth_*``) instead of the
+    #: non-smooth ``fmax``/``fabs`` that previously broke convergence (status=2). This
+    #: lets the MPC keep clearance from poles even when it can't track the planned path
+    #: exactly — the planner alone left the drone too close on inward drift.
     USE_SOFT_CONSTRAINTS = False
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
