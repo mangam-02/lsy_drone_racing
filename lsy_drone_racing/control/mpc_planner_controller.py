@@ -27,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
+import casadi as ca
 import numpy as np
 import scipy.linalg
 from acados_template import AcadosOcp, AcadosOcpSolver
@@ -47,15 +48,34 @@ if TYPE_CHECKING:
 # ── MPC solver with a ground (z) hard constraint ────────────────────────────────
 
 
+# Slack penalty weights for the soft obstacle/gate keep-out constraints. 1e4 enforces
+# the clearance closely while staying solvable (1e5 makes the QP too stiff → failures).
+_CON_SLACK_LIN = 1e4
+_CON_SLACK_QUAD = 1e4
+
+
 def _create_ocp_solver(
     Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
-    verbose: bool = False,
+    verbose: bool = False, n_obstacles: int = 0, n_gates: int = 0,
+    obs_clearance: float = 0.15, gate_drone_r: float = 0.07,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Acados OCP/solver that tracks a reference and keeps the drone above ground.
 
     Same formulation as ``attitude_mpc.create_ocp_solver`` but adds a hard state
     bound on the z position (index 2): ``z_min <= z <= z_max`` on every shooting
     node. With ``z_min = 0`` the MPC can never plan a path through the floor.
+
+    When ``n_obstacles``/``n_gates`` > 0 it also adds *soft* (slacked) nonlinear
+    path constraints that make the MPC itself steer clear of poles and gate frames,
+    even when tracking error pushes the drone off the planned path:
+
+    * Obstacles: keep the xy position outside a cylinder of radius ``obs_clearance``.
+    * Gate frames: keep out of the solid frame material while leaving the opening and
+      the fly-around region free (``fmin`` of the in-ring and near-plane depths is
+      positive only inside the material).
+
+    The obstacle/gate centers and gate axes are model parameters (``model.p``) set per
+    solve from the live observation. Everything is soft so the QP stays feasible.
     """
     ocp = AcadosOcp()
     ocp.model = create_acados_model(parameters)
@@ -94,6 +114,53 @@ def _create_ocp_solver(
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3])
+
+    # Soft obstacle/gate-frame avoidance (one constraint each), parametrised by the
+    # live obstacle/gate poses set per solve. Obstacles first, then gates.
+    #   * Obstacle: squared xy distance >= obs_clearance**2 (lower-bounded).
+    #   * Gate: while near the gate plane, stay inside the opening (lateral offset
+    #     m <= hi). Enforced only for the *target* gate (per-gate flag), since other
+    #     gates are flown around, not through. A smooth plane-proximity weight keeps a
+    #     lateral gradient so the drone is pushed into the opening rather than into the
+    #     frame bars. Gate params: [is_target, center(3), x/y/z axis(9)] = 13 each.
+    n_con = n_obstacles + n_gates
+    if n_con > 0:
+        n_p = 2 * n_obstacles + 13 * n_gates
+        p = ca.MX.sym("p", n_p)  # match the model's MX symbol type
+        ocp.model.p = p
+        ocp.parameter_values = np.zeros(n_p)
+        px, py, pz = ocp.model.x[0], ocp.model.x[1], ocp.model.x[2]
+
+        h_list = []
+        for i in range(n_obstacles):
+            h_list.append((px - p[2 * i]) ** 2 + (py - p[2 * i + 1]) ** 2)
+
+        hi = _GateFrame.OPENING / 2 - gate_drone_r  # opening half-width (drone-inflated)
+        hd = _GateFrame.DEPTH / 2 + gate_drone_r  # plane-proximity length scale
+        base = 2 * n_obstacles
+        for j in range(n_gates):
+            o = base + 13 * j
+            flag = p[o]
+            c, xax, yax, zax = p[o + 1 : o + 4], p[o + 4 : o + 7], p[o + 7 : o + 10], p[o + 10 : o + 13]
+            dxyz = ca.vertcat(px - c[0], py - c[1], pz - c[2])
+            lx, ly, lz = ca.dot(dxyz, xax), ca.dot(dxyz, yax), ca.dot(dxyz, zax)
+            m = ca.fmax(ca.fabs(ly), ca.fabs(lz))
+            plane_w = ca.exp(-(lx**2) / hd**2)  # ~1 at the plane, decays away from it
+            h_list.append(flag * plane_w * ca.fmax(0.0, m - hi))  # > 0 only off-opening near plane
+
+        ocp.model.con_h_expr = ca.vertcat(*h_list)
+        ocp.constraints.lh = np.concatenate(
+            [np.full(n_obstacles, obs_clearance**2), np.full(n_gates, -1e9)]
+        )
+        ocp.constraints.uh = np.concatenate(
+            [np.full(n_obstacles, 1e9), np.full(n_gates, 0.0)]
+        )
+        # Slack all of them so an infeasible spot is penalised, never rejected.
+        ocp.constraints.idxsh = np.arange(n_con)
+        ocp.cost.zl = _CON_SLACK_LIN * np.ones(n_con)
+        ocp.cost.zu = _CON_SLACK_LIN * np.ones(n_con)
+        ocp.cost.Zl = _CON_SLACK_QUAD * np.ones(n_con)
+        ocp.cost.Zu = _CON_SLACK_QUAD * np.ones(n_con)
 
     ocp.constraints.x0 = np.zeros((nx))
 
@@ -211,7 +278,7 @@ class BSplinePlanner:
     DRONE_RADIUS = 0.07  # m — drone half-extent (gate inflation & obstacle clearance)
     FRAME_MARGIN = 0.05  # m — extra gate-frame inflation as tracking reserve
     OBSTACLE_RADIUS = 0.015  # m — physical pole radius (0.03 m diameter)
-    OBSTACLE_BUFFER = 0.06  # m — extra safety gap between drone and obstacle surface
+    OBSTACLE_BUFFER = 0.15  # m — extra safety gap between drone and obstacle surface
     GATE_FRAME_WEIGHT = 10.0  # penalty weight for entering gate frame material
     CYL_WEIGHT = 20.0  # penalty weight for violating obstacle clearance
     # Min center-to-center distance the trajectory must keep from an obstacle:
@@ -226,6 +293,9 @@ class BSplinePlanner:
     W_ANCHOR = 30.0  # fit weight for the start waypoint (must hold)
     W_GATE = 4.0  # fit weight for gate entry/center/exit (loose enough to round corners)
     W_FREE = 1.0  # fit weight for optimized intermediates (free to smooth)
+    DEVIATION_WEIGHT = 2.0  # penalty pulling intermediates toward the straight-line path
+    WP_MARGIN = 0.6  # m — how far optimised waypoints may leave the gate-to-gate bbox
+    MIN_REF_Z = 0.1  # m — hard floor for the reference trajectory (never plan below this)
 
     _WP_LO = np.array([-2.4, -1.4, 0.1])
     _WP_HI = np.array([2.4, 1.4, 1.45])
@@ -295,9 +365,15 @@ class BSplinePlanner:
         gate_data = self._compute_gate_data(obs, target_gate, cylinders, gate_frames)
         cyl_tuples = [(float(c.xy[0]), float(c.xy[1]), self.PLAN_CLEARANCE) for c in cylinders]
 
+        # Constrain the optimiser to a box around the actual gate-to-gate corridor and
+        # anchor it to the straight-line path, so it can't wander off into long detours.
+        wp_lo, wp_hi = self._waypoint_bounds(obs["pos"].copy(), gate_data)
+        straight = self._straight_intermediates(obs["pos"].copy(), gate_data).flatten()
+
         t0 = time.perf_counter()
         opt_intermediates = self._optimize(
-            obs["pos"].copy(), obs["vel"].copy(), gate_data, cyl_tuples, gate_frames
+            obs["pos"].copy(), obs["vel"].copy(), gate_data, cyl_tuples, gate_frames,
+            wp_lo=wp_lo, wp_hi=wp_hi, reg_anchor=straight,
         )
         print(f"[BSplinePlanner] optimization done in {(time.perf_counter() - t0) * 1e3:.3f} ms")
 
@@ -375,6 +451,9 @@ class BSplinePlanner:
         gate_frames: list = (),
         x0_override: np.ndarray | None = None,
         maxiter: int | None = None,
+        wp_lo: np.ndarray | None = None,
+        wp_hi: np.ndarray | None = None,
+        reg_anchor: np.ndarray | None = None,
     ) -> np.ndarray:
         n_wps = len(gate_data) * self.N_INTERMEDIATE
         x0 = (
@@ -383,14 +462,21 @@ class BSplinePlanner:
             else self._initial_intermediates(drone_pos, gate_data)
         )
 
+        lo = self._WP_LO if wp_lo is None else wp_lo
+        hi = self._WP_HI if wp_hi is None else wp_hi
         bounds = [
-            (float(lo), float(hi)) for _ in range(n_wps) for lo, hi in zip(self._WP_LO, self._WP_HI)
+            (float(blo), float(bhi)) for _ in range(n_wps) for blo, bhi in zip(lo, hi)
         ]
 
         def cost(x: np.ndarray) -> float:
             intermediates = x.reshape(n_wps, 3)
             raw = self._build_waypoint_list(drone_pos, drone_vel, gate_data, intermediates)
-            return self._trajectory_cost(raw, cyl_tuples, gate_frames)
+            c = self._trajectory_cost(raw, cyl_tuples, gate_frames)
+            # Direct-path regularisation: penalise straying from the straight line so
+            # the optimiser only detours as far as the obstacles actually require.
+            if reg_anchor is not None:
+                c += self.DEVIATION_WEIGHT * float(np.sum((x - reg_anchor) ** 2))
+            return c
 
         t_start = time.perf_counter()
 
@@ -408,51 +494,80 @@ class BSplinePlanner:
         )
         return result.x.reshape(n_wps, 3)
 
-    def _initial_intermediates(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> np.ndarray:
-        """Initial waypoints between segment endpoints.
+    def _segment_starts(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> list:
+        """Start point of each inter-gate segment: drone, then each gate's exit."""
+        return [drone_pos] + [gd[3] for gd in gate_data[:-1]]
 
-        For U-turn segments (exit direction nearly opposite to direction to next entry),
-        seeds a bypass waypoint perpendicular to the gate to route clear of the frame.
+    def _straight_intermediates(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> np.ndarray:
+        """Straight-line waypoints: linear interpolation from each segment start to entry.
+
+        This is the "direct path" baseline used both as the optimiser anchor
+        (see :meth:`_optimize`) and as the non-U-turn seed.
         """
         n_wps = len(gate_data) * self.N_INTERMEDIATE
         pts = np.zeros((n_wps, 3))
-        seg_starts = [drone_pos] + [gd[3] for gd in gate_data[:-1]]
+        seg_starts = self._segment_starts(drone_pos, gate_data)
+        for seg_i, ((_, _, entry_pt, _), seg_start) in enumerate(zip(gate_data, seg_starts)):
+            for k in range(self.N_INTERMEDIATE):
+                frac = (k + 1) / (self.N_INTERMEDIATE + 1)
+                pts[seg_i * self.N_INTERMEDIATE + k] = seg_start + frac * (entry_pt - seg_start)
+        return pts
+
+    def _waypoint_bounds(
+        self, drone_pos: np.ndarray, gate_data: list[tuple]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Box bounds for the optimised waypoints: bbox(path points) ± WP_MARGIN.
+
+        Restricting the optimiser to a margin around the actual gate-to-gate corridor
+        prevents it from sending waypoints off into the arena corners (which is what
+        produces the occasional extremely long detour, especially on replan). The box
+        is intersected with the global arena limits so it never exceeds them.
+        """
+        pts = [np.asarray(drone_pos)]
+        for gate_center, _, entry_pt, exit_pt in gate_data:
+            pts.extend([gate_center, entry_pt, exit_pt])
+        pts = np.asarray(pts)
+        lo = np.maximum(pts.min(axis=0) - self.WP_MARGIN, self._WP_LO)
+        hi = np.minimum(pts.max(axis=0) + self.WP_MARGIN, self._WP_HI)
+        return lo, hi
+
+    def _initial_intermediates(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> np.ndarray:
+        """Initial waypoints between segment endpoints (optimiser starting point).
+
+        Starts from the straight-line baseline; for U-turn segments (exit direction
+        nearly opposite to direction to next entry) it overwrites the segment with a
+        bypass waypoint perpendicular to the gate to route clear of the frame.
+        """
+        pts = self._straight_intermediates(drone_pos, gate_data)
+        seg_starts = self._segment_starts(drone_pos, gate_data)
 
         for seg_i, ((gate_center, _, entry_pt, exit_pt), seg_start) in enumerate(
             zip(gate_data, seg_starts)
         ):
-            # Detect U-turn: previous gate exit direction vs direction to next entry
-            is_uturn = False
-            bypass = None
-            if seg_i > 0:
-                prev_x = gate_data[seg_i - 1][1]  # previous gate's x_axis
-                to_entry = entry_pt - seg_start
-                d = np.linalg.norm(to_entry)
-                if d > 1e-6 and np.dot(to_entry / d, prev_x) < -0.5:
-                    is_uturn = True
-                    # Perpendicular to exit axis, toward the entry side
-                    perp = np.cross(prev_x, [0.0, 0.0, 1.0])
-                    pn = np.linalg.norm(perp)
-                    if pn > 1e-6:
-                        perp /= pn
-                    sign = np.sign(np.dot(entry_pt - seg_start, perp)) or 1.0
-                    bypass = np.clip(
-                        seg_start + perp * sign * 0.7 + np.array([0.0, 0.0, 0.1]),
-                        self._WP_LO,
-                        self._WP_HI,
-                    )
-
-            if is_uturn and bypass is not None:
-                pts[seg_i * self.N_INTERMEDIATE] = bypass
-                for k in range(1, self.N_INTERMEDIATE):
-                    frac = k / self.N_INTERMEDIATE
-                    pts[seg_i * self.N_INTERMEDIATE + k] = np.clip(
-                        bypass + frac * (entry_pt - bypass), self._WP_LO, self._WP_HI
-                    )
-            else:
-                for k in range(self.N_INTERMEDIATE):
-                    frac = (k + 1) / (self.N_INTERMEDIATE + 1)
-                    pts[seg_i * self.N_INTERMEDIATE + k] = seg_start + frac * (entry_pt - seg_start)
+            if seg_i == 0:
+                continue  # first segment never U-turns (drone already faces the gate)
+            prev_x = gate_data[seg_i - 1][1]  # previous gate's x_axis
+            to_entry = entry_pt - seg_start
+            d = np.linalg.norm(to_entry)
+            if d <= 1e-6 or np.dot(to_entry / d, prev_x) >= -0.5:
+                continue  # not a U-turn
+            # Perpendicular to exit axis, toward the entry side.
+            perp = np.cross(prev_x, [0.0, 0.0, 1.0])
+            pn = np.linalg.norm(perp)
+            if pn > 1e-6:
+                perp /= pn
+            sign = np.sign(np.dot(entry_pt - seg_start, perp)) or 1.0
+            bypass = np.clip(
+                seg_start + perp * sign * 0.7 + np.array([0.0, 0.0, 0.1]),
+                self._WP_LO,
+                self._WP_HI,
+            )
+            pts[seg_i * self.N_INTERMEDIATE] = bypass
+            for k in range(1, self.N_INTERMEDIATE):
+                frac = k / self.N_INTERMEDIATE
+                pts[seg_i * self.N_INTERMEDIATE + k] = np.clip(
+                    bypass + frac * (entry_pt - bypass), self._WP_LO, self._WP_HI
+                )
         return pts
 
     def _trajectory_cost(
@@ -618,9 +733,17 @@ class BSplinePlanner:
         tangent /= np.clip(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9, None)
         v_q = np.interp(s_q, s, v)
 
+        pos = np.stack([xq, yq, zq], axis=1)
+        vel = v_q[:, None] * tangent
+        # Hard floor: a smoothing spline can dip below the lowest waypoint, so clamp
+        # the reference above ground and stop it commanding descent at the floor.
+        below = pos[:, 2] < self.MIN_REF_Z
+        pos[below, 2] = self.MIN_REF_Z
+        vel[below, 2] = np.maximum(vel[below, 2], 0.0)
+
         return {
-            "pos": np.stack([xq, yq, zq], axis=1),
-            "vel": v_q[:, None] * tangent,
+            "pos": pos,
+            "vel": vel,
             "tick_max": n_samp - 1 - self.N,
         }
 
@@ -639,6 +762,10 @@ class MPCPlanner(Controller):
     #: ground level so it stays feasible at takeoff (start height ~0.01 m).
     GROUND_Z = 0.0
 
+    #: MPC soft-obstacle clearance (m), kept below the planner's PLAN_CLEARANCE so the
+    #: planned path stays feasible and the constraint only bites on real drift inward.
+    MPC_OBS_CLEARANCE = 0.15
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Build the MPC solver and the initial reference trajectory.
 
@@ -656,9 +783,15 @@ class MPCPlanner(Controller):
         self._T_HORIZON = self._N * self._dt
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
-        # Solver with a hard ground constraint (z >= GROUND_Z on every node).
+        # Solver with a hard ground constraint (z >= GROUND_Z) plus soft obstacle and
+        # gate-frame keep-out constraints, parametrised by the live object poses.
+        self._n_obstacles = int(len(obs["obstacles_pos"]))
+        self._n_gates = int(len(obs["gates_pos"]))
+        self._n_con = self._n_obstacles + self._n_gates
         self._acados_ocp_solver, self._ocp = _create_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params, z_min=self.GROUND_Z
+            self._T_HORIZON, self._N, self.drone_params, z_min=self.GROUND_Z,
+            n_obstacles=self._n_obstacles, n_gates=self._n_gates,
+            obs_clearance=self.MPC_OBS_CLEARANCE, gate_drone_r=BSplinePlanner.DRONE_RADIUS,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -743,6 +876,24 @@ class MPCPlanner(Controller):
             )
             self._snapshot_objects(obs)  # plan reflects these poses now
 
+    def _obstacle_gate_params(self, obs: dict) -> np.ndarray:
+        """Flatten obstacle/gate poses into the solver's parameter vector layout.
+
+        Layout: [obstacle xy ...] then per gate [is_target, center(3), x_axis(3),
+        y_axis(3), z_axis(3)] — matching the ``con_h`` indexing in ``_create_ocp_solver``.
+        The opening constraint is only active for the current target gate (flag 1.0).
+        """
+        parts = []
+        if self._n_obstacles:
+            parts.append(np.asarray(obs["obstacles_pos"])[:, :2].reshape(-1))
+        target_gate = int(obs["target_gate"])
+        for i in range(self._n_gates):
+            parts.append(np.array([1.0 if i == target_gate else 0.0]))
+            parts.append(np.asarray(obs["gates_pos"][i], dtype=float))
+            axes = R.from_quat(obs["gates_quat"][i]).apply(np.eye(3))  # rows: x,y,z axes
+            parts.append(axes.reshape(-1))
+        return np.concatenate(parts) if parts else np.zeros(0)
+
     # ── Control ─────────────────────────────────────────────────────────────────
 
     def compute_control(
@@ -783,6 +934,12 @@ class MPCPlanner(Controller):
         yref_e[0:3] = pos_ref[self._N]
         yref_e[6:9] = vel_ref[self._N]
         self._acados_ocp_solver.set(self._N, "yref", yref_e)
+
+        # ── Obstacle / gate-frame parameters (soft keep-out constraints) ───────
+        if self._n_con:
+            p_val = self._obstacle_gate_params(obs)
+            for stage in range(self._N + 1):
+                self._acados_ocp_solver.set(stage, "p", p_val)
 
         # ── Solve ──────────────────────────────────────────────────────────────
         # On a failed solve (non-zero status) the returned solution may be garbage,
