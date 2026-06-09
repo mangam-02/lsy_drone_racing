@@ -293,7 +293,7 @@ class BSplinePlanner:
     pos/vel arrays are just indexed by tick.
     """
 
-    TARGET_SPEED = 1.2  # m/s — cruise speed (lowered from 1.5: less overshoot off the
+    TARGET_SPEED = 1.0  # m/s — cruise speed (lowered from 1.5: less overshoot off the
     #                          reference in tight gate corners → fewer frame/pole clips)
     V_EDGE = 0.6  # m/s — speed at trajectory start/end (ramp endpoints)
     ACCEL_DIST = 0.8  # m — arc length over which to ramp up to cruise speed
@@ -951,6 +951,13 @@ class MPCPlanner(Controller):
         """
         self._last_obs = obs
         self._maybe_replan(obs)
+
+        # Without this line, the tick is just a clock (it counts up by 1 each step),
+        # so it points to where the drone *should* be by now. If the drone falls
+        # behind, that target runs away from it and tracking degrades.
+        # With this line, the tick is set from where the drone *actually* is: we
+        # snap it to the nearest point on the path to the drone's real position.
+        self._tick = self._nearest_tick(obs["pos"])
 
         # Reference horizon (N+1 points) from the planned trajectory.
         pos_ref, vel_ref = self.planner.get_reference(self._tick)
