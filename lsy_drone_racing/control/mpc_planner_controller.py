@@ -53,6 +53,14 @@ if TYPE_CHECKING:
 _CON_SLACK_LIN = 1e4
 _CON_SLACK_QUAD = 1e4
 
+# Per-axis speed cap (m/s), enforced as a SOFT state bound (so a transient overspeed never
+# makes the QP infeasible). Stops the drone ever accelerating away fast when it is far off
+# the reference — essential for hardware safety. Set above cruise (1.2) so it only bites on
+# a runaway, not during normal tracking.
+_V_MAX = 2.0
+_VEL_SLACK_LIN = 1e3
+_VEL_SLACK_QUAD = 1e3
+
 # Smoothing scale (m) for the gate keep-out constraint (option B). The original
 # constraint used ``fmax``/``fabs``, whose kinks gave the Gauss-Newton/HPIPM solver
 # jumping gradients → it failed to converge (status=2) and ran to max iterations every
@@ -130,15 +138,26 @@ def _create_ocp_solver(
     ocp.cost.Vx_e = Vx_e
     ocp.cost.yref, ocp.cost.yref_e = np.zeros((ny,)), np.zeros((ny_e,))
 
-    # State constraints: z floor/ceiling (index 2) + rpy < ~30 deg (indices 3,4,5).
-    ocp.constraints.lbx = np.array([z_min, -0.5, -0.5, -0.5])
-    ocp.constraints.ubx = np.array([z_max, 0.5, 0.5, 0.5])
-    ocp.constraints.idxbx = np.array([2, 3, 4, 5])
+    # State constraints: z floor/ceiling (2), rpy < ~30° (3,4,5), and a per-axis speed cap
+    # (6,7,8). The speed cap is softened (idxsbx) so a transient overspeed never makes the
+    # QP infeasible; it stops the drone ever accelerating away fast when it is far off the
+    # reference (hardware safety). Set just above cruise so normal tracking is unaffected.
+    ocp.constraints.lbx = np.array([z_min, -0.5, -0.5, -0.5, -_V_MAX, -_V_MAX, -_V_MAX])
+    ocp.constraints.ubx = np.array([z_max, 0.5, 0.5, 0.5, _V_MAX, _V_MAX, _V_MAX])
+    ocp.constraints.idxbx = np.array([2, 3, 4, 5, 6, 7, 8])
+    ocp.constraints.idxsbx = np.array([4, 5, 6])  # soften the three velocity bounds
 
     # Input constraints (rpy + collective thrust).
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3])
+
+    # Slack costs are accumulated across all soft constraints (soft velocity bounds first,
+    # then the optional obstacle/gate keep-out below), in acados' [sbx, sh] order.
+    zl_parts = [_VEL_SLACK_LIN * np.ones(3)]
+    zu_parts = [_VEL_SLACK_LIN * np.ones(3)]
+    Zl_parts = [_VEL_SLACK_QUAD * np.ones(3)]
+    Zu_parts = [_VEL_SLACK_QUAD * np.ones(3)]
 
     # Soft obstacle/gate-frame avoidance (one constraint each), parametrised by the
     # live obstacle/gate poses set per solve. Obstacles first, then gates.
@@ -182,10 +201,15 @@ def _create_ocp_solver(
         )
         # Slack all of them so an infeasible spot is penalised, never rejected.
         ocp.constraints.idxsh = np.arange(n_con)
-        ocp.cost.zl = _CON_SLACK_LIN * np.ones(n_con)
-        ocp.cost.zu = _CON_SLACK_LIN * np.ones(n_con)
-        ocp.cost.Zl = _CON_SLACK_QUAD * np.ones(n_con)
-        ocp.cost.Zu = _CON_SLACK_QUAD * np.ones(n_con)
+        zl_parts.append(_CON_SLACK_LIN * np.ones(n_con))
+        zu_parts.append(_CON_SLACK_LIN * np.ones(n_con))
+        Zl_parts.append(_CON_SLACK_QUAD * np.ones(n_con))
+        Zu_parts.append(_CON_SLACK_QUAD * np.ones(n_con))
+
+    ocp.cost.zl = np.concatenate(zl_parts)
+    ocp.cost.zu = np.concatenate(zu_parts)
+    ocp.cost.Zl = np.concatenate(Zl_parts)
+    ocp.cost.Zu = np.concatenate(Zu_parts)
 
     ocp.constraints.x0 = np.zeros((nx))
 
@@ -298,7 +322,7 @@ class BSplinePlanner:
     V_EDGE = 0.6  # m/s — speed at trajectory start/end (ramp endpoints)
     ACCEL_DIST = 0.8  # m — arc length over which to ramp up to cruise speed
     DECEL_DIST = 0.8  # m — arc length over which to ramp down at the end
-    GATE_SPEED = 1.0  # m/s — crossing speed tag at gate waypoints (marks them fixed)
+    GATE_SPEED = 0.85  # m/s — crossing speed tag at gate waypoints (marks them fixed)
     APPROACH_DIST = 0.35  # m — fixed orthogonal waypoint before each gate (gate normal)
     DEPART_DIST = 0.35  # m — fixed orthogonal waypoint after each gate (gate normal)
     MIN_GATE_OFFSET = 0.10  # m — smallest entry/exit offset; the waypoint is pulled in to
@@ -341,12 +365,25 @@ class BSplinePlanner:
     OPT_MAXITER = 300  # max L-BFGS-B iterations
     MAX_OPT_TIME = 0.25  # seconds — wall-clock budget for the optimizer (online replan)
     BSPLINE_DEGREE = 3  # cubic B-spline (C2 continuous)
-    SMOOTHING = 0.15  # splprep smoothing factor s (0 = interpolate, larger = smoother)
+    FIT_OVERSHOOT_MARGIN = 0.5  # m — if the fitted spline leaves the waypoint hull by more
+    #                             than this, it's a splprep overshoot artifact; _fit retries
+    #                             with stronger smoothing (prevents "wild" replanned curves)
+    SMOOTHING = 0.15  # splprep smoothing factor s (0 = interpolate, larger = smoother).
+    #                   Kept low: higher s let the spline cut the gate corners on tight
+    #                   U-turns and clip frames. The replan jaggedness was actually the
+    #                   optimiser flinging waypoints (fixed via DEVIATION_WEIGHT), not the
+    #                   spline fit.
     W_ANCHOR = 30.0  # fit weight for the start waypoint (must hold)
     W_GATE = 4.0  # fit weight for gate entry/center/exit (loose enough to round corners)
     W_FREE = 1.0  # fit weight for optimized intermediates (free to smooth)
-    DEVIATION_WEIGHT = 2.0  # penalty pulling intermediates toward the straight-line path
-    WP_MARGIN = 0.6  # m — how far optimised waypoints may leave the gate-to-gate bbox
+    DEVIATION_WEIGHT = 3.0  # penalty pulling intermediates toward the straight-line path.
+    #                         Raised from 2.0 (but kept below 6, which over-anchored and
+    #                         blocked the necessary gate U-turn detours): enough to stop the
+    #                         optimiser flinging free waypoints to the arena corners (wild
+    #                         zigzag on replan) while still allowing real obstacle detours.
+    WP_MARGIN = 0.5  # m — how far optimised waypoints may leave the gate-to-gate bbox
+    #                      (tightened from 0.6 to bound stray detours, but not so tight it
+    #                      blocks valid avoidance)
     MIN_REF_Z = 0.1  # m — hard floor for the reference trajectory (never plan below this)
 
     _WP_LO = np.array([-2.4, -1.4, 0.1])
@@ -563,14 +600,21 @@ class BSplinePlanner:
             if (time.perf_counter() - t_start) > self.MAX_OPT_TIME:
                 raise StopIteration
 
+        x0_flat = x0.flatten()
         result = minimize(
             cost,
-            x0.flatten(),
+            x0_flat,
             method="L-BFGS-B",
             bounds=bounds,
             options={"maxiter": maxiter or self.OPT_MAXITER, "ftol": 1e-10, "gtol": 1e-7},
             callback=_time_cb,
         )
+        # Robustness guard: L-BFGS-B can stop on the time budget at a point *worse* than it
+        # started, which shows up as a wild, self-crossing replanned path (the drone then
+        # jerks/flies off). Never accept a result worse than the straight-line / bypass
+        # start — fall back to that sane initial guess instead.
+        if not np.all(np.isfinite(result.x)) or cost(result.x) > cost(x0_flat):
+            return x0.reshape(n_wps, 3)
         return result.x.reshape(n_wps, 3)
 
     def _segment_starts(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> list:
@@ -698,14 +742,17 @@ class BSplinePlanner:
         """
         points = [(drone_pos, drone_vel)]
 
-        # In-flight replan: lead the path out along the current heading before curving to
-        # the gate, so a moving drone is never asked to reverse abruptly. Skipped at low
-        # speed (takeoff). Carries a velocity tag → weighted like a gate waypoint in the
-        # fit, so the spline commits to the current direction instead of forming a hairpin.
+        # In-flight replan: nudge the path out along the current heading before it curves to
+        # the gate, so a moving drone isn't asked to reverse abruptly. Added as a *free*
+        # (None-tagged) waypoint, NOT a gate-weighted one: a hard, forced lead-in made the
+        # spline pass exactly through it, which created a hook/zigzag whenever the velocity
+        # didn't line up with the path to the gate. As a free point it only biases the
+        # start; the optimiser/guard, the direction-aware resume and the governor handle
+        # the rest.
         speed = float(np.linalg.norm(drone_vel))
         if speed > self.MOMENTUM_MIN_SPEED:
             lead = float(np.clip(speed * self.MOMENTUM_TIME, self.MOMENTUM_LEAD_MIN, self.MOMENTUM_LEAD_MAX))
-            points.append((drone_pos + (drone_vel / speed) * lead, drone_vel.copy()))
+            points.append((drone_pos + (drone_vel / speed) * lead, None))
 
         for seg_i, (gate_center, x_axis, entry_pt, exit_pt) in enumerate(gate_data):
             gate_wps = [entry_pt, gate_center, exit_pt]
@@ -743,7 +790,20 @@ class BSplinePlanner:
         keep = np.concatenate(([True], np.linalg.norm(np.diff(P, axis=0), axis=1) > 1e-6))
         P, w = P[keep], w[keep]
         k = min(self.BSPLINE_DEGREE, len(P) - 1)
-        tck, _ = splprep([P[:, 0], P[:, 1], P[:, 2]], w=w, k=k, s=self.SMOOTHING)
+        # Fit; if the smoothing spline overshoots the waypoint hull, retry with stronger
+        # smoothing. When the first few waypoints are clustered and non-monotonic (drone +
+        # lead-in + intermediates right next to a gate), splprep can fling the curve metres
+        # outside the arena (length ≫ the waypoint polyline) — the "wild replan" the drone
+        # then tries to chase. Stronger smoothing tames that; it only kicks in for these
+        # pathological fits, normal ones use SMOOTHING and stay tight to the gates.
+        lo = P.min(axis=0) - self.FIT_OVERSHOOT_MARGIN
+        hi = P.max(axis=0) + self.FIT_OVERSHOOT_MARGIN
+        tck = None
+        for s in (self.SMOOTHING, 0.5, 1.0, 3.0, 8.0):
+            tck, _ = splprep([P[:, 0], P[:, 1], P[:, 2]], w=w, k=k, s=s)
+            xyz = np.asarray(splev(np.linspace(0.0, 1.0, 80), tck))  # shape (3, 80)
+            if np.all(xyz.min(axis=1) >= lo) and np.all(xyz.max(axis=1) <= hi):
+                break
         return tck
 
     def _fit_weights(self, raw: list[tuple]) -> np.ndarray:
@@ -851,6 +911,24 @@ class MPCPlanner(Controller):
     #: drone's motion (see :meth:`_nearest_tick`).
     RESUME_DIR_BONUS = 0.15
 
+    #: How many ticks ahead (along the current trajectory) to plan a replan from, to
+    #: compensate the background-build lag. Kept below the true lag (~15 ticks) so the new
+    #: trajectory starts just *behind* the drone on install — cutting stale-start zigzag
+    #: without putting the reference ahead of the drone (which causes a forward jump).
+    REPLAN_PRED_TICKS = 8
+
+    #: Max consecutive failed MPC solves for which the last good command is held before
+    #: braking to a safe level-hover. Keeps transient glitches smooth but stops the drone
+    #: ever flying away on a frozen command (hardware safety).
+    MAX_HOLD_TICKS = 3
+
+    #: Reference-governor lookahead (ticks). The reference index may lead the drone's
+    #: *actual* progress along the trajectory by at most this much (~0.3 s at 50 Hz). If
+    #: the drone falls behind (large tracking error), the reference is held back instead
+    #: of marching on to the goal — otherwise the MPC chases a far-ahead point at full
+    #: thrust and the drone shoots off. Critical for hardware safety.
+    MAX_LOOKAHEAD_TICKS = 15
+
     #: Hard MPC floor: the drone's z position may never go below this (m). Kept at
     #: ground level so it stays feasible at takeoff (start height ~0.01 m).
     GROUND_Z = 0.0
@@ -921,6 +999,7 @@ class MPCPlanner(Controller):
         # (level attitude + hover thrust) as the very first fallback.
         self._last_u = None
         self._hover_cmd = np.array([0.0, 0.0, 0.0, self._hover_thrust])
+        self._consec_fail = 0  # consecutive failed solves (for the safe-fallback brake)
 
     # ── Re-planning ────────────────────────────────────────────────────────────
 
@@ -942,6 +1021,26 @@ class MPCPlanner(Controller):
     def _copy_obs(obs: dict) -> dict:
         """Snapshot the observation so the worker never reads sim-reused buffers."""
         return {k: (v.copy() if hasattr(v, "copy") else v) for k, v in obs.items()}
+
+    def _progress_tick(self, drone_pos: np.ndarray, drone_vel: np.ndarray) -> int:
+        """Forward-aware nearest trajectory index within a window around the current tick.
+
+        Used by the reference governor. Searching only a local window (not the whole
+        path) keeps it cheap and stops it snapping to a far part of a self-crossing
+        trajectory; the velocity term keeps it on the forward-running branch.
+        """
+        traj = self.planner.pos
+        lo = max(0, self._tick - 5)
+        hi = min(len(traj), self._tick + self._N + 10)
+        seg = traj[lo:hi]
+        d = np.linalg.norm(seg - drone_pos, axis=1)
+        speed = float(np.linalg.norm(drone_vel))
+        if speed >= 0.2 and len(seg) >= 2:
+            vhat = np.asarray(drone_vel, float) / speed
+            tang = np.gradient(seg, axis=0)
+            tn = tang / np.clip(np.linalg.norm(tang, axis=1, keepdims=True), 1e-9, None)
+            d = d - self.RESUME_DIR_BONUS * (tn @ vhat)
+        return lo + int(np.argmin(d))
 
     def _nearest_tick(self, drone_pos: np.ndarray, drone_vel: np.ndarray | None = None) -> int:
         """Trajectory index to resume at after a replan: nearest to the drone, but biased
@@ -990,8 +1089,18 @@ class MPCPlanner(Controller):
         # (2) Kick off a new replan if the track changed and none is in flight.
         if self._replan_future is None and self._objects_changed(obs):
             v_start = max(float(np.linalg.norm(obs["vel"])), BSplinePlanner.V_EDGE)
+            # The build runs in a background thread (~15 ticks); by install the drone has
+            # moved on, so planning from the *current* position leaves the new trajectory's
+            # start ~0.5 m behind the drone — it then has to navigate the stale, slightly
+            # zigzaggy first waypoints. We plan instead from a point a few ticks ahead along
+            # the *current* trajectory (the drone is tracking it), which cuts the staleness.
+            # The offset is kept BELOW the true lag so the start stays just behind the drone
+            # — never ahead of it, which would make the reference jump forward on install.
+            obs_pred = self._copy_obs(obs)
+            pred_idx = min(self._tick + self.REPLAN_PRED_TICKS, self.planner.tick_max)
+            obs_pred["pos"] = self.planner.pos[pred_idx].copy()
             self._replan_future = self._executor.submit(
-                self.planner._compute_trajectory, self._copy_obs(obs), v_start
+                self.planner._compute_trajectory, obs_pred, v_start
             )
             self._snapshot_objects(obs)  # plan reflects these poses now
 
@@ -1030,12 +1139,22 @@ class MPCPlanner(Controller):
         self._last_obs = obs
         self._maybe_replan(obs)
 
+<<<<<<< HEAD
         # Without this line, the tick is just a clock (it counts up by 1 each step),
         # so it points to where the drone *should* be by now. If the drone falls
         # behind, that target runs away from it and tracking degrades.
         # With this line, the tick is set from where the drone *actually* is: we
         # snap it to the nearest point on the path to the drone's real position.
         self._tick = self._nearest_tick(obs["pos"])
+=======
+        # Reference governor: keep the reference anchored near the drone's actual progress
+        # so it can never run away. If the drone has fallen behind, hold the reference
+        # index back (≤ MAX_LOOKAHEAD_TICKS ahead of the nearest point) instead of letting
+        # it march to the goal — otherwise the MPC chases a far point at full thrust and
+        # the drone shoots off (unsafe on hardware).
+        near = self._progress_tick(obs["pos"], obs["vel"])
+        self._tick = int(np.clip(self._tick, near, near + self.MAX_LOOKAHEAD_TICKS))
+>>>>>>> 4010458 (mid save)
 
         # Reference horizon (N+1 points) from the planned trajectory.
         pos_ref, vel_ref = self.planner.get_reference(self._tick)
@@ -1073,9 +1192,17 @@ class MPCPlanner(Controller):
         status = self._acados_ocp_solver.solve()
         if status == 0:
             self._last_u = self._acados_ocp_solver.get(0, "u")
+            self._consec_fail = 0
             return self._last_u
-        print(f"[MPCPlanner] MPC solve failed (status={status}) at tick {self._tick}; holding last command")
-        return self._last_u if self._last_u is not None else self._hover_cmd
+        # Hold the last good command for a few transient failures (smooth), but if the
+        # solver keeps failing, brake to a safe level-hover instead of flying on a stale,
+        # possibly-aggressive command — a frozen command can run the drone away, which is
+        # unsafe on hardware.
+        self._consec_fail += 1
+        if self._last_u is not None and self._consec_fail <= self.MAX_HOLD_TICKS:
+            return self._last_u
+        print(f"[MPCPlanner] MPC solve failed (status={status}) at tick {self._tick}; braking to hover")
+        return self._hover_cmd
 
     def step_callback(
         self,
