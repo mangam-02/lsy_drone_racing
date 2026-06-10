@@ -1497,14 +1497,6 @@ class MPCPlanner(Controller):
         self._last_obs = obs
         self._maybe_replan(obs)
 
-<<<<<<< HEAD
-        # Without this line, the tick is just a clock (it counts up by 1 each step),
-        # so it points to where the drone *should* be by now. If the drone falls
-        # behind, that target runs away from it and tracking degrades.
-        # With this line, the tick is set from where the drone *actually* is: we
-        # snap it to the nearest point on the path to the drone's real position.
-        self._tick = self._nearest_tick(obs["pos"])
-=======
         # Reference governor: keep the reference anchored near the drone's actual progress
         # so it can never run away. If the drone has fallen behind, hold the reference
         # index back (≤ MAX_LOOKAHEAD_TICKS ahead of the nearest point) instead of letting
@@ -1512,7 +1504,6 @@ class MPCPlanner(Controller):
         # the drone shoots off (unsafe on hardware).
         near = self._progress_tick(obs["pos"], obs["vel"])
         self._tick = int(np.clip(self._tick, near, near + self.MAX_LOOKAHEAD_TICKS))
->>>>>>> 4010458 (mid save)
 
         # Reference horizon (N+1 points) from the planned trajectory.
         pos_ref, vel_ref = self.planner.get_reference(self._tick)
