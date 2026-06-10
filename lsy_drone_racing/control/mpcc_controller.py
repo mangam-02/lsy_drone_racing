@@ -30,7 +30,15 @@ from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.mpc_planner_controller import SimplePlanner, _GateFrame
+from lsy_drone_racing.control.mpc_planner_controller import (
+    _CON_SLACK_LIN,
+    _CON_SLACK_QUAD,
+    _GateFrame,
+    _smooth_abs,
+    _smooth_max,
+    _smooth_relu,
+    SimplePlanner,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -69,11 +77,17 @@ def create_mpcc_model(parameters: dict) -> AcadosModel:
 def create_mpcc_ocp_solver(
     Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
     v_max: float = 2.0, vtheta_max: float = 2.5, atheta_max: float = 6.0,
-    verbose: bool = False,
+    n_obstacles: int = 0, n_gates: int = 0, obs_clearance: float = 0.15,
+    gate_drone_r: float = 0.09, verbose: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Acados OCP/solver for MPCC. NONLINEAR_LS cost on contouring/lag/progress; per-stage
-    path point + tangent + target speed are model parameters ``p = [p_ref(3), t_ref(3),
-    v_target(1)]`` set per solve."""
+    path point + tangent + target speed are model parameters set per solve. When
+    ``n_obstacles``/``n_gates`` > 0 the same soft obstacle/gate keep-out as the tracking MPC
+    is added (smooth ``con_h`` with slack-penalty cost), parametrised by the live poses.
+
+    Parameter layout per stage: ``p = [p_ref(3), t_ref(3), v_target(1), <obstacle xy ...>,
+    <per gate: is_target, center(3), x/y/z axis(9)>]``.
+    """
     ocp = AcadosOcp()
     ocp.model = create_mpcc_model(parameters)
     nx = ocp.model.x.rows()  # 14
@@ -82,10 +96,12 @@ def create_mpcc_ocp_solver(
 
     hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
 
-    # Per-stage parameters: path reference point, unit tangent, target progress speed.
-    p = ca.MX.sym("p", 7)
+    # Per-stage parameters: contouring head [p_ref, t_ref, v_target] + obstacle/gate tail.
+    n_con = n_obstacles + n_gates
+    n_p = 7 + 2 * n_obstacles + 13 * n_gates
+    p = ca.MX.sym("p", n_p)
     ocp.model.p = p
-    ocp.parameter_values = np.zeros(7)
+    ocp.parameter_values = np.zeros(n_p)
     p_ref, t_ref, v_target = p[0:3], p[3:6], p[6]
 
     pos = ocp.model.x[0:3]
@@ -133,11 +149,50 @@ def create_mpcc_ocp_solver(
     # Soften the velocity and v_theta bounds so a transient overspeed never makes the QP
     # infeasible (positions 4,5,6,7 within idxbx → vel x/y/z and v_theta).
     ocp.constraints.idxsbx = np.array([4, 5, 6, 7])
-    ns = 4
-    ocp.cost.zl = 1e3 * np.ones(ns)
-    ocp.cost.zu = 1e3 * np.ones(ns)
-    ocp.cost.Zl = 1e3 * np.ones(ns)
-    ocp.cost.Zu = 1e3 * np.ones(ns)
+    # Slack costs accumulate across soft constraints (velocity bounds first, then the
+    # optional obstacle/gate keep-out below) in acados' [sbx, sh] order.
+    zl_parts = [1e3 * np.ones(4)]
+    zu_parts = [1e3 * np.ones(4)]
+    Zl_parts = [1e3 * np.ones(4)]
+    Zu_parts = [1e3 * np.ones(4)]
+
+    # Soft obstacle/gate-frame keep-out (same formulation as the tracking MPC). Obstacle:
+    # squared xy distance >= clearance**2. Gate: stay inside the opening near the target
+    # gate plane. Parametrised by the live poses in the obstacle/gate tail of ``p``.
+    if n_con > 0:
+        px, py, pz = ocp.model.x[0], ocp.model.x[1], ocp.model.x[2]
+        h_list = []
+        for i in range(n_obstacles):
+            h_list.append((px - p[7 + 2 * i]) ** 2 + (py - p[7 + 2 * i + 1]) ** 2)
+        hi = _GateFrame.OPENING / 2 - gate_drone_r
+        hd = _GateFrame.DEPTH / 2 + gate_drone_r
+        base = 7 + 2 * n_obstacles
+        for j in range(n_gates):
+            o = base + 13 * j
+            flag = p[o]
+            c, xax, yax, zax = p[o + 1 : o + 4], p[o + 4 : o + 7], p[o + 7 : o + 10], p[o + 10 : o + 13]
+            dxyz = ca.vertcat(px - c[0], py - c[1], pz - c[2])
+            lx, ly, lz = ca.dot(dxyz, xax), ca.dot(dxyz, yax), ca.dot(dxyz, zax)
+            m = _smooth_max(_smooth_abs(ly), _smooth_abs(lz))
+            plane_w = ca.exp(-(lx**2) / hd**2)
+            h_list.append(flag * plane_w * _smooth_relu(m - hi))
+        ocp.model.con_h_expr = ca.vertcat(*h_list)
+        ocp.constraints.lh = np.concatenate(
+            [np.full(n_obstacles, obs_clearance**2), np.full(n_gates, -1e9)]
+        )
+        ocp.constraints.uh = np.concatenate(
+            [np.full(n_obstacles, 1e9), np.full(n_gates, 0.0)]
+        )
+        ocp.constraints.idxsh = np.arange(n_con)
+        zl_parts.append(_CON_SLACK_LIN * np.ones(n_con))
+        zu_parts.append(_CON_SLACK_LIN * np.ones(n_con))
+        Zl_parts.append(_CON_SLACK_QUAD * np.ones(n_con))
+        Zu_parts.append(_CON_SLACK_QUAD * np.ones(n_con))
+
+    ocp.cost.zl = np.concatenate(zl_parts)
+    ocp.cost.zu = np.concatenate(zu_parts)
+    ocp.cost.Zl = np.concatenate(Zl_parts)
+    ocp.cost.Zu = np.concatenate(Zu_parts)
 
     # Input bounds: rpy commands, collective thrust, progress acceleration.
     ocp.constraints.lbu = np.array(
@@ -180,6 +235,12 @@ class MPCCController(Controller):
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
 
+    #: Add the MPC's soft obstacle/gate-frame keep-out (penalty cost on violation) to MPCC.
+    USE_OBSTACLE_CONSTRAINTS = True
+    #: MPC soft-obstacle clearance (m), kept below the planner's PLAN_CLEARANCE so the path
+    #: stays feasible and the constraint only bites on real drift toward a pole.
+    MPC_OBS_CLEARANCE = 0.15
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Build the MPCC solver and the initial path."""
         super().__init__(obs, info, config)
@@ -190,9 +251,14 @@ class MPCCController(Controller):
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._hover_thrust = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
 
+        self._n_obstacles = int(len(obs["obstacles_pos"])) if self.USE_OBSTACLE_CONSTRAINTS else 0
+        self._n_gates = int(len(obs["gates_pos"])) if self.USE_OBSTACLE_CONSTRAINTS else 0
+        self._n_con = self._n_obstacles + self._n_gates
         self._solver, self._ocp = create_mpcc_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params,
             z_min=self.GROUND_Z, vtheta_max=self.VTHETA_MAX,
+            n_obstacles=self._n_obstacles, n_gates=self._n_gates,
+            obs_clearance=self.MPC_OBS_CLEARANCE, gate_drone_r=SimplePlanner.DRONE_RADIUS,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -248,6 +314,21 @@ class MPCCController(Controller):
 
     # ── Control ───────────────────────────────────────────────────────────────
 
+    def _obstacle_gate_params(self, obs: dict) -> np.ndarray:
+        """Obstacle/gate poses for the soft keep-out, in the ``con_h`` tail layout:
+        ``[obstacle xy ...]`` then per gate ``[is_target, center(3), x/y/z axis(9)]``.
+        The opening constraint is only active for the current target gate (flag 1.0)."""
+        parts = []
+        if self._n_obstacles:
+            parts.append(np.asarray(obs["obstacles_pos"])[:, :2].reshape(-1))
+        target_gate = int(obs["target_gate"])
+        for i in range(self._n_gates):
+            parts.append(np.array([1.0 if i == target_gate else 0.0]))
+            parts.append(np.asarray(obs["gates_pos"][i], dtype=float))
+            axes = R.from_quat(obs["gates_quat"][i]).apply(np.eye(3))  # rows: x,y,z axes
+            parts.append(axes.reshape(-1))
+        return np.concatenate(parts) if parts else np.zeros(0)
+
     def _stage_thetas(self, theta0: float) -> np.ndarray:
         """Predicted theta at each shooting node (warm start for the path relinearisation):
         the previous solution shifted one step, re-anchored at the current projection."""
@@ -282,8 +363,11 @@ class MPCCController(Controller):
         # Per-stage path reference (point + unit tangent) at the predicted theta of each node.
         thetas = self._stage_thetas(theta0)
         pts, tans = self.planner.path_point_tangent(thetas)
+        tail = self._obstacle_gate_params(obs) if self._n_con else np.zeros(0)
         for k in range(self._N + 1):
-            self._solver.set(k, "p", np.concatenate((pts[k], tans[k], [self.V_TARGET])))
+            self._solver.set(
+                k, "p", np.concatenate((pts[k], tans[k], [self.V_TARGET], tail))
+            )
 
         status = self._solver.solve()
         if status == 0:
