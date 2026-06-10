@@ -395,6 +395,8 @@ class BSplinePlanner:
         self.N = N
         self._prev_visited = obs["gates_visited"].copy()
         self._prev_obs_visited = obs["obstacles_visited"].copy()
+        self._warm_intermediates = None  # previous optimiser solution (warm start)
+        self._warm_target_gate = None
         self.build(obs)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -454,15 +456,22 @@ class BSplinePlanner:
         gate_data = self._compute_gate_data(obs, target_gate, cylinders, gate_frames)
         cyl_tuples = [(float(c.xy[0]), float(c.xy[1]), c.radius) for c in cylinders]
 
-        # Constrain the optimiser to a box around the actual gate-to-gate corridor and
-        # anchor it to the straight-line path, so it can't wander off into long detours.
+        # Constrain the optimiser to a box around the actual gate-to-gate corridor. On a
+        # replan, warm-start from the previous solution and anchor the deviation term to it
+        # (not the straight line), so the new plan only nudges the last good trajectory to
+        # react to the moved object — similar trajectory, fewer iterations. On the initial
+        # plan there is no warm start, so we anchor to the straight line as before.
         wp_lo, wp_hi = self._waypoint_bounds(obs["pos"].copy(), gate_data)
-        straight = self._straight_intermediates(obs["pos"].copy(), gate_data).flatten()
+        warm = self._warm_start(obs["pos"].copy(), gate_data, target_gate)
+        if warm is not None:
+            anchor = warm.flatten()
+        else:
+            anchor = self._straight_intermediates(obs["pos"].copy(), gate_data).flatten()
 
         t0 = time.perf_counter()
         opt_intermediates = self._optimize(
             obs["pos"].copy(), obs["vel"].copy(), gate_data, cyl_tuples, gate_frames,
-            wp_lo=wp_lo, wp_hi=wp_hi, reg_anchor=straight,
+            wp_lo=wp_lo, wp_hi=wp_hi, reg_anchor=anchor, x0_override=warm,
         )
         print(f"[BSplinePlanner] optimization done in {(time.perf_counter() - t0) * 1e3:.3f} ms")
 
@@ -471,7 +480,31 @@ class BSplinePlanner:
         )
         result = self._finalize(raw, v_start)
         result["raw_waypoints"] = raw
+        result["intermediates"] = opt_intermediates  # warm start for the next replan
+        result["target_gate"] = target_gate
         return result
+
+    def _warm_start(
+        self, drone_pos: np.ndarray, gate_data: list[tuple], target_gate: int
+    ) -> np.ndarray | None:
+        """Previous optimiser solution aligned to the current segments (dropping segments
+        for gates passed since), with the active segment re-seeded to the straight line.
+        Returns ``None`` (→ optimiser uses its own initial guess) when there is no usable
+        previous solution: the first plan, or the gate count changed."""
+        n_seg = len(gate_data)
+        prev = self._warm_intermediates
+        if prev is None or self._warm_target_gate is None:
+            return None
+        shift = target_gate - self._warm_target_gate
+        prev_segs = prev.reshape(-1, self.N_INTERMEDIATE, 3)
+        if shift < 0 or shift + n_seg > len(prev_segs):
+            return None
+        warm = prev_segs[shift : shift + n_seg].copy()
+        straight = self._straight_intermediates(drone_pos, gate_data).reshape(
+            n_seg, self.N_INTERMEDIATE, 3
+        )
+        warm[0] = straight[0]  # active segment: drone moved, re-seed it fresh
+        return warm.reshape(-1, 3)
 
     def _apply_trajectory(self, result: dict) -> None:
         """Install a trajectory computed by :meth:`_compute_trajectory` (main thread)."""
@@ -479,6 +512,9 @@ class BSplinePlanner:
         self.vel = result["vel"]
         self.tick_max = result["tick_max"]
         self._raw_waypoints = result["raw_waypoints"]
+        if result.get("intermediates") is not None:  # remember as warm start for next replan
+            self._warm_intermediates = result["intermediates"]
+            self._warm_target_gate = result["target_gate"]
 
     def _build_obstacles(self, obs: dict) -> tuple[list, list]:
         # Obstacles outside sensor_range report their NOMINAL pose, which the track
@@ -896,6 +932,322 @@ class BSplinePlanner:
         }
 
 
+# ── Simple B-spline planner (clean, matches the presentation design) ────────────
+
+
+class SimplePlanner:
+    """Minimal B-spline trajectory planner — exactly the presentation design, no extras.
+
+    * **3 fixed waypoints per gate** (before / center / after), placed along the gate
+      normal so the spline crosses each gate straight on.
+    * **4 freely movable waypoints per inter-gate segment**, shifted by ``scipy.minimize``
+      to minimise a cost of three terms: obstacle penalty, gate-frame penalty, and
+      straight-line deviation penalty.
+    * a **weighted cubic B-spline** (gate points high weight, free points low weight),
+    * a **trapezoidal speed profile** (cruise ``TARGET_SPEED``) resampled at uniform time,
+    * **re-planned** whenever a measured gate/obstacle pose changes.
+
+    Deliberately leaves out the machinery the older :class:`BSplinePlanner` accumulated
+    (U-turn bypass, momentum lead-in, lag prediction, overshoot/optimiser guards): a clean
+    cost-driven optimiser kept anchored to the straight line is predictable on its own.
+    """
+
+    TARGET_SPEED = 1.5  # m/s — cruise speed of the velocity profile
+    V_EDGE = 0.6  # m/s — speed at trajectory start/end
+    ACCEL_DIST = 0.8  # m — ramp-up arc length
+    DECEL_DIST = 0.8  # m — ramp-down arc length
+    APPROACH_DIST = 0.35  # m — before-gate waypoint offset along the gate normal
+    DEPART_DIST = 0.35  # m — after-gate waypoint offset along the gate normal
+    DRONE_RADIUS = 0.09  # m — drone half-extent (gate inflation & obstacle clearance)
+    FRAME_MARGIN = 0.08  # m — extra gate-frame inflation
+    OBSTACLE_RADIUS = 0.015  # m — physical pole radius
+    OBSTACLE_BUFFER = 0.20  # m — extra safety gap to the pole surface
+    PLAN_CLEARANCE = OBSTACLE_RADIUS + DRONE_RADIUS + OBSTACLE_BUFFER  # center-to-center
+    GATE_FRAME_WEIGHT = 40.0  # cost weight: entering gate-frame material
+    CYL_WEIGHT = 20.0  # cost weight: violating obstacle clearance
+    DEVIATION_WEIGHT = 2.0  # cost weight: straying from the straight-line path
+    N_INTERMEDIATE = 4  # free waypoints per inter-gate segment
+    N_SAMPLE = 100  # samples along the curve for the cost
+    OPT_MAXITER = 200  # max L-BFGS-B iterations
+    MAX_OPT_TIME = 0.20  # s — wall-clock budget for the optimiser
+    BSPLINE_DEGREE = 3  # cubic
+    SMOOTHING = 0.1  # splprep smoothing factor
+    W_ANCHOR = 30.0  # fit weight: start waypoint
+    W_GATE = 4.0  # fit weight: gate waypoints
+    W_FREE = 1.0  # fit weight: free intermediates
+    MIN_REF_Z = 0.1  # m — hard floor for the reference
+
+    _WP_LO = np.array([-2.4, -1.4, 0.1])
+    _WP_HI = np.array([2.4, 1.4, 1.45])
+
+    def __init__(self, obs: dict, config: object, N: int = 25) -> None:
+        self.freq = config.env.freq
+        self.N = N
+        self._prev_visited = obs["gates_visited"].copy()
+        self._prev_obs_visited = obs["obstacles_visited"].copy()
+        self._warm_intermediates = None  # previous optimiser solution (warm start)
+        self._warm_target_gate = None
+        self.build(obs)
+
+    # ── Public API (same interface as BSplinePlanner) ─────────────────────────
+
+    def get_reference(self, tick: int) -> tuple[np.ndarray, np.ndarray]:
+        i = min(tick, self.tick_max)
+        return self.pos[i : i + self.N + 1], self.vel[i : i + self.N + 1]
+
+    def update(self, obs: dict) -> bool:
+        new_gates, new_obs = obs["gates_visited"], obs["obstacles_visited"]
+        replanned = bool(
+            np.any(new_gates & ~self._prev_visited) or np.any(new_obs & ~self._prev_obs_visited)
+        )
+        if replanned:
+            self.build(obs)
+        self._prev_visited = new_gates.copy()
+        self._prev_obs_visited = new_obs.copy()
+        return replanned
+
+    def build(self, obs: dict, v_start: float | None = None) -> None:
+        self._apply_trajectory(self._compute_trajectory(obs, v_start))
+
+    def _apply_trajectory(self, result: dict) -> None:
+        self.pos = result["pos"]
+        self.vel = result["vel"]
+        self.tick_max = result["tick_max"]
+        self._raw_waypoints = result["raw_waypoints"]
+        if result.get("intermediates") is not None:  # remember as warm start for next replan
+            self._warm_intermediates = result["intermediates"]
+            self._warm_target_gate = result["target_gate"]
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def _compute_trajectory(self, obs: dict, v_start: float | None = None) -> dict:
+        if v_start is None:
+            v_start = self.V_EDGE
+        target_gate = int(obs["target_gate"])
+        if target_gate == -1:  # all gates passed → hover in place
+            n = self.N + 2
+            return {
+                "pos": np.tile(obs["pos"], (n, 1)),
+                "vel": np.zeros((n, 3)),
+                "tick_max": 1,
+                "raw_waypoints": [(obs["pos"].copy(), None)],
+            }
+
+        cylinders = [_Cylinder(p, self.PLAN_CLEARANCE) for p in obs["obstacles_pos"]]
+        frames = [
+            _GateFrame(gp, gq, drone_r=self.DRONE_RADIUS + self.FRAME_MARGIN)
+            for gp, gq in zip(obs["gates_pos"], obs["gates_quat"])
+        ]
+        cyl_tuples = [(float(c.xy[0]), float(c.xy[1]), self.PLAN_CLEARANCE) for c in cylinders]
+        gate_data = self._gate_data(obs, target_gate)
+
+        x0 = self._warm_start(obs["pos"].copy(), gate_data, target_gate)
+        intermediates = self._optimize(obs["pos"].copy(), gate_data, cyl_tuples, frames, x0=x0)
+        raw = self._build_waypoints(obs["pos"].copy(), gate_data, intermediates)
+        result = self._finalize(raw, v_start)
+        result["raw_waypoints"] = raw
+        result["intermediates"] = intermediates  # kept as the warm start for the next replan
+        result["target_gate"] = target_gate
+        return result
+
+    def _warm_start(
+        self, drone_pos: np.ndarray, gate_data: list[tuple], target_gate: int
+    ) -> np.ndarray:
+        """Seed for the optimiser: the previous solution, aligned to the current segments
+        (dropping segments for gates passed since), with the active segment re-seeded to
+        the straight line (the drone has moved). Falls back to the full straight-line guess
+        when there is no usable previous solution (first plan, or the gate count changed)."""
+        n_seg = len(gate_data)
+        straight = self._straight_intermediates(drone_pos, gate_data).reshape(
+            n_seg, self.N_INTERMEDIATE, 3
+        )
+        prev = self._warm_intermediates
+        if prev is None or self._warm_target_gate is None:
+            return straight.reshape(-1, 3)
+        shift = target_gate - self._warm_target_gate  # gates passed since the last plan
+        prev_segs = prev.reshape(-1, self.N_INTERMEDIATE, 3)
+        if shift < 0 or shift + n_seg > len(prev_segs):
+            return straight.reshape(-1, 3)  # structure changed → fresh straight-line guess
+        warm = prev_segs[shift : shift + n_seg].copy()
+        warm[0] = straight[0]  # active segment: drone moved, re-seed it fresh
+        return warm.reshape(-1, 3)
+
+    def _gate_data(self, obs: dict, target_gate: int) -> list[tuple]:
+        """Per gate: (center, x_axis, entry, exit) — 3 points along the gate normal."""
+        gates_pos, gates_quat = obs["gates_pos"], obs["gates_quat"]
+        drone_pos = obs["pos"].copy()
+        data, prev = [], drone_pos
+        for i in range(target_gate, len(gates_pos)):
+            x_axis = R.from_quat(gates_quat[i]).apply([1.0, 0.0, 0.0])
+            if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
+                x_axis = -x_axis
+            entry = gates_pos[i] - x_axis * self.APPROACH_DIST
+            # For the current target gate, if the drone has already flown past the nominal
+            # entry (it sits behind the drone along the gate normal), pull the entry to a
+            # point just ahead of the drone instead. This stops the replanned path jogging
+            # backwards while keeping the free waypoints (so the optimiser can still route
+            # around obstacles into the gate).
+            if i == target_gate and np.dot(drone_pos - entry, x_axis) > 0:
+                entry = drone_pos + 0.4 * (gates_pos[i] - drone_pos)
+            exit_ = gates_pos[i] + x_axis * self.DEPART_DIST
+            data.append((gates_pos[i].copy(), x_axis.copy(), entry, exit_))
+            prev = exit_
+        return data
+
+    def _segment_starts(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> list:
+        return [drone_pos] + [gd[3] for gd in gate_data[:-1]]
+
+    def _straight_intermediates(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> np.ndarray:
+        """Initial guess: linear interpolation from each segment start to the gate entry."""
+        n_wps = len(gate_data) * self.N_INTERMEDIATE
+        pts = np.zeros((n_wps, 3))
+        for si, ((_, _, entry, _), start) in enumerate(
+            zip(gate_data, self._segment_starts(drone_pos, gate_data))
+        ):
+            for k in range(self.N_INTERMEDIATE):
+                frac = (k + 1) / (self.N_INTERMEDIATE + 1)
+                pts[si * self.N_INTERMEDIATE + k] = start + frac * (entry - start)
+        return pts
+
+    def _optimize(
+        self, drone_pos: np.ndarray, gate_data: list[tuple], cyl_tuples: list, frames: list,
+        x0: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Shift the free waypoints to minimise obstacle + frame + deviation cost.
+
+        ``x0`` seeds the optimiser (and the deviation anchor). On a replan it is the
+        previous solution (warm start): the optimiser starts near the last good trajectory
+        and the deviation term pulls toward *it* rather than the straight line, so the new
+        plan only nudges the old one to react to the moved object — similar trajectory,
+        fewer iterations. Defaults to the straight-line guess (the initial plan).
+        """
+        n_wps = len(gate_data) * self.N_INTERMEDIATE
+        if x0 is None:
+            x0 = self._straight_intermediates(drone_pos, gate_data)
+        anchor = x0.flatten()
+        bounds = [
+            (float(lo), float(hi))
+            for _ in range(n_wps)
+            for lo, hi in zip(self._WP_LO, self._WP_HI)
+        ]
+
+        def cost(x: np.ndarray) -> float:
+            raw = self._build_waypoints(drone_pos, gate_data, x.reshape(n_wps, 3))
+            c = self._trajectory_cost(raw, cyl_tuples, frames)
+            c += self.DEVIATION_WEIGHT * float(np.sum((x - anchor) ** 2))  # straight-line term
+            return c
+
+        t0 = time.perf_counter()
+
+        def _time_cb(_xk: np.ndarray) -> None:
+            if time.perf_counter() - t0 > self.MAX_OPT_TIME:
+                raise StopIteration
+
+        result = minimize(
+            cost, anchor, method="L-BFGS-B", bounds=bounds,
+            options={"maxiter": self.OPT_MAXITER, "ftol": 1e-10, "gtol": 1e-7},
+            callback=_time_cb,
+        )
+        return result.x.reshape(n_wps, 3)
+
+    def _build_waypoints(
+        self, drone_pos: np.ndarray, gate_data: list[tuple], intermediates: np.ndarray
+    ) -> list[tuple]:
+        """Interleave: drone, then per gate [4 free, entry, center, exit]. Gate points
+        carry a non-None tag (high fit weight); free points carry ``None`` (low weight)."""
+        pts = [(drone_pos, None)]
+        for si, (center, _x, entry, exit_) in enumerate(gate_data):
+            for k in range(self.N_INTERMEDIATE):
+                pts.append((intermediates[si * self.N_INTERMEDIATE + k].copy(), None))
+            pts.append((entry, "gate"))
+            pts.append((center.copy(), "gate"))
+            pts.append((exit_, "gate"))
+        last_x = gate_data[-1][1]
+        pts.append((gate_data[-1][3] + last_x * 0.3, "gate"))  # short run-out past the last gate
+        return pts
+
+    def _trajectory_cost(self, raw: list[tuple], cyl_tuples: list, frames: list) -> float:
+        """Obstacle (cylinder) + gate-frame penalty along the sampled spline."""
+        try:
+            tck = self._fit(raw)
+            x, y, z = splev(np.linspace(0.0, 1.0, self.N_SAMPLE), tck)
+            traj = np.stack([x, y, z], axis=1)
+        except Exception:
+            return 1e6
+        cost = 0.0
+        for cx, cy, r in cyl_tuples:
+            viol = np.maximum(0.0, r - np.linalg.norm(traj[:, :2] - np.array([cx, cy]), axis=1))
+            cost += self.CYL_WEIGHT * float(np.sum(viol**2))
+        for fr in frames:
+            cost += self.GATE_FRAME_WEIGHT * float(np.sum(fr.penetration(traj) ** 2))
+        return cost
+
+    # ── Spline fit + speed profile ────────────────────────────────────────────
+
+    def _fit(self, raw: list[tuple]) -> tuple:
+        P = np.array([np.asarray(p) for p, _ in raw], dtype=float)
+        w = np.array(
+            [
+                self.W_ANCHOR if i == 0
+                else 0.5 * self.W_ANCHOR if i == len(raw) - 1
+                else self.W_GATE if tag is not None
+                else self.W_FREE
+                for i, (_p, tag) in enumerate(raw)
+            ]
+        )
+        keep = np.concatenate(([True], np.linalg.norm(np.diff(P, axis=0), axis=1) > 1e-6))
+        P, w = P[keep], w[keep]
+        k = min(self.BSPLINE_DEGREE, len(P) - 1)
+        tck, _ = splprep([P[:, 0], P[:, 1], P[:, 2]], w=w, k=k, s=self.SMOOTHING)
+        return tck
+
+    def _speed_profile(self, s: np.ndarray, length: float, v_start: float) -> np.ndarray:
+        v = np.full_like(s, self.TARGET_SPEED)
+        a, d = min(self.ACCEL_DIST, 0.5 * length), min(self.DECEL_DIST, 0.5 * length)
+        if a > 1e-6:
+            m = s < a
+            f = s[m] / a
+            v[m] = v_start + (self.TARGET_SPEED - v_start) * (3 * f**2 - 2 * f**3)
+        if d > 1e-6:
+            m = s > length - d
+            f = (length - s[m]) / d
+            v[m] = np.minimum(
+                v[m], self.V_EDGE + (self.TARGET_SPEED - self.V_EDGE) * (3 * f**2 - 2 * f**3)
+            )
+        return np.clip(v, self.V_EDGE, None)
+
+    def _finalize(self, raw: list[tuple], v_start: float, n_dense: int = 2000) -> dict:
+        tck = self._fit(raw)
+        u = np.linspace(0.0, 1.0, n_dense)
+        x, y, z = splev(u, tck)
+        P = np.stack([x, y, z], axis=1)
+        s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+        length = float(s[-1])
+
+        v = self._speed_profile(s, length, v_start)
+        dt_seg = np.diff(s) / np.clip(0.5 * (v[:-1] + v[1:]), 1e-3, None)
+        t = np.concatenate([[0.0], np.cumsum(dt_seg)])
+        t_total = float(t[-1])
+
+        n_samp = max(int(self.freq * t_total), self.N + 2)
+        t_q = np.linspace(0.0, t_total, n_samp)
+        s_q = np.interp(t_q, t, s)
+        u_q = np.interp(s_q, s, u)
+
+        xq, yq, zq = splev(u_q, tck)
+        dxq, dyq, dzq = splev(u_q, tck, der=1)
+        tangent = np.stack([dxq, dyq, dzq], axis=1)
+        tangent /= np.clip(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9, None)
+        v_q = np.interp(s_q, s, v)
+
+        pos = np.stack([xq, yq, zq], axis=1)
+        vel = v_q[:, None] * tangent
+        below = pos[:, 2] < self.MIN_REF_Z
+        pos[below, 2] = self.MIN_REF_Z
+        vel[below, 2] = np.maximum(vel[below, 2], 0.0)
+        return {"pos": pos, "vel": vel, "tick_max": n_samp - 1 - self.N}
+
+
 # ── Controller ────────────────────────────────────────────────────────────────
 
 
@@ -948,6 +1300,11 @@ class MPCPlanner(Controller):
     #: exactly — the planner alone left the drone too close on inward drift.
     USE_SOFT_CONSTRAINTS = False
 
+    #: Use the clean :class:`SimplePlanner` (presentation design: 3 gate points + 4
+    #: optimised free points + weighted B-spline + speed profile) instead of the older,
+    #: heavily-patched :class:`BSplinePlanner`. The MPC + safety stack are unchanged.
+    USE_SIMPLE_PLANNER = True
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Build the MPC solver and the initial reference trajectory.
 
@@ -982,7 +1339,8 @@ class MPCPlanner(Controller):
         self._hover_thrust = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
 
         # ── Path planner ───────────────────────────────────────────────────────
-        self.planner = BSplinePlanner(obs, config, N=self._N)
+        planner_cls = SimplePlanner if self.USE_SIMPLE_PLANNER else BSplinePlanner
+        self.planner = planner_cls(obs, config, N=self._N)
         self._snapshot_objects(obs)  # remember poses we just planned with
 
         # Background replanning: the heavy planner build runs in a worker thread so
