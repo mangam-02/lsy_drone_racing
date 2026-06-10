@@ -1017,6 +1017,11 @@ class SimplePlanner:
         if result.get("intermediates") is not None:  # remember as warm start for next replan
             self._warm_intermediates = result["intermediates"]
             self._warm_target_gate = result["target_gate"]
+        if result.get("tck") is not None:  # geometric path for the MPCC controller
+            self._tck = result["tck"]
+            self._s_lut = result["s_lut"]
+            self._u_lut = result["u_lut"]
+            self.length = result["length"]
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
@@ -1245,7 +1250,41 @@ class SimplePlanner:
         below = pos[:, 2] < self.MIN_REF_Z
         pos[below, 2] = self.MIN_REF_Z
         vel[below, 2] = np.maximum(vel[below, 2], 0.0)
-        return {"pos": pos, "vel": vel, "tick_max": n_samp - 1 - self.N}
+        # Also keep the raw geometric path (B-spline + arc-length LUT) so a contouring
+        # controller (MPCC) can query the path by arc length θ; the reference-tracking MPC
+        # ignores these and just uses pos/vel.
+        return {
+            "pos": pos, "vel": vel, "tick_max": n_samp - 1 - self.N,
+            "tck": tck, "s_lut": s, "u_lut": u, "length": length,
+        }
+
+    # ── Geometric-path API (used by the MPCC controller) ──────────────────────
+
+    def path_point_tangent(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Map arc length θ → (position(3), unit tangent(3)). Accepts a scalar or array."""
+        th = np.atleast_1d(np.clip(theta, 0.0, self.length))
+        u = np.interp(th, self._s_lut, self._u_lut)  # arc length → spline parameter
+        x, y, z = splev(u, self._tck)
+        dx, dy, dz = splev(u, self._tck, der=1)
+        pos = np.stack([x, y, z], axis=-1)
+        tan = np.stack([dx, dy, dz], axis=-1)
+        tan /= np.clip(np.linalg.norm(tan, axis=-1, keepdims=True), 1e-9, None)
+        if np.isscalar(theta) or np.ndim(theta) == 0:
+            return pos[0], tan[0]
+        return pos, tan
+
+    def project_to_theta(self, pos: np.ndarray, vel: np.ndarray | None = None) -> float:
+        """Drone position → nearest arc length θ on the path. With ``vel`` given, bias the
+        projection toward the branch whose tangent aligns with the velocity (so it stays on
+        the forward branch where the path self-crosses, e.g. a U-turn near a gate)."""
+        P = np.stack(splev(self._u_lut, self._tck), axis=-1)  # dense path samples
+        d = np.linalg.norm(P - pos, axis=1)
+        speed = 0.0 if vel is None else float(np.linalg.norm(vel))
+        if speed >= 0.2:
+            t = np.gradient(P, axis=0)
+            t /= np.clip(np.linalg.norm(t, axis=1, keepdims=True), 1e-9, None)
+            d = d - 0.15 * (t @ (np.asarray(vel, float) / speed))
+        return float(self._s_lut[int(np.argmin(d))])
 
 
 # ── Controller ────────────────────────────────────────────────────────────────
