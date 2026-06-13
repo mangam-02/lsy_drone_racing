@@ -78,7 +78,8 @@ def create_mpcc_ocp_solver(
     Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
     v_max: float = 2.0, vtheta_max: float = 2.5, atheta_max: float = 6.0,
     n_obstacles: int = 0, n_gates: int = 0, obs_clearance: float = 0.15,
-    gate_drone_r: float = 0.09, verbose: bool = False,
+    gate_drone_r: float = 0.09, time_steps: np.ndarray | None = None,
+    verbose: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Acados OCP/solver for MPCC. NONLINEAR_LS cost on contouring/lag/progress; per-stage
     path point + tangent + target speed are model parameters set per solve. When
@@ -208,7 +209,18 @@ def create_mpcc_ocp_solver(
     ocp.solver_options.qp_solver_warm_start = 1
     ocp.solver_options.qp_solver_iter_max = 50
     ocp.solver_options.nlp_solver_max_iter = 50
-    ocp.solver_options.tf = Tf
+    if time_steps is not None:
+        # Non-uniform shooting grid: same N nodes, but the intervals grow toward the end so
+        # the horizon reaches much further ahead at ~no extra cost. tf must equal their sum.
+        # acados scales the stage cost by the time step by default, so the far (longer)
+        # nodes are weighted by the time they cover — the physically correct integral.
+        ts = np.asarray(time_steps, dtype=float)
+        ocp.solver_options.time_steps = ts
+        ocp.solver_options.tf = float(ts.sum())
+        # A couple of ERK substeps keeps the integration accurate over the larger far steps.
+        ocp.solver_options.sim_method_num_steps = 2
+    else:
+        ocp.solver_options.tf = Tf
 
     solver = AcadosOcpSolver(
         ocp, json_file="c_generated_code/mpcc_planner.json",
@@ -581,10 +593,16 @@ class MPCCController(Controller):
     """MPCC controller: contouring control along the warm-started SimplePlanner path."""
 
     GROUND_Z = 0.0
-    V_TARGET = 1.4  # m/s — target progress speed (cruise)
-    VTHETA_MAX = 2.5  # m/s — hard-ish cap on progress speed
+    V_TARGET = 2  # m/s — target progress speed (cruise)
+    VTHETA_MAX = 5  # m/s — hard-ish cap on progress speed
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
+
+    #: Per-node growth of the shooting interval (non-uniform time grid). The first interval
+    #: is the real control period dt; each later one is this much longer, so the same N
+    #: nodes look much further ahead for ~no extra compute. 1.0 → classic uniform dt grid.
+    #: e.g. N=25, dt=0.02, growth=1.06 → horizon ≈ 1.1 s instead of 0.5 s.
+    HORIZON_GROWTH = 1.0
 
     #: Add the MPC's soft obstacle/gate-frame keep-out (penalty cost on violation) to MPCC.
     USE_OBSTACLE_CONSTRAINTS = True
@@ -606,7 +624,12 @@ class MPCCController(Controller):
         self._config = config
         self._N = 25
         self._dt = 1 / config.env.freq
-        self._T_HORIZON = self._N * self._dt
+        # Non-uniform shooting grid: first interval = the real control period dt, each later
+        # interval grown by HORIZON_GROWTH, so the same N nodes reach much further ahead.
+        # node_t[k] is the predicted time of node k (used to propagate the per-stage theta).
+        self._time_steps = self._dt * self.HORIZON_GROWTH ** np.arange(self._N)
+        self._node_t = np.concatenate(([0.0], np.cumsum(self._time_steps)))  # (N+1,)
+        self._T_HORIZON = float(self._node_t[-1])
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._hover_thrust = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
 
@@ -619,6 +642,7 @@ class MPCCController(Controller):
             z_min=self.GROUND_Z, vtheta_max=self.VTHETA_MAX,
             n_obstacles=self._n_obstacles, n_gates=self._n_gates,
             obs_clearance=self.MPC_OBS_CLEARANCE, gate_drone_r=SimplePlanner.DRONE_RADIUS,
+            time_steps=self._time_steps if self.HORIZON_GROWTH != 1.0 else None,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -710,10 +734,11 @@ class MPCCController(Controller):
         """Predicted theta at each shooting node (warm start for the path relinearisation):
         the previous solution shifted one step, re-anchored at the current projection."""
         if self._theta_pred is None:
-            return theta0 + np.arange(self._N + 1) * self._dt * self.V_TARGET
+            # First guess: constant progress speed over the (non-uniform) node times.
+            return theta0 + self._node_t * self.V_TARGET
         th = np.empty(self._N + 1)
         th[:-1] = self._theta_pred[1:]
-        th[-1] = self._theta_pred[-1] + self._dt * self.V_TARGET
+        th[-1] = self._theta_pred[-1] + self._time_steps[-1] * self.V_TARGET
         th[0] = theta0  # re-anchor to where the drone actually is
         return np.maximum.accumulate(th)  # keep monotonic
 
@@ -793,8 +818,9 @@ class MPCCController(Controller):
 
     def render_callback(self, sim: object) -> None:
         """Draw gates (yellow + cyan/white frames), obstacles (orange poles), the planned
-        path (green line) with the gate waypoints (magenta), and a single red marker at the
-        drone's current progress along the path (its projection point θ)."""
+        path (green line) with the gate waypoints (magenta), a red marker at the drone's
+        current progress along the path (its projection point θ), and a single blue marker
+        at the far end of the MPCC horizon (how far ahead the controller plans)."""
         obs = self._last_obs
         if obs is not None:
             draw_points(sim, np.atleast_2d(obs["gates_pos"]),
@@ -814,6 +840,12 @@ class MPCCController(Controller):
             draw_points(sim, np.atleast_2d(self._progress_point),
                         rgba=np.array([1.0, 0.0, 0.0, 1.0]), size=0.07)
 
+        # Single blue marker: the far end of the MPC horizon (last predicted stage position)
+        # — i.e. how far ahead the controller is currently planning.
+        if self._pos_pred is not None:
+            draw_points(sim, np.atleast_2d(self._pos_pred[-1]),
+                        rgba=np.array([0.0, 0.0, 1.0, 1.0]), size=0.07)
+
         # Fixed gate waypoints (entry / center / exit), magenta.
         raw = getattr(self.planner, "_raw_waypoints", None)
         if raw:
@@ -821,10 +853,11 @@ class MPCCController(Controller):
             if len(fixed):
                 draw_points(sim, fixed, rgba=np.array([1.0, 0.0, 1.0, 1.0]), size=0.05)
 
-        # Planned path (green line, downsampled).
+        # Planned path (green line). Downsample to ~200 segments — enough to render the
+        # B-spline smoothly (20 made it look visibly faceted) while staying light.
         traj = getattr(self.planner, "pos", None)
         if traj is not None:
-            step = max(1, len(traj) // 20)
+            step = max(1, len(traj) // 200)
             draw_line(sim, traj[::step], rgba=np.array([0.0, 1.0, 0.0, 1.0]))
 
     @staticmethod
