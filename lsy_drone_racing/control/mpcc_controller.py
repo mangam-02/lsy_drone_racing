@@ -579,18 +579,36 @@ class SimplePlanner:
             return pos[0], tan[0]
         return pos, tan
 
-    def project_to_theta(self, pos: np.ndarray, vel: np.ndarray | None = None) -> float:
-        """Drone position → nearest arc length θ on the path. With ``vel`` given, bias the
-        projection toward the branch whose tangent aligns with the velocity (so it stays on
-        the forward branch where the path self-crosses, e.g. a U-turn near a gate).
+    def project_to_theta(
+        self, pos: np.ndarray, vel: np.ndarray | None = None,
+        theta_prev: float | None = None, back: float = 0.30, fwd: float = 1.0,
+    ) -> float:
+        """Drone position → nearest arc length θ on the path.
 
-        Uses the dense path samples + tangents cached at path-install time (no per-call
-        ``splev`` over 2000 points — this runs every control tick).
+        The projection must never *teleport* along θ: where the path passes close to an
+        earlier/later section (flying through a gate and back, a U-turn near a frame), a
+        global nearest-point search can snap to the wrong branch and make the reference jump
+        — the drone would then "shortcut" the path. So when ``theta_prev`` (last tick's θ) is
+        given, the search is restricted to a *local, forward-biased* arc-length window
+        ``[theta_prev - back, theta_prev + fwd]``. Because the window is in arc length, the
+        two branches of a self-crossing (spatially close but far apart in θ) are cleanly
+        separated, so θ advances continuously and can never snap backwards onto an old branch.
+        ``back`` allows small projection wobble / disturbance recovery; ``fwd`` bounds the
+        progress per tick (≫ the real V·dt, so honest fast progress is never clipped).
+
+        With ``vel`` given, ties inside the window break toward the branch whose tangent
+        aligns with the velocity. Uses the dense path samples + tangents cached at path-
+        install time (no per-call ``splev`` over 2000 points — this runs every control tick).
         """
         d = np.linalg.norm(self._path_dense - pos, axis=1)
         speed = 0.0 if vel is None else float(np.linalg.norm(vel))
         if speed >= 0.2:
             d = d - 0.15 * (self._path_dense_tan @ (np.asarray(vel, float) / speed))
+        if theta_prev is not None:
+            mask = (self._s_lut >= theta_prev - back) & (self._s_lut <= theta_prev + fwd)
+            if np.any(mask):
+                idx = np.flatnonzero(mask)
+                return float(self._s_lut[idx[int(np.argmin(d[idx]))]])
         return float(self._s_lut[int(np.argmin(d))])
 
 
@@ -672,6 +690,7 @@ class MPCCController(Controller):
         self._consec_fail = 0
         self._finished = False
         self._last_obs = obs
+        self._theta_est = None  # last tick's progress θ; constrains the projection (no jumps)
         self._progress_point = None  # drone's current projection on the path (render marker)
         self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
 
@@ -779,8 +798,11 @@ class MPCCController(Controller):
         self._maybe_replan(obs)
         tic = time.perf_counter()
 
-        # Project the drone onto the path → current progress theta0 and progress speed.
-        theta0 = self.planner.project_to_theta(obs["pos"], obs["vel"])
+        # Project the drone onto the path → current progress theta0 and progress speed. The
+        # projection is constrained to a local forward window around the last θ so it can
+        # never jump onto an earlier/later branch (flying through a gate and back) and shortcut.
+        theta0 = self.planner.project_to_theta(obs["pos"], obs["vel"], theta_prev=self._theta_est)
+        self._theta_est = theta0
         p0, t0 = self.planner.path_point_tangent(theta0)
         self._progress_point = p0  # the single "where is the drone along the path" marker
         vtheta0 = float(np.clip(np.dot(obs["vel"], t0), 0.0, self.VTHETA_MAX))
@@ -911,6 +933,7 @@ class MPCCController(Controller):
         self._pos_pred = None
         self._x_pred = None
         self._u_pred = None
+        self._theta_est = None  # re-project globally at the next episode's start
         if self._replan_future is not None:
             self._replan_future.cancel()
             self._replan_future = None
