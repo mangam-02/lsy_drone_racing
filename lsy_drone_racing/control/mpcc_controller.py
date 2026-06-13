@@ -657,6 +657,8 @@ class MPCCController(Controller):
 
         self._theta_pred = None  # last solve's per-stage theta (warm start for relinearisation)
         self._pos_pred = None  # last solve's per-stage positions (keep-out linearisation point)
+        self._x_pred = None  # last solve's full state trajectory (N+1, nx) — primal warm start
+        self._u_pred = None  # last solve's full input trajectory (N, nu)   — primal warm start
         self._last_u = None
         self._hover_cmd = np.array([0.0, 0.0, 0.0, self._hover_thrust])
         self._consec_fail = 0
@@ -742,6 +744,25 @@ class MPCCController(Controller):
         th[0] = theta0  # re-anchor to where the drone actually is
         return np.maximum.accumulate(th)  # keep monotonic
 
+    def _shift_warm_start(self) -> None:
+        """Receding-horizon primal warm start.
+
+        Seed the solver with the *previous* solution shifted one node forward (node k ← old
+        node k+1, last node/input repeated). Because the horizon advances by one control step
+        each tick, old node k+1 is the best guess for new node k. acados otherwise keeps the
+        previous solution *unshifted*; the explicit shift lands the SQP much closer to the
+        optimum, so it converges in a couple of iterations instead of rebuilding the
+        trajectory — the bulk of the compute saving. Node 0's state guess is irrelevant
+        (pinned by lbx=ubx=x0 below).
+        """
+        if self._x_pred is None or self._u_pred is None:
+            return
+        xg, ug = self._x_pred, self._u_pred
+        for k in range(self._N):
+            self._solver.set(k, "x", xg[k + 1])
+            self._solver.set(k, "u", ug[min(k + 1, self._N - 1)])
+        self._solver.set(self._N, "x", xg[self._N])
+
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
@@ -760,6 +781,9 @@ class MPCCController(Controller):
         rpy = R.from_quat(obs["quat"]).as_euler("xyz")
         drpy = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
         x0 = np.concatenate((obs["pos"], rpy, obs["vel"], drpy, [theta0, vtheta0]))
+        # Receding-horizon warm start: reuse the previous solve's trajectory, shifted one
+        # node forward, as the initial guess (so SQP converges in a few iterations).
+        self._shift_warm_start()
         self._solver.set(0, "lbx", x0)
         self._solver.set(0, "ubx", x0)
         t_proj = time.perf_counter()
@@ -781,8 +805,11 @@ class MPCCController(Controller):
             self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
         if status == 0:
             xs = np.array([self._solver.get(k, "x") for k in range(self._N + 1)])
+            us = np.array([self._solver.get(k, "u") for k in range(self._N)])
             self._theta_pred = xs[:, 12]
             self._pos_pred = xs[:, 0:3]  # warm start for the next tick's keep-out linearisation
+            self._x_pred = xs  # full primal trajectory → shifted warm start next tick
+            self._u_pred = us
             self._last_u = self._solver.get(0, "u")[:4]  # drop a_theta
             self._consec_fail = 0
             return self._last_u
@@ -874,6 +901,8 @@ class MPCCController(Controller):
     def episode_callback(self):
         self._theta_pred = None
         self._pos_pred = None
+        self._x_pred = None
+        self._u_pred = None
         if self._replan_future is not None:
             self._replan_future.cancel()
             self._replan_future = None
