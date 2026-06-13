@@ -212,13 +212,21 @@ def create_mpcc_ocp_solver(
     if time_steps is not None:
         # Non-uniform shooting grid: same N nodes, but the intervals grow toward the end so
         # the horizon reaches much further ahead at ~no extra cost. tf must equal their sum.
-        # acados scales the stage cost by the time step by default, so the far (longer)
-        # nodes are weighted by the time they cover — the physically correct integral.
         ts = np.asarray(time_steps, dtype=float)
         ocp.solver_options.time_steps = ts
         ocp.solver_options.tf = float(ts.sum())
         # A couple of ERK substeps keeps the integration accurate over the larger far steps.
         ocp.solver_options.sim_method_num_steps = 2
+        # Cost scaling: acados' default is [time_steps, 1.0] — each stage scaled by its
+        # shooting interval and the *terminal* node by 1.0. With a growing grid that terminal
+        # 1.0 is ~50x any single stage (dt=0.02) and ~2x all stages combined, so the cost is
+        # dominated by the last node — which sits ~1.1 s / ~2 m ahead (the blue marker). The
+        # drone then optimises mostly to land that far node on the path and chases it, cutting
+        # corners. Fix: weight *every* node, terminal included, equally by the real control
+        # period dt (= ts[0]). No node dominates → the whole horizon is tracked uniformly and
+        # the near (executed) nodes get their fair share. (Equals the uniform default when
+        # HORIZON_GROWTH == 1.0, except the terminal is now dt-weighted too rather than 1.0.)
+        ocp.solver_options.cost_scaling = ts[0] * np.ones(N + 1)
     else:
         ocp.solver_options.tf = Tf
 
