@@ -8,10 +8,12 @@ and the *lag* error (longitudinal), and rewards advancing ``theta`` at a target 
 
 Because there is no time-parameterised reference, the reference can never "run away" from
 the drone — so the reference governor / nearest-tick machinery of the tracking MPC is not
-needed here. The path enters acados as per-stage parameters: for each shooting node we pass
-the path point ``p_ref`` and unit tangent ``t_ref`` at that node's predicted ``theta``
-(re-linearised every tick — standard practical MPCC). The path comes from the same
-warm-started :class:`SimplePlanner`, queried by arc length via ``path_point_tangent``.
+needed here. The path is **embedded in the model as a function of the progress state**
+``theta`` (formulation A, as in MPCC++ eq. 5): for each shooting node we pass the local
+cubic coefficients of the path around that node's predicted ``theta``, and acados evaluates
+the path point ``p_d(theta)`` and tangent symbolically from the state — so moving ``theta``
+moves the reference and the contouring/lag errors genuinely depend on progress. The cubic
+comes from an internal arc-length spline built from the warm-started :class:`SimplePlanner`.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.so_rpy import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
-from scipy.interpolate import splev, splprep
+from scipy.interpolate import CubicSpline, splev, splprep
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as R
 
@@ -99,8 +101,10 @@ def create_mpcc_ocp_solver(
     ``n_obstacles``/``n_gates`` > 0 the same soft obstacle/gate keep-out as the tracking MPC
     is added (smooth ``con_h`` with slack-penalty cost), parametrised by the live poses.
 
-    Parameter layout per stage: ``p = [p_ref(3), t_ref(3), v_target(1), <obstacle xy ...>,
-    <per gate: is_target, center(3), x/y/z axis(9)>]``.
+    Parameter layout per stage: ``p = [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1),
+    <one convex half-plane [a_x, a_y, b] per keep-out>]``. The 13-number cubic head defines
+    ``p_d(theta) = c*(theta - theta_i)`` so the path point/tangent are functions of the
+    progress state (re-linearised per node from the warm-started theta).
     """
     ocp = AcadosOcp()
     ocp.model = create_mpcc_model(parameters)
@@ -109,30 +113,49 @@ def create_mpcc_ocp_solver(
 
     hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
 
-    # Per-stage parameters: contouring head [p_ref(3), t_ref(3), v_target(1)] + one convex
+    # Per-stage parameters: contouring head [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1)]
+    # = the LOCAL CUBIC of the path around this node's predicted theta, + one convex
     # half-plane [a_x, a_y, b] per keep-out (obstacle or non-target gate).
     n_keepout = n_obstacles + n_gates
-    n_p = 7 + 3 * n_keepout
+    n_head = 14  # 1 (theta_i) + 12 (cubic coeffs) + 1 (v_target)
+    n_p = n_head + 3 * n_keepout
     p = ca.MX.sym("p", n_p)
     ocp.model.p = p
     ocp.parameter_values = np.zeros(n_p)
-    p_ref, t_ref, v_target = p[0:3], p[3:6], p[6]
+    theta_i = p[0]
+    c_x, c_y, c_z = p[1:5], p[5:9], p[9:13]
+    v_target = p[13]
 
     pos = ocp.model.x[0:3]
     rpy = ocp.model.x[3:6]
     drpy = ocp.model.x[9:12]
+    theta = ocp.model.x[12]
     v_theta = ocp.model.x[13]
     rpy_cmd = ocp.model.u[0:3]
     thrust = ocp.model.u[3]
     a_theta = ocp.model.u[4]
 
-    d = pos - p_ref
-    e_l = ca.dot(t_ref, d)  # lag (longitudinal, signed)
-    e_c = d - e_l * t_ref  # contouring (perpendicular, 3-vector)
+    # Embedded path: p_d(theta) and its tangent are evaluated symbolically from the progress
+    # STATE theta via the local cubic — so e_c/e_l genuinely depend on theta (formulation A).
+    t = theta - theta_i
+    p_d = ca.vertcat(
+        c_x[0] * t**3 + c_x[1] * t**2 + c_x[2] * t + c_x[3],
+        c_y[0] * t**3 + c_y[1] * t**2 + c_y[2] * t + c_y[3],
+        c_z[0] * t**3 + c_z[1] * t**2 + c_z[2] * t + c_z[3],
+    )
+    t_vec = ca.vertcat(
+        3 * c_x[0] * t**2 + 2 * c_x[1] * t + c_x[2],
+        3 * c_y[0] * t**2 + 2 * c_y[1] * t + c_y[2],
+        3 * c_z[0] * t**2 + 2 * c_z[1] * t + c_z[2],
+    )
+    d = pos - p_d
+    t_norm = ca.norm_2(t_vec) + 1e-6
+    e_l = ca.dot(t_vec, d) / t_norm  # lag (longitudinal, signed) — depends on theta
+    e_c = d - e_l * (t_vec / t_norm)  # contouring (perpendicular, 3-vector) — depends on theta
     e_v = v_theta - v_target  # progress-speed tracking (the "reward")
 
-    # Smooth least-squares residual (Gauss-Newton friendly: linear in the optimisation
-    # variables given the frozen per-stage path params).
+    # Nonlinear least-squares residual (nonlinear in theta now; acados' Gauss-Newton SQP
+    # re-linearises the path each iteration).
     y = ca.vertcat(e_c, e_l, rpy, drpy, e_v, rpy_cmd, thrust - hover_thrust, a_theta)
     y_e = ca.vertcat(e_c, e_l, rpy, drpy, e_v)
     ocp.model.cost_y_expr = y
@@ -195,7 +218,7 @@ def create_mpcc_ocp_solver(
     if n_keepout > 0:
         px, py = ocp.model.x[0], ocp.model.x[1]
         h_list = []
-        off = 7
+        off = n_head
         for _ in range(n_keepout):
             h_list.append(p[off] * px + p[off + 1] * py - p[off + 2])
             off += 3
@@ -668,7 +691,7 @@ class MPCCController(Controller):
     """MPCC controller: contouring control along the warm-started SimplePlanner path."""
 
     GROUND_Z = 0.0
-    V_TARGET = 2  # m/s — target progress speed (cruise)
+    V_TARGET = 1.5  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 5  # m/s — hard-ish cap on progress speed
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
@@ -692,6 +715,10 @@ class MPCCController(Controller):
     #: Print a rolling per-tick timing breakdown (project / set-params / solve) every 50
     #: ticks, to find what eats the 20 ms control budget. Off by default.
     PROFILE = False
+
+    #: Arc-length sampling step (m) for the internal cubic spline that feeds the embedded
+    #: path coefficients to acados. Finer = closer to the planner B-spline; 5 cm is ample.
+    _CUBIC_DS = 0.05
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Build the MPCC solver and the initial path."""
@@ -729,6 +756,11 @@ class MPCCController(Controller):
 
         # Path planner (warm-started B-spline planner; we use its geometric-path API).
         self.planner = SimplePlanner(obs, config, N=self._N)
+        # Internal arc-length cubic spline of the planner path; supplies the local cubic
+        # coefficients the model needs to evaluate p_d(theta) symbolically. Rebuilt on replan.
+        self._cubic = None
+        self._cubic_smax = 0.0
+        self._build_cubic()
         self._snapshot_objects(obs)
 
         # Background replanning (never stalls the 50 Hz loop).
@@ -771,6 +803,8 @@ class MPCCController(Controller):
         if self._replan_future is not None and self._replan_future.done():
             try:
                 self.planner._apply_trajectory(self._replan_future.result())
+                self._build_cubic()  # refresh the embedded path coefficients onto the new path
+
             except Exception as exc:
                 print(f"[MPCC] background replan failed: {exc!r}")
             self._replan_future = None
@@ -780,6 +814,40 @@ class MPCCController(Controller):
                 self.planner._compute_trajectory, self._copy_obs(obs), self.V_TARGET
             )
             self._snapshot_objects(obs)
+
+    # ── Embedded path: local cubic coefficients ───────────────────────────────
+
+    def _build_cubic(self) -> None:
+        """(Re)build the internal arc-length cubic spline of the planner path.
+
+        The MPCC cost evaluates p_d(theta) as a function of the progress STATE theta
+        (formulation A / MPCC++ eq. 5). acados does that from per-node local cubic
+        coefficients, which this spline supplies via ``_path_segment_coeffs``. Built from the
+        planner's public ``path_point_tangent`` so it needs no planner internals.
+        """
+        length = float(getattr(self.planner, "length", 0.0))
+        if length <= 1e-6:
+            self._cubic = None
+            return
+        n = max(self._N + 2, int(length / self._CUBIC_DS) + 1)
+        s = np.linspace(0.0, length, n)
+        pos, _ = self.planner.path_point_tangent(s)
+        self._cubic = CubicSpline(s, np.asarray(pos, dtype=float))
+        self._cubic_smax = length
+
+    def _path_segment_coeffs(
+        self, theta: float
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+        """Local cubic coefficients (theta_i, c_x, c_y, c_z) of the segment containing theta.
+
+        Matches the symbolic model: ``p_d(theta) = c[0]*t^3 + c[1]*t^2 + c[2]*t + c[3]`` with
+        ``t = theta - theta_i``. scipy stores these in ``CubicSpline.c[:, seg, dim]``.
+        """
+        cs = self._cubic
+        th = float(np.clip(theta, 0.0, self._cubic_smax))
+        seg = int(np.searchsorted(cs.x, th, side="right") - 1)
+        seg = int(np.clip(seg, 0, len(cs.x) - 2))
+        return float(cs.x[seg]), cs.c[:, seg, 0], cs.c[:, seg, 1], cs.c[:, seg, 2]
 
     # ── Control ───────────────────────────────────────────────────────────────
 
@@ -878,14 +946,16 @@ class MPCCController(Controller):
         self._solver.set(0, "ubx", x0)
         t_proj = time.perf_counter()
 
-        # Per-stage path reference (point + unit tangent) at the predicted theta of each
-        # node, plus the convex keep-out half-planes linearised at the predicted positions.
+        # Per-stage path: the LOCAL CUBIC of the path around each node's predicted theta, so
+        # acados can evaluate p_d(theta) symbolically. Plus the convex keep-out half-planes
+        # linearised at the predicted positions.
         thetas = self._stage_thetas(theta0)
-        pts, tans = self.planner.path_point_tangent(thetas)
+        pts, _tans = self.planner.path_point_tangent(thetas)  # only for the keep-out fallback
         pos_pred = self._pos_pred if self._pos_pred is not None else pts
         hp = self._keepout_halfplanes(obs, pos_pred) if self._n_keepout else None
         for k in range(self._N + 1):
-            head = np.concatenate((pts[k], tans[k], [self.V_TARGET]))
+            theta_i, cx, cy, cz = self._path_segment_coeffs(thetas[k])
+            head = np.concatenate(([theta_i], cx, cy, cz, [self.V_TARGET]))
             p_k = head if hp is None else np.concatenate((head, hp[k].reshape(-1)))
             self._solver.set(k, "p", p_k)
         t_setp = time.perf_counter()
