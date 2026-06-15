@@ -16,10 +16,9 @@ warm-started :class:`SimplePlanner`, queried by arc length via ``path_point_tang
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
-
-import time
 
 import casadi as ca
 import numpy as np
@@ -48,9 +47,12 @@ if TYPE_CHECKING:
 
 
 def create_mpcc_model(parameters: dict) -> AcadosModel:
-    """Drone model (12 states / 4 inputs) augmented with progress states ``[theta, v_theta]``
-    and a progress-acceleration input ``a_theta``: ``theta_dot = v_theta``, ``v_theta_dot =
-    a_theta``."""
+    """Build the progress-augmented drone model.
+
+    The drone model (12 states / 4 inputs) is augmented with progress states ``[theta,
+    v_theta]`` and a progress-acceleration input ``a_theta``: ``theta_dot = v_theta``,
+    ``v_theta_dot = a_theta``.
+    """
     x_dot, x, u, _ = symbolic_dynamics_euler(
         mass=parameters["mass"],
         gravity_vec=parameters["gravity_vec"],
@@ -75,13 +77,24 @@ def create_mpcc_model(parameters: dict) -> AcadosModel:
 
 
 def create_mpcc_ocp_solver(
-    Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
-    v_max: float = 2.0, vtheta_max: float = 2.5, atheta_max: float = 6.0,
-    n_obstacles: int = 0, n_gates: int = 0, obs_clearance: float = 0.15,
-    gate_drone_r: float = 0.09, time_steps: np.ndarray | None = None,
+    Tf: float,
+    N: int,
+    parameters: dict,
+    z_min: float = 0.0,
+    z_max: float = 2.5,
+    v_max: float = 2.0,
+    vtheta_max: float = 2.5,
+    atheta_max: float = 6.0,
+    n_obstacles: int = 0,
+    n_gates: int = 0,
+    obs_clearance: float = 0.15,
+    gate_drone_r: float = 0.09,
+    time_steps: np.ndarray | None = None,
     verbose: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
-    """Acados OCP/solver for MPCC. NONLINEAR_LS cost on contouring/lag/progress; per-stage
+    """Build the acados OCP/solver for MPCC.
+
+    NONLINEAR_LS cost on contouring/lag/progress; per-stage
     path point + tangent + target speed are model parameters set per solve. When
     ``n_obstacles``/``n_gates`` > 0 the same soft obstacle/gate keep-out as the tracking MPC
     is added (smooth ``con_h`` with slack-penalty cost), parametrised by the live poses.
@@ -92,7 +105,6 @@ def create_mpcc_ocp_solver(
     ocp = AcadosOcp()
     ocp.model = create_mpcc_model(parameters)
     nx = ocp.model.x.rows()  # 14
-    nu = ocp.model.u.rows()  # 5
     ocp.solver_options.N_horizon = N
 
     hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
@@ -133,10 +145,26 @@ def create_mpcc_ocp_solver(
     # toward V_TARGET). q_c ≫ q_l keeps it contouring; q_l/q_v drive how eagerly it advances.
     q_c, q_l, q_att, q_dr, q_v = 50.0, 5.0, 1.0, 5.0, 20.0
     r_rpy, r_T, r_at = 1.0, 50.0, 0.5
-    W = np.diag([
-        q_c, q_c, q_c, q_l, q_att, q_att, q_att, q_dr, q_dr, q_dr, q_v,
-        r_rpy, r_rpy, r_rpy, r_T, r_at,
-    ])
+    W = np.diag(
+        [
+            q_c,
+            q_c,
+            q_c,
+            q_l,
+            q_att,
+            q_att,
+            q_att,
+            q_dr,
+            q_dr,
+            q_dr,
+            q_v,
+            r_rpy,
+            r_rpy,
+            r_rpy,
+            r_T,
+            r_at,
+        ]
+    )
     W_e = np.diag([q_c, q_c, q_c, q_l, q_att, q_att, q_att, q_dr, q_dr, q_dr, q_v])
     ocp.cost.W = W
     ocp.cost.W_e = W_e
@@ -144,12 +172,8 @@ def create_mpcc_ocp_solver(
     ocp.cost.yref_e = np.zeros(y_e.rows())
 
     # State bounds: z floor/ceiling (2), rpy (3,4,5), vel (6,7,8), v_theta (13: 0..vtheta).
-    ocp.constraints.lbx = np.array(
-        [z_min, -0.5, -0.5, -0.5, -v_max, -v_max, -v_max, 0.0]
-    )
-    ocp.constraints.ubx = np.array(
-        [z_max, 0.5, 0.5, 0.5, v_max, v_max, v_max, vtheta_max]
-    )
+    ocp.constraints.lbx = np.array([z_min, -0.5, -0.5, -0.5, -v_max, -v_max, -v_max, 0.0])
+    ocp.constraints.ubx = np.array([z_max, 0.5, 0.5, 0.5, v_max, v_max, v_max, vtheta_max])
     ocp.constraints.idxbx = np.array([2, 3, 4, 5, 6, 7, 8, 13])
     # Soften the velocity and v_theta bounds so a transient overspeed never makes the QP
     # infeasible (positions 4,5,6,7 within idxbx → vel x/y/z and v_theta).
@@ -190,12 +214,8 @@ def create_mpcc_ocp_solver(
     ocp.cost.Zu = np.concatenate(Zu_parts)
 
     # Input bounds: rpy commands, collective thrust, progress acceleration.
-    ocp.constraints.lbu = np.array(
-        [-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -atheta_max]
-    )
-    ocp.constraints.ubu = np.array(
-        [0.5, 0.5, 0.5, parameters["thrust_max"] * 4, atheta_max]
-    )
+    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -atheta_max])
+    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, atheta_max])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
@@ -231,8 +251,11 @@ def create_mpcc_ocp_solver(
         ocp.solver_options.tf = Tf
 
     solver = AcadosOcpSolver(
-        ocp, json_file="c_generated_code/mpcc_planner.json",
-        verbose=verbose, build=True, generate=True,
+        ocp,
+        json_file="c_generated_code/mpcc_planner.json",
+        verbose=verbose,
+        build=True,
+        generate=True,
     )
     return solver, ocp
 
@@ -287,6 +310,7 @@ class SimplePlanner:
     _WP_HI = np.array([2.4, 1.4, 1.45])
 
     def __init__(self, obs: dict, config: object, N: int = 25) -> None:
+        """Build the initial full-track path from the current observation."""
         self.freq = config.env.freq
         self.N = N
         self._start_pos = obs["pos"].copy()  # fixed full-trajectory anchor (theta = 0)
@@ -299,10 +323,12 @@ class SimplePlanner:
     # ── Public API (same interface as BSplinePlanner) ─────────────────────────
 
     def get_reference(self, tick: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return the (pos, vel) reference window of ``N + 1`` samples from ``tick``."""
         i = min(tick, self.tick_max)
         return self.pos[i : i + self.N + 1], self.vel[i : i + self.N + 1]
 
     def update(self, obs: dict) -> bool:
+        """Re-plan when a gate/obstacle becomes newly visited; return whether it did."""
         new_gates, new_obs = obs["gates_visited"], obs["obstacles_visited"]
         replanned = bool(
             np.any(new_gates & ~self._prev_visited) or np.any(new_obs & ~self._prev_obs_visited)
@@ -314,6 +340,7 @@ class SimplePlanner:
         return replanned
 
     def build(self, obs: dict, v_start: float | None = None) -> None:
+        """Compute and install a fresh full-track trajectory from ``obs``."""
         self._apply_trajectory(self._compute_trajectory(obs, v_start))
 
     def _apply_trajectory(self, result: dict) -> None:
@@ -374,8 +401,10 @@ class SimplePlanner:
         return result
 
     def _warm_start(self, gate_data: list[tuple]) -> np.ndarray | None:
-        """Previous optimiser solution as the warm start, or ``None`` (→ straight-line
-        guess) when there is none yet or the gate count changed.
+        """Return the previous optimiser solution as the warm start, else ``None``.
+
+        Falls back to ``None`` (→ straight-line guess) when there is none yet or the gate
+        count changed.
 
         Because every plan now covers the full track from the same fixed start, the
         waypoint structure is identical across replans, so the previous solution can be
@@ -421,7 +450,11 @@ class SimplePlanner:
         return pts
 
     def _optimize(
-        self, drone_pos: np.ndarray, gate_data: list[tuple], cyl_tuples: list, frames: list,
+        self,
+        drone_pos: np.ndarray,
+        gate_data: list[tuple],
+        cyl_tuples: list,
+        frames: list,
         x0: np.ndarray | None = None,
     ) -> np.ndarray:
         """Shift the free waypoints to minimise obstacle + frame + deviation cost.
@@ -437,9 +470,7 @@ class SimplePlanner:
             x0 = self._straight_intermediates(drone_pos, gate_data)
         anchor = x0.flatten()
         bounds = [
-            (float(lo), float(hi))
-            for _ in range(n_wps)
-            for lo, hi in zip(self._WP_LO, self._WP_HI)
+            (float(lo), float(hi)) for _ in range(n_wps) for lo, hi in zip(self._WP_LO, self._WP_HI)
         ]
 
         def cost(x: np.ndarray) -> float:
@@ -455,7 +486,10 @@ class SimplePlanner:
                 raise StopIteration
 
         result = minimize(
-            cost, anchor, method="L-BFGS-B", bounds=bounds,
+            cost,
+            anchor,
+            method="L-BFGS-B",
+            bounds=bounds,
             options={"maxiter": self.OPT_MAXITER, "ftol": 1e-10, "gtol": 1e-7},
             callback=_time_cb,
         )
@@ -464,8 +498,11 @@ class SimplePlanner:
     def _build_waypoints(
         self, drone_pos: np.ndarray, gate_data: list[tuple], intermediates: np.ndarray
     ) -> list[tuple]:
-        """Interleave: drone, then per gate [4 free, entry, center, exit]. Gate points
-        carry a non-None tag (high fit weight); free points carry ``None`` (low weight)."""
+        """Interleave waypoints: drone, then per gate [4 free, entry, center, exit].
+
+        Gate points carry a non-None tag (high fit weight); free points carry ``None``
+        (low weight).
+        """
         pts = [(drone_pos, None)]
         for si, (center, _x, entry, exit_) in enumerate(gate_data):
             for k in range(self.N_INTERMEDIATE):
@@ -499,9 +536,12 @@ class SimplePlanner:
         P = np.array([np.asarray(p) for p, _ in raw], dtype=float)
         w = np.array(
             [
-                self.W_ANCHOR if i == 0
-                else 0.5 * self.W_ANCHOR if i == len(raw) - 1
-                else self.W_GATE if tag is not None
+                self.W_ANCHOR
+                if i == 0
+                else 0.5 * self.W_ANCHOR
+                if i == len(raw) - 1
+                else self.W_GATE
+                if tag is not None
                 else self.W_FREE
                 for i, (_p, tag) in enumerate(raw)
             ]
@@ -560,8 +600,13 @@ class SimplePlanner:
         # controller (MPCC) can query the path by arc length θ; the reference-tracking MPC
         # ignores these and just uses pos/vel.
         return {
-            "pos": pos, "vel": vel, "tick_max": n_samp - 1 - self.N,
-            "tck": tck, "s_lut": s, "u_lut": u, "length": length,
+            "pos": pos,
+            "vel": vel,
+            "tick_max": n_samp - 1 - self.N,
+            "tck": tck,
+            "s_lut": s,
+            "u_lut": u,
+            "length": length,
         }
 
     # ── Geometric-path API (used by the MPCC controller) ──────────────────────
@@ -580,8 +625,12 @@ class SimplePlanner:
         return pos, tan
 
     def project_to_theta(
-        self, pos: np.ndarray, vel: np.ndarray | None = None,
-        theta_prev: float | None = None, back: float = 0.30, fwd: float = 1.0,
+        self,
+        pos: np.ndarray,
+        vel: np.ndarray | None = None,
+        theta_prev: float | None = None,
+        back: float = 0.30,
+        fwd: float = 1.0,
     ) -> float:
         """Drone position → nearest arc length θ on the path.
 
@@ -664,10 +713,15 @@ class MPCCController(Controller):
         self._n_gates = int(len(obs["gates_pos"])) if use_gates else 0
         self._n_keepout = self._n_obstacles + self._n_gates
         self._solver, self._ocp = create_mpcc_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params,
-            z_min=self.GROUND_Z, vtheta_max=self.VTHETA_MAX,
-            n_obstacles=self._n_obstacles, n_gates=self._n_gates,
-            obs_clearance=self.MPC_OBS_CLEARANCE, gate_drone_r=SimplePlanner.DRONE_RADIUS,
+            self._T_HORIZON,
+            self._N,
+            self.drone_params,
+            z_min=self.GROUND_Z,
+            vtheta_max=self.VTHETA_MAX,
+            n_obstacles=self._n_obstacles,
+            n_gates=self._n_gates,
+            obs_clearance=self.MPC_OBS_CLEARANCE,
+            gate_drone_r=SimplePlanner.DRONE_RADIUS,
             time_steps=self._time_steps if self.HORIZON_GROWTH != 1.0 else None,
         )
         self._nx = self._ocp.model.x.rows()
@@ -730,19 +784,23 @@ class MPCCController(Controller):
     # ── Control ───────────────────────────────────────────────────────────────
 
     def _keepout_halfplanes(self, obs: dict, pos_pred: np.ndarray) -> np.ndarray:
-        """Per-stage convex keep-out half-planes ``[a_x, a_y, b]`` for each obstacle and
-        non-target gate, linearised at the predicted per-stage positions ``pos_pred``
-        ((N+1, 3)). The normal ``a`` points from the keep-out centre to the predicted drone
-        position; ``b = a·c + r`` makes the line tangent to the keep-out circle of radius
-        ``r`` (obstacle clearance, or the gate's outer frame half-width). The target gate is
+        """Build per-stage convex keep-out half-planes for each obstacle and non-target gate.
+
+        Each half-plane ``[a_x, a_y, b]`` is linearised at the predicted per-stage positions
+        ``pos_pred`` ((N+1, 3)). The normal ``a`` points from the keep-out centre to the
+        predicted drone position; ``b = a·c + r`` makes the line tangent to the keep-out
+        circle of radius ``r`` (obstacle clearance, or the gate's outer frame half-width).
+        The target gate is
         disabled (``a=0, b=-1e9`` → constraint always satisfied: we fly through it).
 
         Returns an array of shape (N+1, n_keepout, 3).
         """
         P = pos_pred[:, :2]  # (N+1, 2) predicted xy
         # (centre xy, radius, disabled) for every keep-out: obstacles then gates.
-        items = [(np.asarray(op[:2], float), self.MPC_OBS_CLEARANCE, False)
-                 for op in obs["obstacles_pos"]]
+        items = [
+            (np.asarray(op[:2], float), self.MPC_OBS_CLEARANCE, False)
+            for op in obs["obstacles_pos"]
+        ]
         target = int(obs["target_gate"])
         gate_r = _GateFrame.OUTER / 2 + SimplePlanner.DRONE_RADIUS  # clear the frame
         for j in range(self._n_gates):
@@ -760,8 +818,10 @@ class MPCCController(Controller):
         return out
 
     def _stage_thetas(self, theta0: float) -> np.ndarray:
-        """Predicted theta at each shooting node (warm start for the path relinearisation):
-        the previous solution shifted one step, re-anchored at the current projection."""
+        """Predict theta at each shooting node (warm start for the path relinearisation).
+
+        The previous solution is shifted one step and re-anchored at the current projection.
+        """
         if self._theta_pred is None:
             # First guess: constant progress speed over the (non-uniform) node times.
             return theta0 + self._node_t * self.V_TARGET
@@ -866,7 +926,16 @@ class MPCCController(Controller):
             )
             self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Mark the run finished once all gates are passed (``target_gate == -1``)."""
         if int(obs["target_gate"]) == -1:
             self._finished = True
         return self._finished
@@ -874,34 +943,49 @@ class MPCCController(Controller):
     # ── Visualisation (mirrors the MPC controller's overlay) ──────────────────
 
     def render_callback(self, sim: object) -> None:
-        """Draw gates (yellow + cyan/white frames), obstacles (orange poles), the planned
-        path (green line) with the gate waypoints (magenta), a red marker at the drone's
-        current progress along the path (its projection point θ), and a single blue marker
-        at the far end of the MPCC horizon (how far ahead the controller plans)."""
+        """Draw the planned path, gates, obstacles and progress markers.
+
+        Gates (yellow + cyan/white frames), obstacles (orange poles), the planned path (green
+        line) with the gate waypoints (magenta), a red marker at the drone's current progress
+        along the path (its projection point θ), and a single blue marker at the far end of
+        the MPCC horizon (how far ahead the controller plans).
+        """
         obs = self._last_obs
         if obs is not None:
-            draw_points(sim, np.atleast_2d(obs["gates_pos"]),
-                        rgba=np.array([1.0, 1.0, 0.0, 1.0]), size=0.08)
+            draw_points(
+                sim, np.atleast_2d(obs["gates_pos"]), rgba=np.array([1.0, 1.0, 0.0, 1.0]), size=0.08
+            )
             for gpos, gquat in zip(obs["gates_pos"], obs["gates_quat"]):
-                self._draw_square(sim, gpos, gquat, _GateFrame.OUTER / 2,
-                                  np.array([0.0, 1.0, 1.0, 1.0]))
-                self._draw_square(sim, gpos, gquat, _GateFrame.OPENING / 2,
-                                  np.array([1.0, 1.0, 1.0, 1.0]))
+                self._draw_square(
+                    sim, gpos, gquat, _GateFrame.OUTER / 2, np.array([0.0, 1.0, 1.0, 1.0])
+                )
+                self._draw_square(
+                    sim, gpos, gquat, _GateFrame.OPENING / 2, np.array([1.0, 1.0, 1.0, 1.0])
+                )
             for opos in np.atleast_2d(obs["obstacles_pos"]):
                 pole = np.array([[opos[0], opos[1], 0.0], [opos[0], opos[1], opos[2]]])
-                draw_line(sim, pole, rgba=np.array([1.0, 0.5, 0.0, 1.0]),
-                          start_size=6.0, end_size=6.0)
+                draw_line(
+                    sim, pole, rgba=np.array([1.0, 0.5, 0.0, 1.0]), start_size=6.0, end_size=6.0
+                )
 
         # Single red marker: the drone's current progress θ projected onto the path.
         if self._progress_point is not None:
-            draw_points(sim, np.atleast_2d(self._progress_point),
-                        rgba=np.array([1.0, 0.0, 0.0, 1.0]), size=0.07)
+            draw_points(
+                sim,
+                np.atleast_2d(self._progress_point),
+                rgba=np.array([1.0, 0.0, 0.0, 1.0]),
+                size=0.07,
+            )
 
         # Single blue marker: the far end of the MPC horizon (last predicted stage position)
         # — i.e. how far ahead the controller is currently planning.
         if self._pos_pred is not None:
-            draw_points(sim, np.atleast_2d(self._pos_pred[-1]),
-                        rgba=np.array([0.0, 0.0, 1.0, 1.0]), size=0.07)
+            draw_points(
+                sim,
+                np.atleast_2d(self._pos_pred[-1]),
+                rgba=np.array([0.0, 0.0, 1.0, 1.0]),
+                size=0.07,
+            )
 
         # Fixed gate waypoints (entry / center / exit), magenta.
         raw = getattr(self.planner, "_raw_waypoints", None)
@@ -918,17 +1002,24 @@ class MPCCController(Controller):
             draw_line(sim, traj[::step], rgba=np.array([0.0, 1.0, 0.0, 1.0]))
 
     @staticmethod
-    def _draw_square(sim: object, center: np.ndarray, quat: np.ndarray, half: float,
-                     rgba: np.ndarray) -> None:
+    def _draw_square(
+        sim: object, center: np.ndarray, quat: np.ndarray, half: float, rgba: np.ndarray
+    ) -> None:
         """Draw an oriented square outline in the gate plane (local y-z plane)."""
         rot = R.from_quat(quat)
-        local = np.array([
-            [0.0, half, half], [0.0, -half, half],
-            [0.0, -half, -half], [0.0, half, -half], [0.0, half, half],
-        ])
+        local = np.array(
+            [
+                [0.0, half, half],
+                [0.0, -half, half],
+                [0.0, -half, -half],
+                [0.0, half, -half],
+                [0.0, half, half],
+            ]
+        )
         draw_line(sim, center + rot.apply(local), rgba=rgba)
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
+        """Clear the warm-start caches and cancel any in-flight replan between episodes."""
         self._theta_pred = None
         self._pos_pred = None
         self._x_pred = None
@@ -938,6 +1029,7 @@ class MPCCController(Controller):
             self._replan_future.cancel()
             self._replan_future = None
 
-    def episode_reset(self):
+    def episode_reset(self) -> None:
+        """Reset the finished flag and clear per-episode state."""
         self._finished = False
         self.episode_callback()
