@@ -163,10 +163,15 @@ def create_mpcc_ocp_solver(
     ocp.cost.cost_type = "NONLINEAR_LS"
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
-    # Contouring (q_c, hold the path), lag (q_l, don't fall behind the progress point →
-    # raise if the drone "waits" before gates), attitude, drpy, progress reward (q_v, push
-    # toward V_TARGET). q_c ≫ q_l keeps it contouring; q_l/q_v drive how eagerly it advances.
-    q_c, q_l, q_att, q_dr, q_v = 50.0, 5.0, 1.0, 5.0, 20.0
+    # Contouring (q_c, hold the path) and lag (q_l, keep the reference point p_d(theta) tied
+    # to the drone longitudinally). Because theta is now a free inherited STATE (#2), q_l is
+    # what stops it running away: a strong lag penalty forces the optimiser to slow v_theta
+    # whenever the drone falls behind p_d(theta), so theta stays glued to the drone (and the
+    # drone slows into corners instead of letting the reference sprint ahead). The progress
+    # penalty q_v is kept light so it sets a cruise speed without overpowering the lag — lag
+    # must dominate progress (≈30:1), or theta marches at the target speed regardless of the
+    # drone and the reference leads it off the line.
+    q_c, q_l, q_att, q_dr, q_v = 50.0, 150.0, 1.0, 5.0, 5.0
     r_rpy, r_T, r_at = 1.0, 50.0, 0.5
     W = np.diag(
         [
@@ -805,6 +810,12 @@ class MPCCController(Controller):
                 self.planner._apply_trajectory(self._replan_future.result())
                 self._build_cubic()  # refresh the embedded path coefficients onto the new path
 
+                # New path ⇒ the old progress state no longer means the same arc length, so
+                # the inherited θ/positions are stale. Clear them; compute_control then
+                # re-localises by projecting onto the fresh path on the next tick (#2).
+                self._theta_pred = None
+                self._pos_pred = None
+
             except Exception as exc:
                 print(f"[MPCC] background replan failed: {exc!r}")
             self._replan_future = None
@@ -926,14 +937,27 @@ class MPCCController(Controller):
         self._maybe_replan(obs)
         tic = time.perf_counter()
 
-        # Project the drone onto the path → current progress theta0 and progress speed. The
-        # projection is constrained to a local forward window around the last θ so it can
-        # never jump onto an earlier/later branch (flying through a gate and back) and shortcut.
-        theta0 = self.planner.project_to_theta(obs["pos"], obs["vel"], theta_prev=self._theta_est)
-        self._theta_est = theta0
-        p0, t0 = self.planner.path_point_tangent(theta0)
+        # Progress state θ / v_theta. θ is a genuine progress STATE that evolves inside the
+        # solve (MPCC++ eq. 6) — it must NOT be re-pinned to the geometric projection every
+        # tick, or its lag dynamics collapse and the cost degenerates back to point-tracking.
+        # So on a NORMAL tick we INHERIT θ / v_theta from the previous solution at node 1
+        # (the node that becomes "now" once the horizon advances one control step). We
+        # re-localise by projecting ONLY when there is no valid prediction on the current
+        # path: the first tick, an episode reset, or right after a replan installs a new path
+        # — all signalled by _theta_pred having been cleared. The projection is window-
+        # constrained around the last θ so it can never snap onto an earlier/later branch.
+        if self._theta_pred is None or self._x_pred is None:
+            theta0 = self.planner.project_to_theta(
+                obs["pos"], obs["vel"], theta_prev=self._theta_est
+            )
+            p0, t0 = self.planner.path_point_tangent(theta0)
+            vtheta0 = float(np.clip(np.dot(obs["vel"], t0), 0.0, self.VTHETA_MAX))
+        else:
+            theta0 = float(self._theta_pred[1])
+            p0, _ = self.planner.path_point_tangent(theta0)
+            vtheta0 = float(np.clip(self._x_pred[1, 13], 0.0, self.VTHETA_MAX))
+        self._theta_est = theta0  # window centre for the next re-localisation projection
         self._progress_point = p0  # the single "where is the drone along the path" marker
-        vtheta0 = float(np.clip(np.dot(obs["vel"], t0), 0.0, self.VTHETA_MAX))
 
         # Initial state (augmented).
         rpy = R.from_quat(obs["quat"]).as_euler("xyz")
