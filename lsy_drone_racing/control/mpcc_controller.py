@@ -35,8 +35,6 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.mpc_planner_controller import (
-    _CON_SLACK_LIN,
-    _CON_SLACK_QUAD,
     _Cylinder,
     _GateFrame,
 )
@@ -78,6 +76,31 @@ def create_mpcc_model(parameters: dict) -> AcadosModel:
     return model
 
 
+def _capsule_barrier(p_caps: ca.MX, pos: ca.MX, n_caps: int) -> ca.MX:
+    """Smooth soft-barrier residual for each avoidance capsule.
+
+    ``p_caps`` packs ``n_caps`` capsules as ``[p1(3), p2(3), r(1)]`` each. For every capsule
+    the residual is ``max(0, 1 - d^2/r^2)^2`` with ``d`` the distance from ``pos`` to the
+    closest point on the capsule segment: 0 outside the radius, rising smoothly to 1 on the
+    axis. C1-continuous, so it suits the Gauss-Newton SQP. Returns an empty vector when
+    ``n_caps == 0``.
+    """
+    out = []
+    for i in range(n_caps):
+        p1 = p_caps[i * 7 + 0 : i * 7 + 3]
+        p2 = p_caps[i * 7 + 3 : i * 7 + 6]
+        r = p_caps[i * 7 + 6]
+        v = p2 - p1
+        w = pos - p1
+        vv = ca.dot(v, v)
+        vv = ca.if_else(vv > 1e-6, vv, 1e-6)
+        s = ca.fmax(0.0, ca.fmin(1.0, ca.dot(w, v) / vv))  # closest-point param on the segment
+        diff = pos - (p1 + s * v)
+        d2 = ca.dot(diff, diff)
+        out.append(ca.fmax(0.0, 1.0 - d2 / (r**2 + 1e-6)) ** 2)
+    return ca.vertcat(*out)
+
+
 def create_mpcc_ocp_solver(
     Tf: float,
     N: int,
@@ -87,24 +110,25 @@ def create_mpcc_ocp_solver(
     v_max: float = 2.0,
     vtheta_max: float = 2.5,
     atheta_max: float = 6.0,
-    n_obstacles: int = 0,
-    n_gates: int = 0,
-    obs_clearance: float = 0.15,
-    gate_drone_r: float = 0.09,
+    n_caps: int = 0,
+    capsule_penalty: float = 5000.0,
     time_steps: np.ndarray | None = None,
     verbose: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Build the acados OCP/solver for MPCC.
 
-    NONLINEAR_LS cost on contouring/lag/progress; per-stage
-    path point + tangent + target speed are model parameters set per solve. When
-    ``n_obstacles``/``n_gates`` > 0 the same soft obstacle/gate keep-out as the tracking MPC
-    is added (smooth ``con_h`` with slack-penalty cost), parametrised by the live poses.
+    NONLINEAR_LS cost on contouring/lag/progress; the per-stage path cubic + target speed are
+    model parameters set per solve. When ``n_caps`` > 0, obstacle/gate avoidance is added as a
+    smooth soft-barrier in the COST (not a hard constraint): each keep-out is a capsule
+    (segment ``p1->p2`` with radius ``r``) and the barrier ``max(0, 1 - d^2/r^2)^2`` (``d`` =
+    distance from the drone to the capsule axis) is penalised with weight ``capsule_penalty``.
+    A cost barrier never makes the QP infeasible and is cheap (no extra inequality rows /
+    slacks), and the capsule shape lets the drone fly through a gate opening while avoiding the
+    frame bars — so no per-gate enable/disable is needed.
 
     Parameter layout per stage: ``p = [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1),
-    <one convex half-plane [a_x, a_y, b] per keep-out>]``. The 13-number cubic head defines
-    ``p_d(theta) = c*(theta - theta_i)`` so the path point/tangent are functions of the
-    progress state (re-linearised per node from the warm-started theta).
+    <p1(3), p2(3), r(1)> * n_caps]``. The cubic head defines ``p_d(theta) = c*(theta-theta_i)``
+    so the path point/tangent are functions of the progress state (re-linearised per node).
     """
     ocp = AcadosOcp()
     ocp.model = create_mpcc_model(parameters)
@@ -114,11 +138,10 @@ def create_mpcc_ocp_solver(
     hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
 
     # Per-stage parameters: contouring head [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1)]
-    # = the LOCAL CUBIC of the path around this node's predicted theta, + one convex
-    # half-plane [a_x, a_y, b] per keep-out (obstacle or non-target gate).
-    n_keepout = n_obstacles + n_gates
+    # = the LOCAL CUBIC of the path around this node's predicted theta, followed by n_caps
+    # avoidance capsules [p1(3), p2(3), r(1)] (poles + gate stand/bars).
     n_head = 14  # 1 (theta_i) + 12 (cubic coeffs) + 1 (v_target)
-    n_p = n_head + 3 * n_keepout
+    n_p = n_head + 7 * n_caps
     p = ca.MX.sym("p", n_p)
     ocp.model.p = p
     ocp.parameter_values = np.zeros(n_p)
@@ -154,10 +177,15 @@ def create_mpcc_ocp_solver(
     e_c = d - e_l * (t_vec / t_norm)  # contouring (perpendicular, 3-vector) — depends on theta
     e_v = v_theta - v_target  # progress-speed tracking (the "reward")
 
+    # Avoidance soft-barrier: one smooth residual per capsule (poles + gate stand/bars),
+    # appended to the least-squares cost. Penalises proximity to each capsule axis instead of
+    # adding hard constraints, so the QP never goes infeasible and the gate opening stays free.
+    y_obs = _capsule_barrier(p[n_head:], pos, n_caps)
+
     # Nonlinear least-squares residual (nonlinear in theta now; acados' Gauss-Newton SQP
     # re-linearises the path each iteration).
-    y = ca.vertcat(e_c, e_l, rpy, drpy, e_v, rpy_cmd, thrust - hover_thrust, a_theta)
-    y_e = ca.vertcat(e_c, e_l, rpy, drpy, e_v)
+    y = ca.vertcat(e_c, e_l, rpy, drpy, e_v, rpy_cmd, thrust - hover_thrust, a_theta, y_obs)
+    y_e = ca.vertcat(e_c, e_l, rpy, drpy, e_v, y_obs)
     ocp.model.cost_y_expr = y
     ocp.model.cost_y_expr_e = y_e
     ocp.cost.cost_type = "NONLINEAR_LS"
@@ -173,27 +201,12 @@ def create_mpcc_ocp_solver(
     # drone and the reference leads it off the line.
     q_c, q_l, q_att, q_dr, q_v = 50.0, 150.0, 1.0, 5.0, 5.0
     r_rpy, r_T, r_at = 1.0, 50.0, 0.5
-    W = np.diag(
-        [
-            q_c,
-            q_c,
-            q_c,
-            q_l,
-            q_att,
-            q_att,
-            q_att,
-            q_dr,
-            q_dr,
-            q_dr,
-            q_v,
-            r_rpy,
-            r_rpy,
-            r_rpy,
-            r_T,
-            r_at,
-        ]
-    )
-    W_e = np.diag([q_c, q_c, q_c, q_l, q_att, q_att, q_att, q_dr, q_dr, q_dr, q_v])
+    # Diagonal weights; the n_caps capsule-barrier residuals are weighted capsule_penalty each
+    # (appended last to match the y / y_e ordering above).
+    w_term = [q_c, q_c, q_c, q_l, q_att, q_att, q_att, q_dr, q_dr, q_dr, q_v]
+    w_stage = w_term + [r_rpy, r_rpy, r_rpy, r_T, r_at]
+    W = np.diag(w_stage + [capsule_penalty] * n_caps)
+    W_e = np.diag(w_term + [capsule_penalty] * n_caps)
     ocp.cost.W = W
     ocp.cost.W_e = W_e
     ocp.cost.yref = np.zeros(y.rows())
@@ -206,40 +219,12 @@ def create_mpcc_ocp_solver(
     # Soften the velocity and v_theta bounds so a transient overspeed never makes the QP
     # infeasible (positions 4,5,6,7 within idxbx → vel x/y/z and v_theta).
     ocp.constraints.idxsbx = np.array([4, 5, 6, 7])
-    # Slack costs accumulate across soft constraints (velocity bounds first, then the
-    # optional obstacle/gate keep-out below) in acados' [sbx, sh] order.
-    zl_parts = [1e3 * np.ones(4)]
-    zu_parts = [1e3 * np.ones(4)]
-    Zl_parts = [1e3 * np.ones(4)]
-    Zu_parts = [1e3 * np.ones(4)]
-
-    # Convex per-stage keep-out: one half-plane ``a_x·px + a_y·py - b >= 0`` per obstacle
-    # and per non-target gate. The normal ``a`` points from the keep-out centre to the
-    # *predicted* drone position and ``b`` puts the line tangent to the keep-out circle, so
-    # the feasible side is convex — re-linearised every tick (SCP). Linear ⇒ the QP stays
-    # convex and solves fast/reliably, and *every* gate is kept out (no "just-passed gate"
-    # exemption, so a U-turn back toward a frame is still caught). The target gate's plane
-    # is disabled at run time (``a=0, b=-1e9``) since we fly through it on the path.
-    if n_keepout > 0:
-        px, py = ocp.model.x[0], ocp.model.x[1]
-        h_list = []
-        off = n_head
-        for _ in range(n_keepout):
-            h_list.append(p[off] * px + p[off + 1] * py - p[off + 2])
-            off += 3
-        ocp.model.con_h_expr = ca.vertcat(*h_list)
-        ocp.constraints.lh = np.zeros(n_keepout)
-        ocp.constraints.uh = 1e9 * np.ones(n_keepout)
-        ocp.constraints.idxsh = np.arange(n_keepout)
-        zl_parts.append(_CON_SLACK_LIN * np.ones(n_keepout))
-        zu_parts.append(_CON_SLACK_LIN * np.ones(n_keepout))
-        Zl_parts.append(_CON_SLACK_QUAD * np.ones(n_keepout))
-        Zu_parts.append(_CON_SLACK_QUAD * np.ones(n_keepout))
-
-    ocp.cost.zl = np.concatenate(zl_parts)
-    ocp.cost.zu = np.concatenate(zu_parts)
-    ocp.cost.Zl = np.concatenate(Zl_parts)
-    ocp.cost.Zu = np.concatenate(Zu_parts)
+    # Slack costs for the softened velocity / v_theta bounds. Obstacle/gate avoidance is now a
+    # cost barrier (above), not a constraint, so there are no keep-out slacks here any more.
+    ocp.cost.zl = 1e3 * np.ones(4)
+    ocp.cost.zu = 1e3 * np.ones(4)
+    ocp.cost.Zl = 1e3 * np.ones(4)
+    ocp.cost.Zu = 1e3 * np.ones(4)
 
     # Input bounds: rpy commands, collective thrust, progress acceleration.
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -atheta_max])
@@ -251,12 +236,16 @@ def create_mpcc_ocp_solver(
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.nlp_solver_type = "SQP"
-    ocp.solver_options.tol = 1e-6
+    # Real-time iteration: ONE SQP step per tick (prepare + feedback), instead of iterating a
+    # full SQP to 1e-6 (up to 50 re-linearisations/tick) which blew the ~20 ms control budget.
+    # The shifted warm start lands each tick near the optimum, so a single iteration tracks
+    # well; correctness was already verified with full SQP (#1/#2) before this speed change.
+    ocp.solver_options.nlp_solver_type = "SQP_RTI"
+    ocp.solver_options.tol = 1e-3
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
-    ocp.solver_options.qp_solver_iter_max = 50
-    ocp.solver_options.nlp_solver_max_iter = 50
+    ocp.solver_options.qp_solver_iter_max = 10
+    ocp.solver_options.nlp_solver_max_iter = 1
     if time_steps is not None:
         # Non-uniform shooting grid: same N nodes, but the intervals grow toward the end so
         # the horizon reaches much further ahead at ~no extra cost. tf must equal their sum.
@@ -700,6 +689,9 @@ class MPCCController(Controller):
     VTHETA_MAX = 5  # m/s — hard-ish cap on progress speed
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
+    #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
+    #: episode reset), where the warm start is far from the new optimum. Normal ticks run 1.
+    RTI_BUMP_ITERS = 5
 
     #: Per-node growth of the shooting interval (non-uniform time grid). The first interval
     #: is the real control period dt; each later one is this much longer, so the same N
@@ -707,15 +699,23 @@ class MPCCController(Controller):
     #: e.g. N=25, dt=0.02, growth=1.06 → horizon ≈ 1.1 s instead of 0.5 s.
     HORIZON_GROWTH = 1.0
 
-    #: Add the MPC's soft obstacle/gate-frame keep-out (penalty cost on violation) to MPCC.
-    USE_OBSTACLE_CONSTRAINTS = True
-    #: Add the per-gate keep-out half-planes. Set False to temporarily switch the gate costs
-    #: off (the solver is then rebuilt without any gate constraint); obstacle keep-out is
-    #: unaffected. Has no effect when USE_OBSTACLE_CONSTRAINTS is False (everything off).
-    USE_GATE_CONSTRAINTS = False
-    #: MPC soft-obstacle clearance (m), kept below the planner's PLAN_CLEARANCE so the path
-    #: stays feasible and the constraint only bites on real drift toward a pole.
-    MPC_OBS_CLEARANCE = 0.15
+    #: Add the obstacle/gate-frame avoidance soft-barrier (capsule cost) to the MPCC cost.
+    #: Set False to fly with no avoidance (pure path tracking) for debugging.
+    USE_AVOIDANCE = True
+    #: Weight on each capsule barrier residual — how hard avoidance bites.
+    CAPSULE_PENALTY = 5000.0
+    #: Extra safety margin (m) added to every capsule radius.
+    AVOID_MARGIN = 0.15
+    #: Gate-frame geometry (m), matched to the simulator's gate: outer size, bar-centre
+    #: distance from the gate centre, bar radius, stand (leg) radius. Each gate becomes a
+    #: stand capsule + 4 frame-bar capsules.
+    GATE_OUTER = 0.72
+    GATE_BAR_DIST = 0.28
+    GATE_BAR_RADIUS = 0.08
+    GATE_STAND_RADIUS = 0.05
+    #: Obstacle pole geometry (m): radius and full height (vertical capsule from the ground).
+    POLE_RADIUS = 0.015
+    POLE_HEIGHT = 1.52
 
     #: Print a rolling per-tick timing breakdown (project / set-params / solve) every 50
     #: ticks, to find what eats the 20 ms control budget. Off by default.
@@ -740,20 +740,20 @@ class MPCCController(Controller):
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._hover_thrust = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
 
-        self._n_obstacles = int(len(obs["obstacles_pos"])) if self.USE_OBSTACLE_CONSTRAINTS else 0
-        use_gates = self.USE_OBSTACLE_CONSTRAINTS and self.USE_GATE_CONSTRAINTS
-        self._n_gates = int(len(obs["gates_pos"])) if use_gates else 0
-        self._n_keepout = self._n_obstacles + self._n_gates
+        self._n_obstacles = int(len(obs["obstacles_pos"]))
+        self._n_gates = int(len(obs["gates_pos"]))
+        # Avoidance capsules: one per pole + 5 per gate (stand + 4 frame bars). The stand slot
+        # is always allocated and set to a far-away dummy when the gate sits on the ground, so
+        # the capsule count stays fixed for the life of the solver.
+        self._n_caps = (self._n_obstacles + 5 * self._n_gates) if self.USE_AVOIDANCE else 0
         self._solver, self._ocp = create_mpcc_ocp_solver(
             self._T_HORIZON,
             self._N,
             self.drone_params,
             z_min=self.GROUND_Z,
             vtheta_max=self.VTHETA_MAX,
-            n_obstacles=self._n_obstacles,
-            n_gates=self._n_gates,
-            obs_clearance=self.MPC_OBS_CLEARANCE,
-            gate_drone_r=SimplePlanner.DRONE_RADIUS,
+            n_caps=self._n_caps,
+            capsule_penalty=self.CAPSULE_PENALTY,
             time_steps=self._time_steps if self.HORIZON_GROWTH != 1.0 else None,
         )
         self._nx = self._ocp.model.x.rows()
@@ -862,39 +862,49 @@ class MPCCController(Controller):
 
     # ── Control ───────────────────────────────────────────────────────────────
 
-    def _keepout_halfplanes(self, obs: dict, pos_pred: np.ndarray) -> np.ndarray:
-        """Build per-stage convex keep-out half-planes for each obstacle and non-target gate.
+    def _build_capsule_params(self, obs: dict) -> np.ndarray:
+        """Flat avoidance-capsule params ``[p1(3), p2(3), r(1)] * n_caps`` from the live poses.
 
-        Each half-plane ``[a_x, a_y, b]`` is linearised at the predicted per-stage positions
-        ``pos_pred`` ((N+1, 3)). The normal ``a`` points from the keep-out centre to the
-        predicted drone position; ``b = a·c + r`` makes the line tangent to the keep-out
-        circle of radius ``r`` (obstacle clearance, or the gate's outer frame half-width).
-        The target gate is
-        disabled (``a=0, b=-1e9`` → constraint always satisfied: we fly through it).
-
-        Returns an array of shape (N+1, n_keepout, 3).
+        Poles become a vertical capsule (ground -> POLE_HEIGHT). Each gate becomes a stand
+        (leg) plus 4 frame bars, built from the gate position and its up/right axes; radii get
+        AVOID_MARGIN. The stand slot is set to a far-away dummy when the gate is airborne (no
+        leg), so the capsule count matches the fixed ``n_caps`` the solver was built with.
         """
-        P = pos_pred[:, :2]  # (N+1, 2) predicted xy
-        # (centre xy, radius, disabled) for every keep-out: obstacles then gates.
-        items = [
-            (np.asarray(op[:2], float), self.MPC_OBS_CLEARANCE, False)
-            for op in obs["obstacles_pos"]
-        ]
-        target = int(obs["target_gate"])
-        gate_r = _GateFrame.OUTER / 2 + SimplePlanner.DRONE_RADIUS  # clear the frame
-        for j in range(self._n_gates):
-            items.append((np.asarray(obs["gates_pos"][j][:2], float), gate_r, j == target))
+        caps = np.empty(self._n_caps * 7)
+        i = 0
 
-        out = np.zeros((self._N + 1, len(items), 3))
-        for m, (c, r, disabled) in enumerate(items):
-            if disabled:
-                out[:, m, 2] = -1e9  # a=0, b=-1e9 → a·p - b = 1e9 >= 0 always
-                continue
-            d = P - c  # (N+1, 2)
-            n = d / np.clip(np.linalg.norm(d, axis=1, keepdims=True), 1e-6, None)
-            out[:, m, 0:2] = n
-            out[:, m, 2] = (n * c).sum(axis=1) + r  # b = a·c + r
-        return out
+        def put(p1: np.ndarray, p2: np.ndarray, r: float) -> None:
+            nonlocal i
+            caps[i * 7 + 0 : i * 7 + 3] = p1
+            caps[i * 7 + 3 : i * 7 + 6] = p2
+            caps[i * 7 + 6] = r
+            i += 1
+
+        r_pole = self.POLE_RADIUS + self.AVOID_MARGIN
+        for op in obs["obstacles_pos"]:
+            put([op[0], op[1], 0.0], [op[0], op[1], self.POLE_HEIGHT], r_pole)
+
+        half = self.GATE_OUTER / 2.0
+        bar_dist = self.GATE_BAR_DIST
+        r_bar = self.GATE_BAR_RADIUS + self.AVOID_MARGIN
+        r_stand = self.GATE_STAND_RADIUS + self.AVOID_MARGIN
+        far = np.full(3, 1e3)  # dummy capsule, never near the drone
+        for gp, gq in zip(obs["gates_pos"], obs["gates_quat"]):
+            rot = R.from_quat(gq)
+            up = rot.apply([0.0, 0.0, 1.0])  # gate vertical axis
+            right = rot.apply([0.0, 1.0, 0.0])  # gate lateral axis
+            # Stand: leg from the gate's bottom down to the ground (dummy if airborne).
+            stand_h = float(gp[2]) - half
+            if stand_h > 0:
+                put(gp - up * half, gp - up * (half + stand_h), r_stand)
+            else:
+                put(far, far, r_stand)
+            # 4 frame bars: top, bottom, left, right (each spans the outer width).
+            put(gp + up * bar_dist - right * half, gp + up * bar_dist + right * half, r_bar)
+            put(gp - up * bar_dist - right * half, gp - up * bar_dist + right * half, r_bar)
+            put(gp - right * bar_dist + up * half, gp - right * bar_dist - up * half, r_bar)
+            put(gp + right * bar_dist + up * half, gp + right * bar_dist - up * half, r_bar)
+        return caps
 
     def _stage_thetas(self, theta0: float) -> np.ndarray:
         """Predict theta at each shooting node (warm start for the path relinearisation).
@@ -946,7 +956,8 @@ class MPCCController(Controller):
         # path: the first tick, an episode reset, or right after a replan installs a new path
         # — all signalled by _theta_pred having been cleared. The projection is window-
         # constrained around the last θ so it can never snap onto an earlier/later branch.
-        if self._theta_pred is None or self._x_pred is None:
+        relocalize = self._theta_pred is None or self._x_pred is None
+        if relocalize:
             theta0 = self.planner.project_to_theta(
                 obs["pos"], obs["vel"], theta_prev=self._theta_est
             )
@@ -971,20 +982,28 @@ class MPCCController(Controller):
         t_proj = time.perf_counter()
 
         # Per-stage path: the LOCAL CUBIC of the path around each node's predicted theta, so
-        # acados can evaluate p_d(theta) symbolically. Plus the convex keep-out half-planes
-        # linearised at the predicted positions.
+        # acados can evaluate p_d(theta) symbolically. Plus the avoidance capsules (same for
+        # every node), built once from the live gate/obstacle poses.
         thetas = self._stage_thetas(theta0)
-        pts, _tans = self.planner.path_point_tangent(thetas)  # only for the keep-out fallback
-        pos_pred = self._pos_pred if self._pos_pred is not None else pts
-        hp = self._keepout_halfplanes(obs, pos_pred) if self._n_keepout else None
+        caps = self._build_capsule_params(obs) if self._n_caps else None
         for k in range(self._N + 1):
             theta_i, cx, cy, cz = self._path_segment_coeffs(thetas[k])
             head = np.concatenate(([theta_i], cx, cy, cz, [self.V_TARGET]))
-            p_k = head if hp is None else np.concatenate((head, hp[k].reshape(-1)))
+            p_k = head if caps is None else np.concatenate((head, caps))
             self._solver.set(k, "p", p_k)
         t_setp = time.perf_counter()
 
-        status = self._solver.solve()
+        # SQP_RTI solve: phase 1 prepares (linearise + condense the QP at the warm-started
+        # iterate), phase 2 solves the QP and applies the feedback step. Normally one iteration
+        # per tick; on a fresh path (replan just installed / first tick / reset) the warm start
+        # is far from the new optimum, so run a short burst to re-converge within this tick
+        # instead of lagging the jump over the next several ticks.
+        n_iters = self.RTI_BUMP_ITERS if relocalize else 1
+        for _ in range(n_iters):
+            self._solver.options_set("rti_phase", 1)
+            self._solver.solve()
+            self._solver.options_set("rti_phase", 2)
+            status = self._solver.solve()
         if self.PROFILE:
             self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
         if status == 0:
