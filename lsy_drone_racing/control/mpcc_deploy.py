@@ -18,6 +18,11 @@ comes from an internal arc-length spline built from the warm-started :class:`Sim
 
 from __future__ import annotations
 
+import glob
+import hashlib
+import inspect
+import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -96,6 +101,39 @@ def _capsule_barrier(p_caps: ca.MX, pos: ca.MX, n_caps: int) -> ca.MX:
         d2 = ca.dot(diff, diff)
         out.append(ca.fmax(0.0, 1.0 - d2 / (r**2 + 1e-6)) ** 2)
     return ca.vertcat(*out)
+
+
+def _solver_signature(payload: dict) -> str:
+    """Hash everything that determines the generated acados C code.
+
+    Two parts: (1) the structural/numeric arguments that get baked into the OCP (horizon,
+    capsule count, the bounds/penalties, the time grid, and the drone params that enter the
+    dynamics symbolically); (2) the *source* of the model/cost/solver builders, so any edit to
+    them invalidates the cache automatically. Runtime quantities (gate/obstacle poses, path
+    cubics, x0) flow in as solver parameters and are deliberately excluded — they never change
+    the C code.
+    """
+
+    def _jsonable(v: object) -> object:
+        if isinstance(v, np.ndarray):
+            return np.round(v, 9).tolist()
+        if isinstance(v, (np.floating, np.integer)):
+            return float(v)
+        if isinstance(v, dict):
+            return {k: _jsonable(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_jsonable(x) for x in v]
+        return v
+
+    src = "".join(
+        inspect.getsource(fn)
+        for fn in (create_mpcc_model, _capsule_barrier, create_mpcc_ocp_solver)
+    )
+    blob = json.dumps(
+        {"args": _jsonable(payload), "src": hashlib.sha256(src.encode()).hexdigest()},
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def create_mpcc_ocp_solver(
@@ -264,13 +302,41 @@ def create_mpcc_ocp_solver(
     else:
         ocp.solver_options.tf = Tf
 
-    solver = AcadosOcpSolver(
-        ocp,
-        json_file="c_generated_code/mpcc_planner.json",
-        verbose=verbose,
-        build=True,
-        generate=True,
+    # Reuse the already-generated/compiled solver when nothing that affects the C code has
+    # changed. Generating + compiling the OCP costs many seconds at every start; it only needs
+    # redoing when the OCP structure changes (N, n_caps, the drone model, the time grid, the
+    # bounds/penalties) or the builder source is edited — all captured by the signature below.
+    gen_dir = "c_generated_code"
+    json_file = os.path.join(gen_dir, "mpcc_planner.json")
+    sig_file = os.path.join(gen_dir, "mpcc_planner.sig")
+    signature = _solver_signature(
+        {
+            "N": N,
+            "z_min": z_min,
+            "z_max": z_max,
+            "v_max": v_max,
+            "vtheta_max": vtheta_max,
+            "atheta_max": atheta_max,
+            "n_caps": n_caps,
+            "capsule_penalty": capsule_penalty,
+            "time_steps": None if time_steps is None else np.asarray(time_steps, float),
+            "parameters": parameters,
+        }
     )
+    lib_exists = bool(glob.glob(os.path.join(gen_dir, "libacados_ocp_solver_mpcc_planner.*")))
+    cached_sig = None
+    if os.path.exists(sig_file):
+        with open(sig_file) as f:
+            cached_sig = f.read().strip()
+    fresh = lib_exists and cached_sig == signature  # reuse the compiled code as-is
+
+    solver = AcadosOcpSolver(
+        ocp, json_file=json_file, verbose=verbose, build=not fresh, generate=not fresh
+    )
+    if not fresh:  # record the signature of the code we just generated/built
+        os.makedirs(gen_dir, exist_ok=True)
+        with open(sig_file, "w") as f:
+            f.write(signature)
     return solver, ocp
 
 
@@ -295,7 +361,7 @@ class SimplePlanner:
     optimiser (identical waypoint structure across replans ⇒ direct reuse).
     """
 
-    TARGET_SPEED = 3.5  # m/s — cruise speed of the velocity profile
+    TARGET_SPEED = 3  # m/s — cruise speed of the velocity profile
     V_EDGE = 0.6  # m/s — speed at trajectory start/end
     ACCEL_DIST = 0.8  # m — ramp-up arc length
     DECEL_DIST = 0.8  # m — ramp-down arc length
@@ -682,8 +748,13 @@ class MPCCController(Controller):
     """MPCC controller: contouring control along the warm-started SimplePlanner path."""
 
     GROUND_Z = 0.0
-    V_TARGET = 3.5  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
+    V_TARGET = 3  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 5  # m/s — hard-ish cap on progress speed
+    #: Distance (m) from the path end within which the controller switches to end-hover:
+    #: it freezes every stage's progress at theta=length and sets the target progress speed
+    #: to 0, so contouring+lag pull the drone onto the final path point and v_theta decays to
+    #: 0 — the drone station-keeps on the last trajectory point instead of overrunning it.
+    END_HOVER_TOL = 0.1
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
     #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
@@ -981,11 +1052,20 @@ class MPCCController(Controller):
         # Per-stage path: the LOCAL CUBIC of the path around each node's predicted theta, so
         # acados can evaluate p_d(theta) symbolically. Plus the avoidance capsules (same for
         # every node), built once from the live gate/obstacle poses.
-        thetas = self._stage_thetas(theta0)
+        # End-hover: once the drone's progress reaches the end of the path, freeze every
+        # stage's reference at theta=length and drop the target progress speed to 0. The
+        # contouring+lag cost then pulls the drone onto the final path point p_d(length) and
+        # the progress reward drives v_theta -> 0, so it station-keeps on the last trajectory
+        # point instead of overrunning the path end.
+        finishing = theta0 >= self.planner.length - self.END_HOVER_TOL
+        v_target = 0.0 if finishing else self.V_TARGET
+        thetas = (
+            np.full(self._N + 1, self.planner.length) if finishing else self._stage_thetas(theta0)
+        )
         caps = self._build_capsule_params(obs) if self._n_caps else None
         for k in range(self._N + 1):
             theta_i, cx, cy, cz = self._path_segment_coeffs(thetas[k])
-            head = np.concatenate(([theta_i], cx, cy, cz, [self.V_TARGET]))
+            head = np.concatenate(([theta_i], cx, cy, cz, [v_target]))
             p_k = head if caps is None else np.concatenate((head, caps))
             self._solver.set(k, "p", p_k)
         t_setp = time.perf_counter()
