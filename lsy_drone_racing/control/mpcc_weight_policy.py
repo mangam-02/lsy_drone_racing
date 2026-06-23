@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.spatial.transform import Rotation as R
 from torch.distributions.normal import Normal
 
 if TYPE_CHECKING:
@@ -59,18 +60,37 @@ MULT_LOG_RANGE = float(np.log(MULT_FACTOR))
 
 #: Observation layout (compact, solver-free). Keep in sync with :func:`build_features`.
 FEATURE_NAMES = (
+    # ── Path-relative state ──
     "contour_err",  # perpendicular distance to the path (m)
     "lag_err",  # signed longitudinal path error (m)
     "speed",  # |velocity| (m/s)
     "vtheta_proj",  # velocity component along the path tangent (m/s)
     "progress_frac",  # theta / path length ∈ [0, 1]
+    # ── Path curvature ahead (corner anticipation) ──
+    "curv_near",  # path curvature ~0.5 m ahead (1/m)
+    "curv_far",  # path curvature ~1.5 m ahead (1/m)
+    # ── Target (next) gate ──
     "gate_dist",  # distance to the current target gate centre (m)
     "gate_rel_x",  # target-gate offset from the drone, world frame (m)
     "gate_rel_y",
     "gate_rel_z",
-    "obs_dist",  # distance to the nearest obstacle pole, xy (m)
-    "obs_rel_x",  # nearest-obstacle offset, world frame xy (m)
-    "obs_rel_y",
+    "gate_align",  # |cos| between approach direction and gate normal (1 = head-on)
+    "gate_known",  # 1 if the target gate's true pose is sensed, 0 if still nominal
+    # ── Next-next gate (anticipate the turn after the upcoming gate) ──
+    "gate2_dist",  # distance to the gate after the target (m; 10 if none)
+    "gate2_rel_x",  # next-next-gate offset from the drone, world frame (m)
+    "gate2_rel_y",
+    "gate2_rel_z",
+    "gate2_known",  # 1 if the next-next gate's true pose is sensed, 0 if nominal/none
+    # ── Two nearest obstacles (xy), nearest first ──
+    "obs1_dist",  # distance to the nearest obstacle pole, xy (m)
+    "obs1_rel_x",  # nearest-obstacle offset, world frame xy (m)
+    "obs1_rel_y",
+    "obs1_known",  # 1 if the nearest obstacle's true pose is sensed, 0 if nominal
+    "obs2_dist",  # distance to the 2nd-nearest obstacle pole, xy (m)
+    "obs2_rel_x",  # 2nd-nearest-obstacle offset, world frame xy (m)
+    "obs2_rel_y",
+    "obs2_known",  # 1 if the 2nd-nearest obstacle's true pose is sensed, 0 if nominal
 )
 N_FEATURES = len(FEATURE_NAMES)
 
@@ -115,16 +135,39 @@ def weight_diagonals(
 # ── Observation features (solver-free, built from obs + planner path) ───────────────
 
 
+def _path_curvature(planner: object, theta: float, lookahead: float, ds: float = 0.2) -> float:
+    """Unsigned path curvature (1/m) a short distance ``lookahead`` ahead of ``theta``.
+
+    Estimated from the change in unit tangent over ``ds`` of arc length (``|dT/ds| ≈ curvature``,
+    since the path is arc-length parameterised): ~0 on a straight, large in a tight corner. Lets
+    the policy anticipate corners and stiffen/slow before reaching them. Clamped to the path end.
+    """
+    length = float(getattr(planner, "length", 0.0))
+    if length <= 1e-6:
+        return 0.0
+    s0 = min(theta + lookahead, length)
+    s1 = min(s0 + ds, length)
+    if s1 - s0 < 1e-6:
+        return 0.0
+    _, t0 = planner.path_point_tangent(s0)
+    _, t1 = planner.path_point_tangent(s1)
+    return float(np.linalg.norm(np.asarray(t1) - np.asarray(t0)) / (s1 - s0))
+
+
 def build_features(obs: dict, planner: object, theta_prev: float | None) -> np.ndarray:
     """Compact feature vector for the weight policy — see :data:`FEATURE_NAMES`.
 
     Deliberately solver-free: it projects the drone onto the planner's geometric path (the same
     ``project_to_theta`` / ``path_point_tangent`` the controller uses) so the policy can be
-    evaluated *before* the MPCC solve, both in deployment and in training.
+    evaluated *before* the MPCC solve, both in deployment and in training. Beyond the immediate
+    path-relative state it also exposes the curvature ahead, the next *and* next-next gate, and the
+    two nearest obstacles — each gate/obstacle carrying a ``known`` flag (true sensed pose vs. only
+    the nominal a-priori pose) so the policy can be cautious while a pose is still uncertain.
     """
     pos = np.asarray(obs["pos"], dtype=float)
     vel = np.asarray(obs["vel"], dtype=float)
 
+    # Path-relative state.
     length = float(getattr(planner, "length", 0.0))
     theta0 = planner.project_to_theta(pos, vel, theta_prev=theta_prev)
     p_d, tan = planner.path_point_tangent(theta0)
@@ -135,21 +178,53 @@ def build_features(obs: dict, planner: object, theta_prev: float | None) -> np.n
     vtheta_proj = float(np.dot(vel, tan))
     progress_frac = theta0 / length if length > 1e-6 else 0.0
 
+    # Curvature ahead (near + far lookahead) for corner anticipation.
+    curv_near = _path_curvature(planner, theta0, 0.5)
+    curv_far = _path_curvature(planner, theta0, 1.5)
+
+    # Gates: target (next) + the one after it, each with a "true pose known yet?" flag. Until a
+    # gate is sensed the obs only carries its NOMINAL pose, so the flag tells the policy whether to
+    # trust the planned line through it (sensed) or stay cautious (still nominal).
     gates_pos = np.atleast_2d(np.asarray(obs["gates_pos"], dtype=float))
+    gates_quat = np.atleast_2d(np.asarray(obs["gates_quat"], dtype=float))
+    gates_visited = np.atleast_1d(np.asarray(obs["gates_visited"])).astype(float)
+    n_gates = len(gates_pos)
     target_gate = int(obs["target_gate"])
-    gi = target_gate if 0 <= target_gate < len(gates_pos) else len(gates_pos) - 1
+    gi = target_gate if 0 <= target_gate < n_gates else n_gates - 1
+
     gate_rel = gates_pos[gi] - pos
     gate_dist = float(np.linalg.norm(gate_rel))
+    gate_normal = R.from_quat(gates_quat[gi]).apply([1.0, 0.0, 0.0])  # gate plane normal
+    gate_align = abs(float(np.dot(gate_normal, gate_rel / max(gate_dist, 1e-6))))
+    gate_known = float(gates_visited[gi]) if gi < len(gates_visited) else 0.0
 
+    if gi + 1 < n_gates:  # next-next gate: anticipate the turn waiting after the upcoming gate
+        gj = gi + 1
+        gate2_rel = gates_pos[gj] - pos
+        gate2_dist = float(np.linalg.norm(gate2_rel))
+        gate2_known = float(gates_visited[gj]) if gj < len(gates_visited) else 0.0
+    else:  # already heading through the final gate → nothing meaningful after it
+        gate2_rel = np.zeros(3)
+        gate2_dist = 10.0
+        gate2_known = 0.0
+
+    # Two nearest obstacle poles (xy), nearest first, each with its own known flag.
     obstacles_pos = np.atleast_2d(np.asarray(obs["obstacles_pos"], dtype=float))
+    obs_visited = np.atleast_1d(np.asarray(obs["obstacles_visited"])).astype(float)
     if len(obstacles_pos):
-        obs_rel_xy = obstacles_pos[:, :2] - pos[:2]
-        d_xy = np.linalg.norm(obs_rel_xy, axis=1)
-        j = int(np.argmin(d_xy))
-        obs_dist = float(d_xy[j])
-        obs_rel = obs_rel_xy[j]
+        rel_xy = obstacles_pos[:, :2] - pos[:2]
+        d_xy = np.linalg.norm(rel_xy, axis=1)
+        order = np.argsort(d_xy)
     else:
-        obs_dist, obs_rel = 10.0, np.zeros(2)
+        rel_xy, d_xy, order = np.zeros((0, 2)), np.zeros(0), np.zeros(0, dtype=int)
+    obs_block: list[float] = []
+    for k in range(2):
+        if k < len(order):
+            j = int(order[k])
+            known = float(obs_visited[j]) if j < len(obs_visited) else 0.0
+            obs_block += [float(d_xy[j]), float(rel_xy[j, 0]), float(rel_xy[j, 1]), known]
+        else:  # fewer than 2 obstacles on this track → far-away dummy
+            obs_block += [10.0, 0.0, 0.0, 0.0]
 
     feats = np.array(
         [
@@ -158,13 +233,20 @@ def build_features(obs: dict, planner: object, theta_prev: float | None) -> np.n
             speed,
             vtheta_proj,
             progress_frac,
+            curv_near,
+            curv_far,
             gate_dist,
             gate_rel[0],
             gate_rel[1],
             gate_rel[2],
-            obs_dist,
-            obs_rel[0],
-            obs_rel[1],
+            gate_align,
+            gate_known,
+            gate2_dist,
+            gate2_rel[0],
+            gate2_rel[1],
+            gate2_rel[2],
+            gate2_known,
+            *obs_block,
         ],
         dtype=np.float32,
     )

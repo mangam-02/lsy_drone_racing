@@ -67,12 +67,16 @@ class MPCCWeightEnv(gymnasium.Env):
         render: bool = False,
         seed: int = 0,
         switch_ticks: int = 10,
+        crash_penalty: float = 200.0,
     ):
         """Set up the race config, spaces and reward-shaping coefficients (env built lazily).
 
         ``switch_ticks`` is the WMPC switching interval Tsw/Ts (paper Fig. 2): one RL action sets
         the weights, which are then held for ``switch_ticks`` MPC ticks while the per-tick signals
         are buffered; the returned observation is their mean over the interval.
+
+        ``crash_penalty`` is the one-off reward subtracted when the drone terminates without
+        finishing (a crash); raise it to push the policy harder towards never crashing.
         """
         self.config = load_config(Path(__file__).parents[2] / "config" / config_name)
         self.config.sim.render = render
@@ -89,7 +93,7 @@ class MPCCWeightEnv(gymnasium.Env):
         self.progress_coef = 50.0  # per metre of path progress
         self.gate_bonus = 10.0  # per gate passed
         self.finish_bonus = 50.0  # all gates passed
-        self.crash_penalty = 30.0  # terminated without finishing
+        self.crash_penalty = float(crash_penalty)  # terminated without finishing (a crash)
         self.solve_fail_penalty = 1.0  # MPCC solve failed this tick
         self.track_coef = 2.0  # per metre of contouring error
         self.time_penalty = 0.02  # per tick (encourage finishing fast)
@@ -183,7 +187,13 @@ class MPCCWeightEnv(gymnasium.Env):
             contour = float(np.linalg.norm(np.asarray(obs["pos"]) - ctrl._progress_point))
             r -= self.track_coef * contour
         if terminated and not finished:
-            r -= self.crash_penalty
+            # Scale the crash penalty by how far the drone still had to go: an early crash costs
+            # the full penalty, a crash just before the last gate only a fraction of it. The
+            # target gate at the crash equals the number of gates already passed.
+            n_gates = len(np.atleast_2d(np.asarray(obs["gates_pos"])))
+            gates_passed = int(target) if target != -1 else n_gates
+            remaining_frac = (n_gates - gates_passed) / n_gates if n_gates > 0 else 1.0
+            r -= self.crash_penalty * remaining_frac
         if finished:
             r += self.finish_bonus
         r -= self.time_penalty
@@ -211,6 +221,7 @@ class Args:
     num_steps: int = 256
     switch_ticks: int = 10  # WMPC switching interval Tsw/Ts (MPC ticks held per RL action)
     mpc_horizon: int = 18  # training MPC horizon (< deploy's 25 for speed; policy is N-agnostic)
+    crash_penalty: float = 200.0  # reward subtracted on a crash (raise to punish crashing harder)
     anneal_lr: bool = True
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -257,10 +268,14 @@ def progress_bar(done: int, total: int, elapsed: float, width: int = 24) -> str:
 # its args must be picklable — we pass plain values and build the env inside the worker.
 
 
-def _env_worker(remote: Any, config_name: str, seed: int, switch_ticks: int, horizon: int) -> None:
+def _env_worker(
+    remote: Any, config_name: str, seed: int, switch_ticks: int, horizon: int, crash_penalty: float
+) -> None:
     """Worker process: own one MPCCWeightEnv, step it on command, auto-reset on episode end."""
     MPCCController.N_HORIZON = horizon  # fresh process → apply the (lower) training horizon
-    env = MPCCWeightEnv(config_name, render=False, seed=seed, switch_ticks=switch_ticks)
+    env = MPCCWeightEnv(
+        config_name, render=False, seed=seed, switch_ticks=switch_ticks, crash_penalty=crash_penalty
+    )
     obs, _ = env.reset(seed=seed)
     step_seed = seed
     remote.send(obs)  # hand the initial observation back to the parent
@@ -289,7 +304,15 @@ class SubprocVecEnv:
     compile the acados code once; the rest then start against a warm code cache (no build race).
     """
 
-    def __init__(self, n: int, config_name: str, base_seed: int, switch_ticks: int, horizon: int):
+    def __init__(
+        self,
+        n: int,
+        config_name: str,
+        base_seed: int,
+        switch_ticks: int,
+        horizon: int,
+        crash_penalty: float,
+    ):
         """Spawn ``n`` env worker processes and collect their initial observations."""
         ctx = mp.get_context("spawn")
         pipes = [ctx.Pipe() for _ in range(n)]
@@ -298,7 +321,14 @@ class SubprocVecEnv:
         self.procs = [
             ctx.Process(
                 target=_env_worker,
-                args=(work_remotes[i], config_name, base_seed + i, switch_ticks, horizon),
+                args=(
+                    work_remotes[i],
+                    config_name,
+                    base_seed + i,
+                    switch_ticks,
+                    horizon,
+                    crash_penalty,
+                ),
                 daemon=True,
             )
             for i in range(n)
@@ -345,14 +375,24 @@ def train_ppo(args: Args, device: torch.device) -> None:
     print("[train] spawning parallel MPCC-in-the-loop env processes (acados solver per env) ...")
 
     # Hebel 1: one process per env so the serial acados solves run concurrently across cores.
-    envs = SubprocVecEnv(args.num_envs, args.config, args.seed, args.switch_ticks, args.mpc_horizon)
+    envs = SubprocVecEnv(
+        args.num_envs,
+        args.config,
+        args.seed,
+        args.switch_ticks,
+        args.mpc_horizon,
+        args.crash_penalty,
+    )
     next_obs = torch.tensor(envs.init_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs, device=device)
 
     agent = WeightPolicyNet().to(device)
     if args.resume and CKPT_PATH.exists():
-        agent.load_state_dict(torch.load(CKPT_PATH, map_location=device))
-        print(f"[train] resuming from checkpoint {CKPT_PATH}")
+        try:
+            agent.load_state_dict(torch.load(CKPT_PATH, map_location=device))
+            print(f"[train] resuming from checkpoint {CKPT_PATH}")
+        except RuntimeError as exc:  # e.g. the feature/action layout changed since this ckpt
+            print(f"[train] checkpoint {CKPT_PATH} incompatible ({exc}); starting fresh")
     elif args.resume:
         print(f"[train] --resume set but no checkpoint at {CKPT_PATH}; starting fresh")
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -470,7 +510,7 @@ def train_ppo(args: Args, device: torch.device) -> None:
     print(f"[train] saved checkpoint to {CKPT_PATH}")
 
 
-def evaluate(args: Args, n_eval: int, render: bool = True) -> None:
+def evaluate(args: Args, n_eval: int, render: bool = False) -> None:
     """Run the trained (or identity) weight policy deterministically for ``n_eval`` episodes."""
     device = torch.device("cpu")
     agent = WeightPolicyNet().to(device)
@@ -485,7 +525,11 @@ def evaluate(args: Args, n_eval: int, render: bool = True) -> None:
     # horizon-agnostic, so this still reflects how it behaves at the deploy horizon.
     MPCCController.N_HORIZON = args.mpc_horizon
     env = MPCCWeightEnv(
-        args.config, render=render, seed=args.seed + 999, switch_ticks=args.switch_ticks
+        args.config,
+        render=render,
+        seed=args.seed + 999,
+        switch_ticks=args.switch_ticks,
+        crash_penalty=args.crash_penalty,
     )
     for ep in range(n_eval):
         obs, _ = env.reset(seed=args.seed + 1000 + ep)
@@ -617,7 +661,11 @@ def compare_policies(args: Args, n_episodes: int, render: bool = False) -> None:
     # Eval in-process at the training horizon (the policy is N-agnostic); reuse one solver.
     MPCCController.N_HORIZON = args.mpc_horizon
     env = MPCCWeightEnv(
-        args.config, render=render, seed=args.seed + 4242, switch_ticks=args.switch_ticks
+        args.config,
+        render=render,
+        seed=args.seed + 4242,
+        switch_ticks=args.switch_ticks,
+        crash_penalty=args.crash_penalty,
     )
 
     def rl_action(obs: np.ndarray) -> np.ndarray:

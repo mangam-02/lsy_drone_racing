@@ -817,7 +817,7 @@ class MPCCController(Controller):
     #: RL weight planner (third layer): adapt the MPCC cost weights per tick from the drone
     #: state via a trained policy (mpcc_weight_policy). Off by default → exact baseline weights.
     #: When on, a missing checkpoint falls back to an identity policy (still the baseline).
-    USE_RL_WEIGHTS = False
+    USE_RL_WEIGHTS = True
     #: Checkpoint for the weight policy (produced by train_mpcc_weights.py).
     RL_WEIGHT_CKPT = "lsy_drone_racing/control/mpcc_weights.ckpt"
 
@@ -877,6 +877,7 @@ class MPCCController(Controller):
         self._weight_policy = WeightPolicy(self.RL_WEIGHT_CKPT) if self.USE_RL_WEIGHTS else None
         self._external_mult = None  # set by the trainer to override the internal policy
         self._last_features = None  # last weight-feature vector (logging / inspection)
+        self._last_mult = None  # last weight multipliers actually applied (None ⇒ baseline/RL off)
         self.last_solve_ok = False  # whether the most recent solve succeeded (training reward)
 
         # Per-episode state (planner, embedded path, warm start). Factored out so the trainer
@@ -1141,6 +1142,7 @@ class MPCCController(Controller):
             else:
                 self._last_features = wp.build_features(obs, self.planner, self._theta_est)
                 mult = self._weight_policy.multipliers(self._last_features)
+            self._last_mult = mult  # remember the applied multipliers (render overlay / logging)
             w_stage, w_term = wp.weight_diagonals(
                 mult, BASELINE_WEIGHTS, self._n_caps, self.CAPSULE_PENALTY
             )
@@ -1271,6 +1273,47 @@ class MPCCController(Controller):
         if traj is not None:
             step = max(1, len(traj) // 200)
             draw_line(sim, traj[::step], rgba=np.array([0.0, 1.0, 0.0, 1.0]))
+
+        # Live MPCC cost weights, top-right text box. Without RL these stay at the baseline every
+        # tick; with RL they change as the policy rescales them.
+        self._draw_weight_overlay(sim)
+
+    def _current_weights(self) -> list[tuple[str, float]]:
+        """Current MPCC cost scalars = baseline × the last applied multipliers (1 ⇒ baseline)."""
+        mult = self._last_mult if self._last_mult is not None else np.ones(wp.N_ACTIONS)
+        m = dict(zip(wp.WEIGHT_GROUPS, np.asarray(mult, dtype=float)))
+        b = BASELINE_WEIGHTS
+        return [
+            ("q_c", b["q_c"] * m["q_c"]),
+            ("q_l", b["q_l"] * m["q_l"]),
+            ("q_att", b["q_att"] * m["q_track"]),
+            ("q_dr", b["q_dr"] * m["q_track"]),
+            ("q_v", b["q_v"] * m["q_v"]),
+            ("r_rpy", b["r_rpy"] * m["r_ctrl"]),
+            ("r_T", b["r_T"] * m["r_thrust"]),
+            ("r_at", b["r_at"] * m["r_ctrl"]),
+        ]
+
+    def _draw_weight_overlay(self, sim: object) -> None:
+        """Draw the current cost weights as a 2D text box in the viewer's top-right corner.
+
+        Uses the MuJoCo viewer's ``add_overlay`` (the same per-frame contract as the markers:
+        it must be re-added before every ``render``). No-ops cleanly when there is no on-screen
+        viewer (e.g. headless / rgb_array without an overlay-capable viewer).
+        """
+        viewer = getattr(getattr(sim, "viewer", None), "viewer", None)
+        if viewer is None or not hasattr(viewer, "add_overlay"):
+            return
+        try:
+            import mujoco
+
+            pos = mujoco.mjtGridPos.mjGRID_TOPRIGHT
+            header = "RL weights ON" if self.USE_RL_WEIGHTS else "baseline (RL off)"
+            viewer.add_overlay(pos, "MPCC cost weights", header)
+            for name, val in self._current_weights():
+                viewer.add_overlay(pos, name, f"{val:.2f}")
+        except Exception as exc:  # never let an overlay quirk break the sim
+            print(f"[MPCC] weight overlay skipped: {exc!r}")
 
     @staticmethod
     def _draw_square(
