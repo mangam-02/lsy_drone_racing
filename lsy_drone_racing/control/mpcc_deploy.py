@@ -39,10 +39,30 @@ from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control import mpcc_weight_policy as wp
 from lsy_drone_racing.control.mpc_planner_controller import _Cylinder, _GateFrame
+from lsy_drone_racing.control.mpcc_weight_policy import WeightPolicy
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+
+# ── MPCC cost weights (the controller's single source of truth) ─────────────────────────────
+#: Baseline diagonal cost weights of the MPCC NONLINEAR_LS cost. These ARE the controller's
+#: weights: the solver is built from them, and with the RL weight planner OFF
+#: (``MPCCController.USE_RL_WEIGHTS = False``) they are used verbatim — exactly the no-RL
+#: behaviour. With the RL ON, the policy only *scales* these (mpcc_weight_policy.weight_diagonals),
+#: so editing them here is the one place that changes the controller's weighting either way.
+BASELINE_WEIGHTS = {
+    "q_c": 50.0,  # contouring (perpendicular path error)
+    "q_l": 150.0,  # lag (longitudinal path error) — keeps theta glued to the drone
+    "q_att": 1.0,  # attitude (rpy) state tracking
+    "q_dr": 5.0,  # body-rate (drpy) state tracking
+    "q_v": 5.0,  # progress-speed (cruise) reward
+    "r_rpy": 1.0,  # rpy-command effort
+    "r_T": 50.0,  # collective-thrust effort
+    "r_at": 0.5,  # progress-acceleration effort
+}
 
 
 # ── Augmented model: physical drone + progress double-integrator ────────────────
@@ -234,14 +254,16 @@ def create_mpcc_ocp_solver(
     # penalty q_v is kept light so it sets a cruise speed without overpowering the lag — lag
     # must dominate progress (≈30:1), or theta marches at the target speed regardless of the
     # drone and the reference leads it off the line.
-    q_c, q_l, q_att, q_dr, q_v = 50.0, 150.0, 1.0, 5.0, 5.0
-    r_rpy, r_T, r_at = 1.0, 50.0, 0.5
-    # Diagonal weights; the n_caps capsule-barrier residuals are weighted capsule_penalty each
-    # (appended last to match the y / y_e ordering above).
-    w_term = [q_c, q_c, q_c, q_l, q_att, q_att, q_att, q_dr, q_dr, q_dr, q_v]
-    w_stage = w_term + [r_rpy, r_rpy, r_rpy, r_T, r_at]
-    W = np.diag(w_stage + [capsule_penalty] * n_caps)
-    W_e = np.diag(w_term + [capsule_penalty] * n_caps)
+    # Baseline cost weights are the controller's own BASELINE_WEIGHTS; weight_diagonals just lays
+    # them out (multipliers=1 → exactly these weights). The controller rebuilds W per tick with
+    # the policy's multipliers via the same helper, so the built and the runtime weights can never
+    # diverge. The n_caps capsule-barrier residuals are weighted capsule_penalty each (appended
+    # last to match the y / y_e ordering above).
+    w_stage, w_term = wp.weight_diagonals(
+        np.ones(wp.N_ACTIONS), BASELINE_WEIGHTS, n_caps, capsule_penalty
+    )
+    W = np.diag(w_stage)
+    W_e = np.diag(w_term)
     ocp.cost.W = W
     ocp.cost.W_e = W_e
     ocp.cost.yref = np.zeros(y.rows())
@@ -321,6 +343,9 @@ def create_mpcc_ocp_solver(
             "capsule_penalty": capsule_penalty,
             "time_steps": None if time_steps is None else np.asarray(time_steps, float),
             "parameters": parameters,
+            # Baseline weights are a module constant, not in this function's source, so the source
+            # hash would miss a baseline edit; include them here to keep the cache honest.
+            "weight_baseline": BASELINE_WEIGHTS,
         }
     )
     lib_exists = bool(glob.glob(os.path.join(gen_dir, "libacados_ocp_solver_mpcc_planner.*")))
@@ -789,6 +814,21 @@ class MPCCController(Controller):
     #: ticks, to find what eats the 20 ms control budget. Off by default.
     PROFILE = False
 
+    #: RL weight planner (third layer): adapt the MPCC cost weights per tick from the drone
+    #: state via a trained policy (mpcc_weight_policy). Off by default → exact baseline weights.
+    #: When on, a missing checkpoint falls back to an identity policy (still the baseline).
+    USE_RL_WEIGHTS = False
+    #: Checkpoint for the weight policy (produced by train_mpcc_weights.py).
+    RL_WEIGHT_CKPT = "lsy_drone_racing/control/mpcc_weights.ckpt"
+
+    #: MPC prediction-horizon length (number of shooting nodes). THIS is the one knob for the
+    #: horizon: deployment uses 25. Training (train_mpcc_weights.py --mpc_horizon) temporarily
+    #: lowers it for speed by overriding this class attribute in its worker processes — it does
+    #: NOT edit this value, so deployment keeps 25. The weight policy is horizon-agnostic (its
+    #: features/actions don't depend on N), so a policy trained at a lower N deploys fine at 25.
+    #: >>> To change the deployment horizon, edit THIS number. <<<
+    N_HORIZON = 25
+
     #: Arc-length sampling step (m) for the internal cubic spline that feeds the embedded
     #: path coefficients to acados. Finer = closer to the planner B-spline; 5 cm is ample.
     _CUBIC_DS = 0.05
@@ -797,7 +837,7 @@ class MPCCController(Controller):
         """Build the MPCC solver and the initial path."""
         super().__init__(obs, info, config)
         self._config = config
-        self._N = 25
+        self._N = self.N_HORIZON
         self._dt = 1 / config.env.freq
         # Non-uniform shooting grid: first interval = the real control period dt, each later
         # interval grown by HORIZON_GROWTH, so the same N nodes reach much further ahead.
@@ -827,17 +867,36 @@ class MPCCController(Controller):
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
 
+        # Background replanning (never stalls the 50 Hz loop).
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._hover_cmd = np.array([0.0, 0.0, 0.0, self._hover_thrust])
+        self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
+
+        # RL weight planner (third layer). The deployment policy runs internally; the trainer
+        # injects multipliers via set_external_multipliers (then _weight_policy is unused).
+        self._weight_policy = WeightPolicy(self.RL_WEIGHT_CKPT) if self.USE_RL_WEIGHTS else None
+        self._external_mult = None  # set by the trainer to override the internal policy
+        self._last_features = None  # last weight-feature vector (logging / inspection)
+        self.last_solve_ok = False  # whether the most recent solve succeeded (training reward)
+
+        # Per-episode state (planner, embedded path, warm start). Factored out so the trainer
+        # can reuse the (expensive) acados solver across episodes / randomized tracks.
+        self.reset_for_new_episode(obs)
+
+    def reset_for_new_episode(self, obs: dict) -> None:
+        """Rebuild the planner/embedded path and clear all warm-start state for a fresh episode.
+
+        Reuses the already-built acados solver (only the path + warm start are episode-specific),
+        so the training loop can run many episodes without paying the solver-build cost again.
+        """
         # Path planner (warm-started B-spline planner; we use its geometric-path API).
-        self.planner = SimplePlanner(obs, config, N=self._N)
+        self.planner = SimplePlanner(obs, self._config, N=self._N)
         # Internal arc-length cubic spline of the planner path; supplies the local cubic
         # coefficients the model needs to evaluate p_d(theta) symbolically. Rebuilt on replan.
         self._cubic = None
         self._cubic_smax = 0.0
         self._build_cubic()
         self._snapshot_objects(obs)
-
-        # Background replanning (never stalls the 50 Hz loop).
-        self._executor = ThreadPoolExecutor(max_workers=1)
         self._replan_future = None
 
         self._theta_pred = None  # last solve's per-stage theta (warm start for relinearisation)
@@ -845,13 +904,16 @@ class MPCCController(Controller):
         self._x_pred = None  # last solve's full state trajectory (N+1, nx) — primal warm start
         self._u_pred = None  # last solve's full input trajectory (N, nu)   — primal warm start
         self._last_u = None
-        self._hover_cmd = np.array([0.0, 0.0, 0.0, self._hover_thrust])
         self._consec_fail = 0
         self._finished = False
         self._last_obs = obs
         self._theta_est = None  # last tick's progress θ; constrains the projection (no jumps)
         self._progress_point = None  # drone's current projection on the path (render marker)
-        self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
+        self._external_mult = None
+
+    def set_external_multipliers(self, mult: np.ndarray | None) -> None:
+        """Inject weight multipliers from an outside policy (training); None → internal policy."""
+        self._external_mult = None if mult is None else np.asarray(mult, dtype=float)
 
     # ── Re-planning (background) ──────────────────────────────────────────────
 
@@ -1068,6 +1130,24 @@ class MPCCController(Controller):
             head = np.concatenate(([theta_i], cx, cy, cz, [v_target]))
             p_k = head if caps is None else np.concatenate((head, caps))
             self._solver.set(k, "p", p_k)
+
+        # RL weight planner: adapt the MPCC cost weights for this tick. Multipliers come from the
+        # trainer (external override) or the internal policy; weight_diagonals rebuilds the same
+        # W layout the solver was built with, so multipliers=1 is an exact no-op. acados updates
+        # W in place (no rebuild). Skipped entirely when USE_RL_WEIGHTS is off.
+        if self.USE_RL_WEIGHTS:
+            if self._external_mult is not None:
+                mult = self._external_mult
+            else:
+                self._last_features = wp.build_features(obs, self.planner, self._theta_est)
+                mult = self._weight_policy.multipliers(self._last_features)
+            w_stage, w_term = wp.weight_diagonals(
+                mult, BASELINE_WEIGHTS, self._n_caps, self.CAPSULE_PENALTY
+            )
+            W_stage, W_term = np.diag(w_stage), np.diag(w_term)
+            for k in range(self._N):
+                self._solver.cost_set(k, "W", W_stage)
+            self._solver.cost_set(self._N, "W", W_term)
         t_setp = time.perf_counter()
 
         # SQP_RTI solve: phase 1 prepares (linearise + condense the QP at the warm-started
@@ -1083,6 +1163,7 @@ class MPCCController(Controller):
             status = self._solver.solve()
         if self.PROFILE:
             self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
+        self.last_solve_ok = status == 0
         if status == 0:
             xs = np.array([self._solver.get(k, "x") for k in range(self._N + 1)])
             us = np.array([self._solver.get(k, "u") for k in range(self._N)])
