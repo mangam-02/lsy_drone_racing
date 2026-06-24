@@ -31,10 +31,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
-import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
-from torch.distributions.normal import Normal
+
+try:  # torch is only needed for the RL weight policy (the optional 'rl' extra). The rest of this
+    import torch  # module (features, weight scaling, constants) is torch-free, so the MPCC
+    import torch.nn as nn  # controller can be deployed in a clean env that has no torch installed.
+    from torch.distributions.normal import Normal
+
+    _HAS_TORCH = True
+except ImportError:  # pragma: no cover - only hit in torch-free deploy envs
+    _HAS_TORCH = False
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -256,53 +262,54 @@ def build_features(obs: dict, planner: object, theta_prev: float | None) -> np.n
 # ── Policy network (PPO actor-critic; shared by training and deployment) ────────────
 
 
-def _layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0) -> nn.Linear:
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias)
-    return layer
+if _HAS_TORCH:
 
+    def _layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0) -> nn.Linear:
+        torch.nn.init.orthogonal_(layer.weight, std)
+        torch.nn.init.constant_(layer.bias, bias)
+        return layer
 
-class WeightPolicyNet(nn.Module):
-    """Small Gaussian-policy actor-critic over weight features.
+    class WeightPolicyNet(nn.Module):
+        """Small Gaussian-policy actor-critic over weight features.
 
-    The actor outputs *raw* actions (no squashing here); squashing/bounding to multipliers is
-    done by :func:`multipliers_from_action`, so the same net serves training (sample) and
-    deployment (mean). ``actor_logstd`` starts low so the initial policy stays near identity.
-    """
+        The actor outputs *raw* actions (no squashing here); squashing/bounding to multipliers is
+        done by :func:`multipliers_from_action`, so the same net serves training (sample) and
+        deployment (mean). ``actor_logstd`` starts low so the initial policy stays near identity.
+        """
 
-    def __init__(self, n_obs: int = N_FEATURES, n_act: int = N_ACTIONS, hidden: int = 128):
-        """Build the actor-critic MLP over ``n_obs`` features and ``n_act`` weight knobs."""
-        super().__init__()
-        self.critic = nn.Sequential(
-            _layer_init(nn.Linear(n_obs, hidden)),
-            nn.Tanh(),
-            _layer_init(nn.Linear(hidden, hidden)),
-            nn.Tanh(),
-            _layer_init(nn.Linear(hidden, 1), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            _layer_init(nn.Linear(n_obs, hidden)),
-            nn.Tanh(),
-            _layer_init(nn.Linear(hidden, hidden)),
-            nn.Tanh(),
-            _layer_init(nn.Linear(hidden, n_act), std=0.01),
-        )
-        self.actor_logstd = nn.Parameter(torch.full((1, n_act), -1.0))
+        def __init__(self, n_obs: int = N_FEATURES, n_act: int = N_ACTIONS, hidden: int = 128):
+            """Build the actor-critic MLP over ``n_obs`` features and ``n_act`` weight knobs."""
+            super().__init__()
+            self.critic = nn.Sequential(
+                _layer_init(nn.Linear(n_obs, hidden)),
+                nn.Tanh(),
+                _layer_init(nn.Linear(hidden, hidden)),
+                nn.Tanh(),
+                _layer_init(nn.Linear(hidden, 1), std=1.0),
+            )
+            self.actor_mean = nn.Sequential(
+                _layer_init(nn.Linear(n_obs, hidden)),
+                nn.Tanh(),
+                _layer_init(nn.Linear(hidden, hidden)),
+                nn.Tanh(),
+                _layer_init(nn.Linear(hidden, n_act), std=0.01),
+            )
+            self.actor_logstd = nn.Parameter(torch.full((1, n_act), -1.0))
 
-    def get_value(self, x: Tensor) -> Tensor:
-        """Critic value estimate for the feature batch ``x``."""
-        return self.critic(x)
+        def get_value(self, x: Tensor) -> Tensor:
+            """Critic value estimate for the feature batch ``x``."""
+            return self.critic(x)
 
-    def get_action_and_value(
-        self, x: Tensor, action: Tensor | None = None, deterministic: bool = False
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Return (action, log-prob, entropy, value); sample unless ``deterministic``."""
-        mean = self.actor_mean(x)
-        std = torch.exp(self.actor_logstd.expand_as(mean))
-        dist = Normal(mean, std)
-        if action is None:
-            action = mean if deterministic else dist.sample()
-        return action, dist.log_prob(action).sum(1), dist.entropy().sum(1), self.critic(x)
+        def get_action_and_value(
+            self, x: Tensor, action: Tensor | None = None, deterministic: bool = False
+        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            """Return (action, log-prob, entropy, value); sample unless ``deterministic``."""
+            mean = self.actor_mean(x)
+            std = torch.exp(self.actor_logstd.expand_as(mean))
+            dist = Normal(mean, std)
+            if action is None:
+                action = mean if deterministic else dist.sample()
+            return action, dist.log_prob(action).sum(1), dist.entropy().sum(1), self.critic(x)
 
 
 class WeightPolicy:
@@ -315,6 +322,11 @@ class WeightPolicy:
 
     def __init__(self, ckpt_path: str | None = None, device: str = "cpu"):
         """Load the policy from ``ckpt_path``; stay an identity policy if it is None/missing."""
+        if not _HAS_TORCH:
+            raise ImportError(
+                "WeightPolicy needs PyTorch (the optional 'rl' extra). Install it with "
+                "`pip install -e '.[rl]'`, or keep USE_RL_WEIGHTS off to run without torch."
+            )
         self.device = torch.device(device)
         self.net: WeightPolicyNet | None = None
         if ckpt_path is not None:
