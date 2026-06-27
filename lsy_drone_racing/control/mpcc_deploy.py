@@ -414,10 +414,19 @@ class SimplePlanner:
     _WP_LO = np.array([-2.4, -1.4, 0.1])
     _WP_HI = np.array([2.4, 1.4, 1.45])
 
-    def __init__(self, obs: dict, config: object, N: int = 25) -> None:
-        """Build the initial full-track path from the current observation."""
+    def __init__(
+        self, obs: dict, config: object, N: int = 25, target_speed: float | None = None
+    ) -> None:
+        """Build the initial full-track path from the current observation.
+
+        ``target_speed`` overrides the class default cruise speed on this instance, so the
+        controller can keep its ``V_TARGET`` as the single source of truth and the planner's
+        speed profile can never silently diverge from the MPCC progress target.
+        """
         self.freq = config.env.freq
         self.N = N
+        if target_speed is not None:
+            self.TARGET_SPEED = float(target_speed)
         self._start_pos = obs["pos"].copy()  # fixed full-trajectory anchor (theta = 0)
         self._prev_visited = obs["gates_visited"].copy()
         self._prev_obs_visited = obs["obstacles_visited"].copy()
@@ -780,6 +789,20 @@ class MPCCController(Controller):
     #: to 0, so contouring+lag pull the drone onto the final path point and v_theta decays to
     #: 0 — the drone station-keeps on the last trajectory point instead of overrunning it.
     END_HOVER_TOL = 0.1
+    #: Caution mode: fly slower while a nearby gate/obstacle pose is still UNCERTAIN — i.e. the
+    #: object is not yet "visited"/measured, so the observation only holds its rough nominal
+    #: pose. This matters most for the gate currently being approached: until the drone is close
+    #: enough to measure it, the planned path through it may be off, so the controller creeps in
+    #: and only resumes cruise once the true pose is known (which also triggers a replan onto the
+    #: corrected path). Implemented by scaling the progress target v_target toward
+    #: CAUTION_SPEED_FACTOR as the drone closes within CAUTION_RADIUS of such an object.
+    USE_CAUTION = True
+    CAUTION_SPEED_FACTOR = 0.45  # fraction of V_TARGET when right at an unmeasured object
+    #: xy-distance (m) within which an unmeasured object starts slowing us. MUST be larger than
+    #: the env's sensor_range (the xy-distance at which the exact pose is revealed and the object
+    #: becomes "visited" — 0.7 m in the level configs), otherwise the pose snaps to exact before
+    #: caution ever engages and this has no effect.
+    CAUTION_RADIUS = 1.2  # m
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
     #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
@@ -817,7 +840,7 @@ class MPCCController(Controller):
     #: RL weight planner (third layer): adapt the MPCC cost weights per tick from the drone
     #: state via a trained policy (mpcc_weight_policy). Off by default → exact baseline weights.
     #: When on, a missing checkpoint falls back to an identity policy (still the baseline).
-    USE_RL_WEIGHTS = True
+    USE_RL_WEIGHTS = False
     #: Checkpoint for the weight policy (produced by train_mpcc_weights.py).
     RL_WEIGHT_CKPT = "lsy_drone_racing/control/mpcc_weights.ckpt"
 
@@ -890,8 +913,9 @@ class MPCCController(Controller):
         Reuses the already-built acados solver (only the path + warm start are episode-specific),
         so the training loop can run many episodes without paying the solver-build cost again.
         """
-        # Path planner (warm-started B-spline planner; we use its geometric-path API).
-        self.planner = SimplePlanner(obs, self._config, N=self._N)
+        # Path planner (warm-started B-spline planner; we use its geometric-path API). Its cruise
+        # speed is pinned to V_TARGET so planner profile and MPCC progress target stay in sync.
+        self.planner = SimplePlanner(obs, self._config, N=self._N, target_speed=self.V_TARGET)
         # Internal arc-length cubic spline of the planner path; supplies the local cubic
         # coefficients the model needs to evaluate p_d(theta) symbolically. Rebuilt on replan.
         self._cubic = None
@@ -1070,6 +1094,36 @@ class MPCCController(Controller):
             self._solver.set(k, "u", ug[min(k + 1, self._N - 1)])
         self._solver.set(self._N, "x", xg[self._N])
 
+    def _caution_factor(self, obs: dict) -> float:
+        """Speed scale in [CAUTION_SPEED_FACTOR, 1] based on nearby UNMEASURED objects.
+
+        An object whose pose is still uncertain (not yet ``*_visited``) and that lies within
+        ``CAUTION_RADIUS`` of the drone pulls the factor down — fully to ``CAUTION_SPEED_FACTOR``
+        when the drone is right on top of it, linearly back to 1 at the radius. The gate
+        currently being approached counts as well as any unmeasured obstacle, so the drone slows
+        into objects whose true position it doesn't know yet and resumes cruise once they are
+        measured. Returns 1 (no slowdown) when caution is off or everything nearby is measured.
+        """
+        if not self.USE_CAUTION:
+            return 1.0
+        pos = obs["pos"]
+        uncertain = []
+        tg = int(obs["target_gate"])
+        if tg >= 0 and not bool(obs["gates_visited"][tg]):  # the gate we're flying at
+            uncertain.append(obs["gates_pos"][tg])
+        for i, op in enumerate(obs["obstacles_pos"]):
+            if not bool(obs["obstacles_visited"][i]):
+                uncertain.append(op)
+        if not uncertain:
+            return 1.0
+        # Measure distance in the xy-plane only, matching how the env decides "visited"
+        # (race_core: ||drone_xy - object_xy|| < sensor_range). So CAUTION_RADIUS is directly
+        # comparable to sensor_range and MUST exceed it, or the pose snaps to exact before the
+        # slowdown ever engages.
+        dmin = min(float(np.linalg.norm(np.asarray(u)[:2] - pos[:2])) for u in uncertain)
+        frac = np.clip(dmin / self.CAUTION_RADIUS, 0.0, 1.0)  # 0 at the object, 1 at the radius
+        return float(self.CAUTION_SPEED_FACTOR + (1.0 - self.CAUTION_SPEED_FACTOR) * frac)
+
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
@@ -1121,7 +1175,7 @@ class MPCCController(Controller):
         # the progress reward drives v_theta -> 0, so it station-keeps on the last trajectory
         # point instead of overrunning the path end.
         finishing = theta0 >= self.planner.length - self.END_HOVER_TOL
-        v_target = 0.0 if finishing else self.V_TARGET
+        v_target = 0.0 if finishing else self.V_TARGET * self._caution_factor(obs)
         thetas = (
             np.full(self._N + 1, self.planner.length) if finishing else self._stage_thetas(theta0)
         )
