@@ -392,6 +392,12 @@ class SimplePlanner:
     DECEL_DIST = 0.8  # m — ramp-down arc length
     APPROACH_DIST = 0.35  # m — before-gate waypoint offset along the gate normal
     DEPART_DIST = 0.45  # m — after-gate waypoint offset along the gate normal
+    #: Upward bias (m) applied to the gate entry/center/exit waypoints. The drone tends to track
+    #: the reference slightly LOW through a gate (it pitches/rolls to follow the path, trading
+    #: vertical thrust, so it sags a few cm below the planned height). Aiming the gate waypoints
+    #: a touch high cancels that steady offset so it crosses nearer the gate centre. Tune up if
+    #: it still passes low, down toward 0 if it now passes high.
+    GATE_Z_BIAS = 0.04
     DRONE_RADIUS = 0.09  # m — drone half-extent (gate inflation & obstacle clearance)
     FRAME_MARGIN = 0.08  # m — extra gate-frame inflation
     OBSTACLE_RADIUS = 0.015  # m — physical pole radius
@@ -461,6 +467,7 @@ class SimplePlanner:
         self.pos = result["pos"]
         self.vel = result["vel"]
         self.tick_max = result["tick_max"]
+        self.gate_thetas = result.get("gate_thetas")  # arc length of each gate centre (or None)
         self._raw_waypoints = result["raw_waypoints"]
         if result.get("intermediates") is not None:  # remember as warm start for next replan
             self._warm_intermediates = result["intermediates"]
@@ -512,7 +519,28 @@ class SimplePlanner:
         result["raw_waypoints"] = raw
         result["intermediates"] = intermediates  # kept as the warm start for the next replan
         result["target_gate"] = target_gate
+        # Arc length θ of each gate centre on this path, so the controller can stop progress at
+        # the gate it's flying at until the env confirms the pass (gate-progress barrier).
+        centers = np.array([gd[0] for gd in gate_data])
+        result["gate_thetas"] = self._project_centers_to_arclength(result, centers)
         return result
+
+    def _project_centers_to_arclength(self, result: dict, centers: np.ndarray) -> np.ndarray:
+        """Arc length θ of each gate centre on the installed path, in track order (monotonic).
+
+        Each centre maps to the nearest sample of the dense path; the search start only moves
+        forward gate by gate, so the mapping is monotonic and a self-crossing path can't snap an
+        earlier gate onto a later branch.
+        """
+        P = np.stack(splev(result["u_lut"], result["tck"]), axis=-1)
+        s_lut = result["s_lut"]
+        thetas = np.empty(len(centers))
+        lo = 0
+        for i, c in enumerate(centers):
+            j = lo + int(np.argmin(np.linalg.norm(P[lo:] - c, axis=1)))
+            thetas[i] = s_lut[j]
+            lo = j
+        return thetas
 
     def _warm_start(self, gate_data: list[tuple]) -> np.ndarray | None:
         """Return the previous optimiser solution as the warm start, else ``None``.
@@ -537,14 +565,16 @@ class SimplePlanner:
         always the complete track (the segment behind the drone is kept on a replan).
         """
         gates_pos, gates_quat = obs["gates_pos"], obs["gates_quat"]
+        bias = np.array([0.0, 0.0, self.GATE_Z_BIAS])  # aim a touch high to cancel the sag
         data, prev = [], self._start_pos.copy()
         for i in range(len(gates_pos)):
             x_axis = R.from_quat(gates_quat[i]).apply([1.0, 0.0, 0.0])
             if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
                 x_axis = -x_axis
-            entry = gates_pos[i] - x_axis * self.APPROACH_DIST
-            exit_ = gates_pos[i] + x_axis * self.DEPART_DIST
-            data.append((gates_pos[i].copy(), x_axis.copy(), entry, exit_))
+            center = gates_pos[i] + bias
+            entry = center - x_axis * self.APPROACH_DIST
+            exit_ = center + x_axis * self.DEPART_DIST
+            data.append((center, x_axis.copy(), entry, exit_))
             prev = exit_
         return data
 
@@ -803,6 +833,14 @@ class MPCCController(Controller):
     #: becomes "visited" — 0.7 m in the level configs), otherwise the pose snaps to exact before
     #: caution ever engages and this has no effect.
     CAUTION_RADIUS = 1.2  # m
+    #: Gate-progress barrier: tie the MPCC progress state θ to the env's authoritative gate-pass
+    #: detection. The env only increments target_gate once the drone has actually flown THROUGH
+    #: the current gate's opening; until then θ is not allowed past (gate centre + GATE_PASS_LEAD).
+    #: So if the drone is pushed off the line it keeps working through the current gate instead of
+    #: letting its progress run on to the next one (and skipping a gate it never passed). Off →
+    #: pure path progress with no gate gating.
+    USE_GATE_BARRIER = True
+    GATE_PASS_LEAD = 0.4  # m past the gate centre θ may reach before the env confirms the pass
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
     #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
@@ -1124,6 +1162,22 @@ class MPCCController(Controller):
         frac = np.clip(dmin / self.CAUTION_RADIUS, 0.0, 1.0)  # 0 at the object, 1 at the radius
         return float(self.CAUTION_SPEED_FACTOR + (1.0 - self.CAUTION_SPEED_FACTOR) * frac)
 
+    def _gate_progress_cap(self, obs: dict) -> float:
+        """Upper bound on progress θ imposed by the env's gate-pass state (gate barrier).
+
+        θ may not advance past ``gate_thetas[target_gate] + GATE_PASS_LEAD`` until the env
+        confirms the current gate was flown through (target_gate increments). Returns the full
+        path length (no cap) when the barrier is off, all gates are passed (target_gate == -1),
+        or the gate arc-lengths aren't available yet.
+        """
+        gt = getattr(self.planner, "gate_thetas", None)
+        if not self.USE_GATE_BARRIER or gt is None:
+            return self.planner.length
+        tg = int(obs["target_gate"])
+        if tg < 0 or tg >= len(gt):
+            return self.planner.length
+        return float(min(gt[tg] + self.GATE_PASS_LEAD, self.planner.length))
+
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
@@ -1174,11 +1228,23 @@ class MPCCController(Controller):
         # contouring+lag cost then pulls the drone onto the final path point p_d(length) and
         # the progress reward drives v_theta -> 0, so it station-keeps on the last trajectory
         # point instead of overrunning the path end.
+        # Gate barrier with a smooth approach brake. The per-stage θ anchors are clamped at the
+        # barrier so the horizon never references a gate we haven't passed, and v_target is ramped
+        # linearly to 0 over the last GATE_PASS_LEAD metres before it. The brake is what keeps the
+        # predicted progress from overshooting the clamped anchors: without it the path cubic gets
+        # evaluated far outside its segment and the terminal prediction (the blue marker) shoots
+        # off the trajectory. On a clean pass target_gate increments around the gate centre, so the
+        # barrier jumps ahead before the brake really bites and cruise speed is barely affected; it
+        # only slows things when a pass is actually failing. End-of-path hover always wins.
         finishing = theta0 >= self.planner.length - self.END_HOVER_TOL
-        v_target = 0.0 if finishing else self.V_TARGET * self._caution_factor(obs)
-        thetas = (
-            np.full(self._N + 1, self.planner.length) if finishing else self._stage_thetas(theta0)
-        )
+        theta_cap = self._gate_progress_cap(obs)
+        if finishing:
+            v_target = 0.0
+            thetas = np.full(self._N + 1, self.planner.length)
+        else:
+            brake = float(np.clip((theta_cap - theta0) / self.GATE_PASS_LEAD, 0.0, 1.0))
+            v_target = self.V_TARGET * self._caution_factor(obs) * brake
+            thetas = np.minimum(self._stage_thetas(theta0), theta_cap)
         caps = self._build_capsule_params(obs) if self._n_caps else None
         for k in range(self._N + 1):
             theta_i, cx, cy, cz = self._path_segment_coeffs(thetas[k])
