@@ -900,7 +900,7 @@ class MPCCController(Controller):
     #: throttles the drone on safe straights (the MPCC contouring would just average those out).
     #: Averaging kappa over a window the size of a REAL corner (~0.4 m) kills that high-frequency
     #: noise while keeping genuine turns. 0 disables smoothing. Raise if straights still crawl.
-    CURVE_SMOOTH_M = 0.4
+    CURVE_SMOOTH_M = 0.7
     #: Distance (m) from the path end within which the controller switches to end-hover:
     #: it freezes every stage's progress at theta=length and sets the target progress speed
     #: to 0, so contouring+lag pull the drone onto the final path point and v_theta decays to
