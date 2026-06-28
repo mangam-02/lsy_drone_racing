@@ -38,6 +38,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _setup_logging() -> None:
+    """Enable INFO logging. Called in __main__ AND in each worker process (which is spawned
+    fresh, so it has no handlers and would otherwise print nothing for its per-run lines)."""
+    logging.basicConfig()
+    logging.getLogger("lsy_drone_racing").setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
+
+
 def _classify_crash(prev_pos: np.ndarray, config) -> str:
     """Classify a terminated (non-success) episode from the last alive position."""
     try:
@@ -217,14 +225,17 @@ def _run_episode(env, controller_cls, config, n_gates: int, seed: int | None, ru
 def _run_chunk(config_name, controller_name, seed, n_runs, runs):
     """Worker entry point: build one env/controller and run the assigned run indices.
 
-    Returns ``[(run, result, log_line), ...]``. Builds its own env so each process is
+    Logs each run's outcome live (workers are spawned without logging configured, so this sets
+    it up first) and returns the per-episode result dicts. Builds its own env so each process is
     self-contained (no sharing of the JAX env / acados solver across processes).
     """
+    _setup_logging()
     env, controller_cls, config, n_gates = _build_env(config_name, controller_name, False, seed)
     out = []
     for run in runs:
         result, log_body = _run_episode(env, controller_cls, config, n_gates, seed, run)
-        out.append((run, result, f"run {run + 1}/{n_runs}: {log_body}"))
+        logger.info(f"run {run + 1}/{n_runs}: {log_body}")  # live, as each run finishes
+        out.append(result)
     env.close()
     return out
 
@@ -247,9 +258,7 @@ def _evaluate_parallel(config_name, controller_name, seed, n_runs, workers):
         ]
         try:
             for fut in as_completed(futs):
-                for _run, result, log in sorted(fut.result(), key=lambda r: r[0]):
-                    results.append(result)
-                    logger.info(log)
+                results.extend(fut.result())  # per-run lines were already logged live by workers
         except KeyboardInterrupt:
             logger.info(f"\nInterrupted — summarizing the {len(results)} completed run(s) so far.")
             ex.shutdown(wait=False, cancel_futures=True)
@@ -375,7 +384,5 @@ def _print_summary(s: dict, n_gates: int, n_runs: int):
 
 
 if __name__ == "__main__":
-    logging.basicConfig()
-    logging.getLogger("lsy_drone_racing").setLevel(logging.INFO)
-    logger.setLevel(logging.INFO)
+    _setup_logging()
     fire.Fire(evaluate, serialize=lambda _: None)

@@ -395,7 +395,7 @@ class SimplePlanner:
     ACCEL_DIST = 0.8  # m — ramp-up arc length
     DECEL_DIST = 0.8  # m — ramp-down arc length
     APPROACH_DIST = 0.35  # m — before-gate waypoint offset along the gate normal
-    DEPART_DIST = 0.45  # m — after-gate waypoint offset along the gate normal
+    DEPART_DIST = 0.4  # m — after-gate waypoint offset along the gate normal
     #: Upward bias (m) applied to the gate entry/center/exit waypoints. The drone tends to track
     #: the reference slightly LOW through a gate (it pitches/rolls to follow the path, trading
     #: vertical thrust, so it sags a few cm below the planned height). Aiming the gate waypoints
@@ -415,7 +415,7 @@ class SimplePlanner:
     OPT_MAXITER = 200  # max L-BFGS-B iterations
     MAX_OPT_TIME = 0.20  # s — wall-clock budget for the optimiser
     BSPLINE_DEGREE = 3  # cubic
-    SMOOTHING = 0.1  # splprep smoothing factor
+    SMOOTHING = 0.5  # splprep smoothing factor
     W_ANCHOR = 30.0  # fit weight: start waypoint
     W_GATE = 4.0  # fit weight: gate waypoints
     W_FREE = 1.0  # fit weight: free intermediates
@@ -872,7 +872,13 @@ class MPCCController(Controller):
     #: Per-node growth of the shooting interval (non-uniform time grid). The first interval
     #: is the real control period dt; each later one is this much longer, so the same N
     #: nodes look much further ahead for ~no extra compute. 1.0 → classic uniform dt grid.
-    #: e.g. N=25, dt=0.02, growth=1.06 → horizon ≈ 1.1 s instead of 0.5 s.
+    #: WARNING: leave at 1.0. >1.0 is currently broken — the receding-horizon warm start
+    #: (_shift_warm_start) and the per-stage theta anchors (_stage_thetas) shift by ONE NODE per
+    #: tick, which only equals one control period dt on a UNIFORM grid. With growth>1 the later
+    #: nodes are spaced wider than dt, so the shifted warm start lands time-misaligned; with the
+    #: single SQP_RTI iteration the solve then starts from a bad iterate and the trajectory
+    #: diverges (empirically ~40% out-of-bounds). Fixing it needs a time-aware re-interpolation
+    #: of the warm start onto the shifted grid — not just bumping this number.
     HORIZON_GROWTH = 1.0
 
     #: Add the obstacle/gate-frame avoidance soft-barrier (capsule cost) to the MPCC cost.
