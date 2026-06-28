@@ -816,8 +816,8 @@ class MPCCController(Controller):
     """MPCC controller: contouring control along the warm-started SimplePlanner path."""
 
     GROUND_Z = 0.0
-    V_TARGET = 3  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
-    VTHETA_MAX = 5  # m/s — hard-ish cap on progress speed
+    V_TARGET = 4  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
+    VTHETA_MAX = 6  # m/s — hard-ish cap on progress speed
     #: Curvature speed limit: cap the progress target by the path curvature so the drone slows
     #: through sharp turns (e.g. the ~180° reversal at a gate exit) and cruises on straights,
     #: instead of carrying full V_TARGET into a corner and overshooting into the frame. The cap is
@@ -827,7 +827,14 @@ class MPCCController(Controller):
     USE_CURVATURE_SPEED = True
     MAX_LAT_ACC = 20.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
     CURVE_MIN_SPEED = 0.8  # m/s — floor so a very tight turn never stalls progress
-    CURVE_LOOKAHEAD = 1.0  # m — arc length ahead scanned for the tightest upcoming curvature
+    CURVE_LOOKAHEAD = 1.5  # m — arc length ahead scanned for the tightest upcoming curvature
+    #: Arc-length window (m) over which the path curvature is smoothed before forming v_cap. The
+    #: cubic is fit through SAMPLED path points, so tiny sampling wiggles on an essentially
+    #: straight stretch produce a large spurious |r''| → a phantom curvature that needlessly
+    #: throttles the drone on safe straights (the MPCC contouring would just average those out).
+    #: Averaging kappa over a window the size of a REAL corner (~0.4 m) kills that high-frequency
+    #: noise while keeping genuine turns. 0 disables smoothing. Raise if straights still crawl.
+    CURVE_SMOOTH_M = 0.4
     #: Distance (m) from the path end within which the controller switches to end-hover:
     #: it freezes every stage's progress at theta=length and sets the target progress speed
     #: to 0, so contouring+lag pull the drone onto the final path point and v_theta decays to
@@ -841,13 +848,13 @@ class MPCCController(Controller):
     #: corrected path). Implemented by scaling the progress target v_target toward
     #: CAUTION_SPEED_FACTOR as the drone closes within CAUTION_RADIUS of such an object.
     USE_CAUTION = True
-    CAUTION_SPEED_FACTOR = 0.35  # fraction of V_TARGET when right at an unmeasured object
+    CAUTION_SPEED_FACTOR = 0.5  # fraction of V_TARGET when right at an unmeasured object
     #: xy-distance (m) within which an unmeasured object starts slowing us. MUST be larger than
     #: the env's sensor_range (the xy-distance at which the exact pose is revealed and the object
     #: becomes "visited" — 0.7 m in the level configs), otherwise the pose snaps to exact before
     #: caution ever engages and this has no effect. Set a bit above sensor_range so the approach
     #: is already slow when the true pose is revealed and the replan onto it kicks in.
-    CAUTION_RADIUS = 1.4  # m
+    CAUTION_RADIUS = 1.3  # m
     #: Gate-progress barrier: tie the MPCC progress state θ to the env's authoritative gate-pass
     #: detection. The env only increments target_gate once the drone has actually flown THROUGH
     #: the current gate's opening; until then θ is not allowed past (gate centre + GATE_PASS_LEAD).
@@ -1075,6 +1082,16 @@ class MPCCController(Controller):
             self._vcap = None
             return
         kappa = np.linalg.norm(self._cubic(s, 2), axis=1)
+        # Smooth out sampling-induced curvature noise on straight stretches (see CURVE_SMOOTH_M):
+        # average kappa over a window the size of a real corner so phantom curvature on safe
+        # straights doesn't throttle the drone, while genuine turns survive.
+        ds = (s[-1] - s[0]) / max(len(s) - 1, 1)
+        win = int(round(self.CURVE_SMOOTH_M / ds)) if ds > 0 else 0
+        if win > 1:
+            kernel = np.ones(win) / win
+            kappa = np.convolve(np.pad(kappa, win // 2, mode="edge"), kernel, mode="valid")[
+                : len(s)
+            ]
         vcap = np.sqrt(self.MAX_LAT_ACC / np.maximum(kappa, 1e-6))
         self._curv_s = s
         self._vcap = np.clip(vcap, self.CURVE_MIN_SPEED, self.V_TARGET)

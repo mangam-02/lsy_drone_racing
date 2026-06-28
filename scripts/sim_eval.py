@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -125,12 +126,143 @@ def _diagnose_crash(prev_pos: np.ndarray, obs: dict) -> dict:
     return {"obj_type": typ, "obj_idx": int(idx), "clearance": _seg_clearance(prev_pos, a, b, r)}
 
 
+def _build_env(config_name: str, controller_name: str | None, render: bool, seed: int | None):
+    """Load config + controller and build the (JaxToNumpy-wrapped) env. Returns the pieces a
+    run loop needs: ``(env, controller_cls, config, n_gates)``."""
+    config = load_config(Path(__file__).parents[1] / "config" / config_name)
+    config.sim.render = render
+    if seed is not None:
+        config.env.seed = int(seed)
+    control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
+    controller_path = control_path / (controller_name or config.controller.file)
+    controller_cls = load_controller(controller_path)
+    env: DroneRaceEnv = gymnasium.make(
+        config.env.id,
+        freq=config.env.freq,
+        sim_config=config.sim,
+        sensor_range=config.env.sensor_range,
+        control_mode=config.env.control_mode,
+        track=config.env.track,
+        disturbances=config.env.get("disturbances"),
+        randomizations=config.env.get("randomizations"),
+        seed=config.env.seed,
+    )
+    return JaxToNumpy(env), controller_cls, config, len(config.env.track.gates)
+
+
+def _run_episode(env, controller_cls, config, n_gates: int, seed: int | None, run: int):
+    """Run a single episode; return ``(result_dict, log_body)``.
+
+    A fresh controller is built per run (no state carry-over between episodes). With a seed,
+    run ``r`` resets with ``seed + r`` so the batch is reproducible regardless of run order.
+    """
+    obs, info = env.reset() if seed is None else env.reset(seed=int(seed) + run)
+    controller: Controller = controller_cls(obs, info, config)
+    i = 0
+    prev_pos = np.asarray(obs["pos"], dtype=float).copy()
+
+    while True:
+        curr_time = i / config.env.freq
+        action = controller.compute_control(obs, info)
+        prev_pos = np.asarray(obs["pos"], dtype=float).copy()  # last alive position
+        obs, reward, terminated, truncated, info = env.step(action)
+        controller_finished = controller.step_callback(
+            action, obs, reward, terminated, truncated, info
+        )
+        if terminated or truncated or controller_finished:
+            break
+        if config.sim.render and ((i * 60) % config.env.freq) < 60:
+            controller.render_callback(env.unwrapped.sim)
+            env.render()
+        i += 1
+
+    controller.episode_callback()
+
+    target_gate = int(obs["target_gate"])
+    success = target_gate == -1
+    gates_passed = n_gates if success else target_gate
+    if success:
+        outcome = "success"
+    elif truncated and not terminated:
+        outcome = "timeout"
+    else:
+        outcome = _classify_crash(prev_pos, config)
+
+    diag = None if success or outcome == "timeout" else _diagnose_crash(prev_pos, obs)
+    result = {
+        "outcome": outcome,
+        "gates_passed": gates_passed,
+        "gate_at_crash": None if success else target_gate,
+        "time": curr_time if success else None,
+        "crash_obj": None if diag is None else f"{diag['obj_type']}[{diag['obj_idx']}]",
+        "crash_obj_type": None if diag is None else diag["obj_type"],
+        "crash_clearance": None if diag is None else diag["clearance"],
+    }
+    controller.episode_reset()
+    diag_str = ""
+    if diag is not None:
+        px, py, pz = prev_pos
+        diag_str = (
+            f"  near={diag['obj_type']}[{diag['obj_idx']}]"
+            f" clr={diag['clearance']:+.3f}m at ({px:+.2f},{py:+.2f},{pz:.2f})"
+        )
+    log_body = (
+        f"{outcome:13s} gates={gates_passed}/{n_gates}"
+        + (f"  time={curr_time:.2f}s" if success else "")
+        + diag_str
+    )
+    return result, log_body
+
+
+def _run_chunk(config_name, controller_name, seed, n_runs, runs):
+    """Worker entry point: build one env/controller and run the assigned run indices.
+
+    Returns ``[(run, result, log_line), ...]``. Builds its own env so each process is
+    self-contained (no sharing of the JAX env / acados solver across processes).
+    """
+    env, controller_cls, config, n_gates = _build_env(config_name, controller_name, False, seed)
+    out = []
+    for run in runs:
+        result, log_body = _run_episode(env, controller_cls, config, n_gates, seed, run)
+        out.append((run, result, f"run {run + 1}/{n_runs}: {log_body}"))
+    env.close()
+    return out
+
+
+def _evaluate_parallel(config_name, controller_name, seed, n_runs, workers):
+    """Run the batch across ``workers`` processes; return the collected per-episode results."""
+    # Warm up acados codegen/compile ONCE in the main process so the parallel workers only LOAD
+    # the cached solver — otherwise several workers race to generate the same C code at startup.
+    logger.info(f"warming up solver, then running {n_runs} runs across {workers} workers...")
+    env, controller_cls, cfg, _ = _build_env(config_name, controller_name, False, seed)
+    obs, info = env.reset() if seed is None else env.reset(seed=int(seed))
+    controller_cls(obs, info, cfg)  # triggers the build/compile if not already cached
+    env.close()
+
+    chunks = [c for w in range(workers) if (c := list(range(w, n_runs, workers)))]  # round-robin
+    results = []
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futs = [
+            ex.submit(_run_chunk, config_name, controller_name, seed, n_runs, c) for c in chunks
+        ]
+        try:
+            for fut in as_completed(futs):
+                for _run, result, log in sorted(fut.result(), key=lambda r: r[0]):
+                    results.append(result)
+                    logger.info(log)
+        except KeyboardInterrupt:
+            logger.info(f"\nInterrupted — summarizing the {len(results)} completed run(s) so far.")
+            ex.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
 def evaluate(
     config: str = "level2.toml",
     controller: str | None = None,
     n_runs: int = 20,
     render: bool = False,
     seed: int | None = None,
+    workers: int = 1,
 ) -> dict:
     """Run ``n_runs`` episodes and print a summary of outcomes.
 
@@ -143,96 +275,38 @@ def evaluate(
             so the same ``--seed`` always produces the exact same sequence of randomized tracks
             (level 3) / object positions (level 2) — letting you compare controller changes on an
             identical scenario set. ``None`` (default) keeps the config's behaviour (random).
+        workers: Process count for the batch. ``>1`` runs episodes in parallel across CPU cores
+            (the big speed-up; the per-run seeds keep results identical to a serial run). Forced
+            to 1 when ``render`` is on. The solver is warmed up once in the main process first so
+            workers don't race on the acados code generation.
     """
-    config = load_config(Path(__file__).parents[1] / "config" / config)
-    config.sim.render = render
-    if seed is not None:
-        config.env.seed = int(seed)
+    n_gates = len(load_config(Path(__file__).parents[1] / "config" / config).env.track.gates)
+    workers = int(workers)
 
-    control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
-    controller_path = control_path / (controller or config.controller.file)
-    controller_cls = load_controller(controller_path)
+    if workers > 1 and not render:
+        results = _evaluate_parallel(config, controller, seed, n_runs, workers)
+    else:
+        env, controller_cls, run_cfg, _ = _build_env(config, controller, render, seed)
+        results = []
+        # Ctrl-C still summarizes: an interrupt breaks out of the loop and we report on whatever
+        # runs have already completed, instead of throwing away the partial batch.
+        try:
+            for run in range(n_runs):
+                result, log_body = _run_episode(env, controller_cls, run_cfg, n_gates, seed, run)
+                results.append(result)
+                logger.info(f"run {run + 1}/{n_runs}: {log_body}")
+        except KeyboardInterrupt:
+            logger.info(f"\nInterrupted — summarizing the {len(results)} completed run(s) so far.")
+        env.close()
 
-    env: DroneRaceEnv = gymnasium.make(
-        config.env.id,
-        freq=config.env.freq,
-        sim_config=config.sim,
-        sensor_range=config.env.sensor_range,
-        control_mode=config.env.control_mode,
-        track=config.env.track,
-        disturbances=config.env.get("disturbances"),
-        randomizations=config.env.get("randomizations"),
-        seed=config.env.seed,
-    )
-    env = JaxToNumpy(env)
-
-    n_gates = len(config.env.track.gates)
-    results = []  # per-episode dicts
-
-    for run in range(n_runs):
-        # Deterministic per-run seed when one was given, so the whole batch is reproducible and
-        # comparable across controller changes; otherwise reset randomly as before.
-        obs, info = env.reset() if seed is None else env.reset(seed=int(seed) + run)
-        controller: Controller = controller_cls(obs, info, config)
-        i = 0
-        prev_pos = np.asarray(obs["pos"], dtype=float).copy()
-
-        while True:
-            curr_time = i / config.env.freq
-            action = controller.compute_control(obs, info)
-            prev_pos = np.asarray(obs["pos"], dtype=float).copy()  # last alive position
-            obs, reward, terminated, truncated, info = env.step(action)
-            controller_finished = controller.step_callback(
-                action, obs, reward, terminated, truncated, info
-            )
-            if terminated or truncated or controller_finished:
-                break
-            if config.sim.render and ((i * 60) % config.env.freq) < 60:
-                controller.render_callback(env.unwrapped.sim)
-                env.render()
-            i += 1
-
-        controller.episode_callback()
-
-        target_gate = int(obs["target_gate"])
-        success = target_gate == -1
-        gates_passed = n_gates if success else target_gate
-        if success:
-            outcome = "success"
-        elif truncated and not terminated:
-            outcome = "timeout"
-        else:
-            outcome = _classify_crash(prev_pos, config)
-
-        diag = None if success or outcome == "timeout" else _diagnose_crash(prev_pos, obs)
-        results.append(
-            {
-                "outcome": outcome,
-                "gates_passed": gates_passed,
-                "gate_at_crash": None if success else target_gate,
-                "time": curr_time if success else None,
-                "crash_obj": None if diag is None else f"{diag['obj_type']}[{diag['obj_idx']}]",
-                "crash_obj_type": None if diag is None else diag["obj_type"],
-                "crash_clearance": None if diag is None else diag["clearance"],
-            }
-        )
-        controller.episode_reset()
-        diag_str = ""
-        if diag is not None:
-            px, py, pz = prev_pos
-            diag_str = (
-                f"  near={diag['obj_type']}[{diag['obj_idx']}]"
-                f" clr={diag['clearance']:+.3f}m at ({px:+.2f},{py:+.2f},{pz:.2f})"
-            )
-        logger.info(
-            f"run {run + 1}/{n_runs}: {outcome:13s} gates={gates_passed}/{n_gates}"
-            + (f"  time={curr_time:.2f}s" if success else "")
-            + diag_str
-        )
-
-    env.close()
-    summary = _summarize(results, n_gates, n_runs)
-    _print_summary(summary, n_gates, n_runs)
+    n_done = len(results)
+    if n_done == 0:
+        logger.info("No runs completed; nothing to summarize.")
+        return {}
+    # Percentages are over the runs actually completed (n_done), not the requested n_runs, so an
+    # interrupted batch still reports correct rates.
+    summary = _summarize(results, n_gates, n_done)
+    _print_summary(summary, n_gates, n_done)
     return summary
 
 
