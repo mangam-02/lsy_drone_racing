@@ -396,6 +396,15 @@ class SimplePlanner:
     DECEL_DIST = 0.8  # m — ramp-down arc length
     APPROACH_DIST = 0.35  # m — before-gate waypoint offset along the gate normal
     DEPART_DIST = 0.4  # m — after-gate waypoint offset along the gate normal
+    #: Obstacle-aware entry/exit waypoints. A pole sitting on a gate's approach/departure line
+    #: would otherwise put the fixed entry/exit waypoint inside the pole's keep-out, forcing a
+    #: contorted swerve (the Gate-2/Obstacle-2 overshoot and the Gate-3/Obstacle-3 swing). Fix:
+    #: SHORTEN the offset toward the gate centre until the waypoint clears every obstacle (stays
+    #: aligned with the opening, no frame risk); only if even GATE_WP_MIN_DIST can't clear it (a
+    #: pole right at the gate mouth) add a small perpendicular nudge, capped at GATE_WP_MAX_SHIFT
+    #: so it stays well inside the opening (frame bars sit at GATE_BAR_DIST ≈ 0.28 m).
+    GATE_WP_MIN_DIST = 0.15  # m — floor when shortening an entry/exit offset to clear an obstacle
+    GATE_WP_MAX_SHIFT = 0.12  # m — max perpendicular nudge (fallback), kept inside the opening
     #: Upward bias (m) applied to the gate entry/center/exit waypoints. The drone tends to track
     #: the reference slightly LOW through a gate (it pitches/rolls to follow the path, trading
     #: vertical thrust, so it sags a few cm below the planned height). Aiming the gate waypoints
@@ -569,6 +578,7 @@ class SimplePlanner:
         always the complete track (the segment behind the drone is kept on a replan).
         """
         gates_pos, gates_quat = obs["gates_pos"], obs["gates_quat"]
+        obstacles_xy = [(float(p[0]), float(p[1])) for p in obs["obstacles_pos"]]
         bias = np.array([0.0, 0.0, self.GATE_Z_BIAS])  # aim a touch high to cancel the sag
         data, prev = [], self._start_pos.copy()
         for i in range(len(gates_pos)):
@@ -576,11 +586,49 @@ class SimplePlanner:
             if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
                 x_axis = -x_axis
             center = gates_pos[i] + bias
-            entry = center - x_axis * self.APPROACH_DIST
-            exit_ = center + x_axis * self.DEPART_DIST
+            # Keep the entry/exit waypoints out of any obstacle's keep-out (see GATE_WP_MIN_DIST):
+            # a pole on the approach/departure line otherwise forces a contorted swerve.
+            entry = self._clear_waypoint(center, -x_axis, self.APPROACH_DIST, obstacles_xy)
+            exit_ = self._clear_waypoint(center, x_axis, self.DEPART_DIST, obstacles_xy)
             data.append((center, x_axis.copy(), entry, exit_))
             prev = exit_
         return data
+
+    def _clear_waypoint(
+        self, center: np.ndarray, axis: np.ndarray, base_dist: float, obstacles_xy: list
+    ) -> np.ndarray:
+        """Entry/exit waypoint at ``center + axis*base_dist``, kept clear of every obstacle pole.
+
+        ``axis`` is the outward gate-normal unit vector (−normal for entry, +normal for exit).
+        First SHORTEN the offset toward the gate centre (the waypoint stays on the gate axis, i.e.
+        centred in the opening — no frame risk) until it clears ``PLAN_CLEARANCE`` in xy from all
+        poles. Only if it still can't clear at ``GATE_WP_MIN_DIST`` (a pole right at the gate
+        mouth) add a small perpendicular nudge, capped at ``GATE_WP_MAX_SHIFT`` so the waypoint
+        stays well inside the opening. Falls back to the shortened point if nothing clears (the
+        MPCC capsule avoidance is the backstop).
+        """
+
+        def clear(p: np.ndarray) -> bool:
+            return all(
+                np.hypot(p[0] - ox, p[1] - oy) >= self.PLAN_CLEARANCE for ox, oy in obstacles_xy
+            )
+
+        steps = 12
+        for k in range(steps + 1):  # shorten base_dist -> GATE_WP_MIN_DIST
+            d = base_dist - (base_dist - self.GATE_WP_MIN_DIST) * k / steps
+            p = center + axis * d
+            if clear(p):
+                return p
+        # Still blocked at the minimum offset: small bounded perpendicular nudge (in the gate
+        # plane), kept inside the opening so it never approaches the frame bars.
+        p = center + axis * self.GATE_WP_MIN_DIST
+        right = np.array([-axis[1], axis[0], 0.0])
+        right = right / (np.linalg.norm(right) + 1e-9)
+        for s in np.linspace(0.0, self.GATE_WP_MAX_SHIFT, steps + 1):
+            for q in (p + right * s, p - right * s):
+                if clear(q):
+                    return q
+        return p
 
     def _segment_starts(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> list:
         return [drone_pos] + [gd[3] for gd in gate_data[:-1]]
@@ -863,6 +911,19 @@ class MPCCController(Controller):
     #: pure path progress with no gate gating.
     USE_GATE_BARRIER = True
     GATE_PASS_LEAD = 0.4  # m past the gate centre θ may reach before the env confirms the pass
+    #: Gate-retry recovery. The progress θ is monotonic (v_theta >= 0) and clamped at the gate
+    #: barrier, so if the drone MISSES a gate (overshoots / flies past the opening without the env
+    #: confirming the pass) it can't reverse on its own — v_target brakes to 0 and it dead-hovers
+    #: at the barrier until timeout. This detects that stall and flies the drone back to a point
+    #: BEFORE the gate with a simple position controller (bypassing the MPCC), then hands back so
+    #: the MPCC re-approaches and re-threads. The back-and-forth also raises the chance of finally
+    #: sensing the real gate pose (→ replan onto the correct line). Off → old dead-hover behaviour.
+    USE_GATE_RETRY = True
+    RETRY_STUCK_SPEED = 0.3  # m/s — below this, at/past the gate, counts as stalled
+    RETRY_STUCK_TICKS = 40  # consecutive stalled ticks before a retry triggers (~0.8 s @ 50 Hz)
+    RETRY_BACK_DIST = 0.8  # m (arc length) before the gate centre the recovery retreats to
+    RETRY_DONE_DIST = 0.25  # m — within this of the retreat point, hand back to the MPCC
+    RETRY_MAX = 3  # give up after this many retries on one gate (then let it hover → timeout)
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
     #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
@@ -1006,6 +1067,14 @@ class MPCCController(Controller):
         self._theta_est = None  # last tick's progress θ; constrains the projection (no jumps)
         self._progress_point = None  # drone's current projection on the path (render marker)
         self._external_mult = None
+
+        # Gate-retry recovery state (see USE_GATE_RETRY).
+        self._stuck_ticks = 0  # consecutive stalled ticks at the current (unpassed) gate
+        self._retrying = False  # currently flying back to re-attempt a missed gate
+        self._retry_target = None  # world point (before the gate) the recovery flies to
+        self._retry_theta = 0.0  # arc length of that retreat point (MPCC re-localises here)
+        self._retry_gate = -1  # the gate index we are retrying
+        self._retry_count = 0  # retries already spent on the current gate
 
     def set_external_multipliers(self, mult: np.ndarray | None) -> None:
         """Inject weight multipliers from an outside policy (training); None → internal policy."""
@@ -1275,6 +1344,15 @@ class MPCCController(Controller):
         """Project onto the path, set per-stage contouring params, solve MPCC."""
         self._last_obs = obs
         self._maybe_replan(obs)
+
+        # Missed-gate recovery: if the drone has stalled at an unpassed gate, fly it back for
+        # another attempt (the monotonic MPCC progress can't reverse on its own). Returns a
+        # command while recovering, else None → fall through to the normal MPCC solve.
+        retry_cmd = self._handle_gate_retry(obs)
+        if retry_cmd is not None:
+            self._last_u = retry_cmd[:4]
+            return retry_cmd
+
         tic = time.perf_counter()
 
         # Progress state θ / v_theta. θ is a genuine progress STATE that evolves inside the
@@ -1425,13 +1503,25 @@ class MPCCController(Controller):
         hover; with velocity it decelerates and holds altitude.
         """
         g = float(-self.drone_params["gravity_vec"][-1])
-        mass = float(self.drone_params["mass"])
         vel = np.asarray(obs["vel"], dtype=float)
         k_xy, k_z = 2.0, 1.5  # velocity-damping gains (horizontal / vertical)
         f = np.array([-k_xy * vel[0], -k_xy * vel[1], g - k_z * vel[2]])
-        f[2] = max(f[2], 0.5 * g)  # never command near-zero / downward thrust
-        zb = f / np.linalg.norm(f)
         psi = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])  # hold current heading
+        return self._force_to_cmd(f, psi)
+
+    def _force_to_cmd(self, f: np.ndarray, psi: float) -> NDArray[np.floating]:
+        """Turn a desired world-frame specific force ``f`` into a ``[roll, pitch, yaw, thrust]``.
+
+        Geometric attitude reconstruction (desired body-z = f/|f|, heading ``psi``), round-
+        tripped through the same scipy 'xyz' Euler convention used to read the state, with
+        thrust = mass*|f|. Shared by the brake fallback and the gate-retry recovery. ``f[2]`` is
+        floored so the command never tilts past vertical or asks for near-zero thrust.
+        """
+        g = float(-self.drone_params["gravity_vec"][-1])
+        mass = float(self.drone_params["mass"])
+        f = np.asarray(f, dtype=float).copy()
+        f[2] = max(f[2], 0.5 * g)
+        zb = f / np.linalg.norm(f)
         x_c = np.array([np.cos(psi), np.sin(psi), 0.0])
         y_b = np.cross(zb, x_c)
         y_b /= np.linalg.norm(y_b)
@@ -1447,6 +1537,72 @@ class MPCCController(Controller):
         roll = float(np.clip(roll, -0.7, 0.7))
         pitch = float(np.clip(pitch, -0.7, 0.7))
         return np.array([roll, pitch, psi, thrust])
+
+    def _recovery_cmd(self, obs: dict) -> NDArray[np.floating]:
+        """PD position command flying the drone back to ``self._retry_target`` (gate retry)."""
+        g = float(-self.drone_params["gravity_vec"][-1])
+        pos = np.asarray(obs["pos"], dtype=float)
+        vel = np.asarray(obs["vel"], dtype=float)
+        kp, kd = 4.0, 3.0  # position / velocity-damping gains
+        a = np.clip(kp * (self._retry_target - pos) - kd * vel, -8.0, 8.0)  # desired accel
+        f = np.array([a[0], a[1], g + a[2]])
+        psi = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+        return self._force_to_cmd(f, psi)
+
+    def _handle_gate_retry(self, obs: dict) -> NDArray[np.floating] | None:
+        """Detect a missed-gate stall and run the retreat-and-retry recovery.
+
+        Returns a command while recovering (and on the tick a retry is triggered), or ``None`` to
+        let the normal MPCC solve run. See USE_GATE_RETRY for the rationale.
+        """
+        tg = int(obs["target_gate"])
+        gt = getattr(self.planner, "gate_thetas", None)
+        if (
+            not self.USE_GATE_RETRY
+            or gt is None
+            or tg < 0
+            or tg >= len(gt)
+            or self._theta_est is None
+        ):
+            self._stuck_ticks = 0
+            self._retrying = False
+            return None
+        if tg != self._retry_gate:  # new (or advanced) target gate → reset the per-gate retry state
+            self._retry_gate = tg
+            self._retry_count = 0
+            self._stuck_ticks = 0
+            self._retrying = False
+
+        if self._retrying:
+            if float(np.linalg.norm(self._retry_target - np.asarray(obs["pos"], float))) < (
+                self.RETRY_DONE_DIST
+            ):
+                # Back before the gate: hand control to the MPCC, re-localised at the retreat
+                # point so it re-approaches and re-threads the gate.
+                self._retrying = False
+                self._stuck_ticks = 0
+                self._theta_pred = None
+                self._pos_pred = None
+                self._x_pred = None
+                self._u_pred = None
+                self._theta_est = self._retry_theta
+                return None
+            return self._recovery_cmd(obs)
+
+        # Not yet recovering: count consecutive stalled ticks at/past the unpassed gate.
+        speed = float(np.linalg.norm(np.asarray(obs["vel"], float)))
+        stalled = self._theta_est >= float(gt[tg]) - 0.1 and speed < self.RETRY_STUCK_SPEED
+        self._stuck_ticks = self._stuck_ticks + 1 if stalled else 0
+        if self._stuck_ticks >= self.RETRY_STUCK_TICKS and self._retry_count < self.RETRY_MAX:
+            self._retry_count += 1
+            self._retry_theta = max(0.0, float(gt[tg]) - self.RETRY_BACK_DIST)
+            self._retry_target = self.planner.path_point_tangent(self._retry_theta)[0]
+            self._retrying = True
+            print(
+                f"[MPCC] gate {tg} missed (try {self._retry_count}/{self.RETRY_MAX}) — retreating"
+            )
+            return self._recovery_cmd(obs)
+        return None
 
     def step_callback(
         self,
