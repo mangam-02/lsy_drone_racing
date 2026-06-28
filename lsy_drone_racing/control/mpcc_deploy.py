@@ -400,10 +400,17 @@ class SimplePlanner:
     #: would otherwise put the fixed entry/exit waypoint inside the pole's keep-out, forcing a
     #: contorted swerve (the Gate-2/Obstacle-2 overshoot and the Gate-3/Obstacle-3 swing). Fix:
     #: SHORTEN the offset toward the gate centre until the waypoint clears every obstacle (stays
-    #: aligned with the opening, no frame risk); only if even GATE_WP_MIN_DIST can't clear it (a
+    #: aligned with the opening, no frame risk); only if even the minimum offset can't clear it (a
     #: pole right at the gate mouth) add a small perpendicular nudge, capped at GATE_WP_MAX_SHIFT
     #: so it stays well inside the opening (frame bars sit at GATE_BAR_DIST ≈ 0.28 m).
-    GATE_WP_MIN_DIST = 0.15  # m — floor when shortening an entry/exit offset to clear an obstacle
+    #: The ENTRY may be shortened all the way to GATE_WP_MIN_DIST, but the EXIT has its own,
+    #: LARGER floor GATE_EXIT_MIN_DIST: it must stay far enough PAST the gate plane that the drone
+    #: actually crosses it (and the env registers the pass) before the line curves toward the next
+    #: gate. Shortening the exit too aggressively made the drone turn back before completing the
+    #: pass at reversal gates; if that pulls it nearer an obstacle, the MPCC capsule avoidance
+    #: handles the clearance.
+    GATE_WP_MIN_DIST = 0.15  # m — floor when shortening the ENTRY offset to clear an obstacle
+    GATE_EXIT_MIN_DIST = 0.30  # m — floor for the EXIT offset (keep the gate pass completing)
     GATE_WP_MAX_SHIFT = 0.12  # m — max perpendicular nudge (fallback), kept inside the opening
     #: Upward bias (m) applied to the gate entry/center/exit waypoints. The drone tends to track
     #: the reference slightly LOW through a gate (it pitches/rolls to follow the path, trading
@@ -587,25 +594,36 @@ class SimplePlanner:
                 x_axis = -x_axis
             center = gates_pos[i] + bias
             # Keep the entry/exit waypoints out of any obstacle's keep-out (see GATE_WP_MIN_DIST):
-            # a pole on the approach/departure line otherwise forces a contorted swerve.
-            entry = self._clear_waypoint(center, -x_axis, self.APPROACH_DIST, obstacles_xy)
-            exit_ = self._clear_waypoint(center, x_axis, self.DEPART_DIST, obstacles_xy)
+            # a pole on the approach/departure line otherwise forces a contorted swerve. The exit
+            # uses a LARGER floor so the drone still crosses the gate plane (completes the pass).
+            entry = self._clear_waypoint(
+                center, -x_axis, self.APPROACH_DIST, obstacles_xy, self.GATE_WP_MIN_DIST
+            )
+            exit_ = self._clear_waypoint(
+                center, x_axis, self.DEPART_DIST, obstacles_xy, self.GATE_EXIT_MIN_DIST
+            )
             data.append((center, x_axis.copy(), entry, exit_))
             prev = exit_
         return data
 
     def _clear_waypoint(
-        self, center: np.ndarray, axis: np.ndarray, base_dist: float, obstacles_xy: list
+        self,
+        center: np.ndarray,
+        axis: np.ndarray,
+        base_dist: float,
+        obstacles_xy: list,
+        min_dist: float,
     ) -> np.ndarray:
         """Entry/exit waypoint at ``center + axis*base_dist``, kept clear of every obstacle pole.
 
         ``axis`` is the outward gate-normal unit vector (−normal for entry, +normal for exit).
         First SHORTEN the offset toward the gate centre (the waypoint stays on the gate axis, i.e.
         centred in the opening — no frame risk) until it clears ``PLAN_CLEARANCE`` in xy from all
-        poles. Only if it still can't clear at ``GATE_WP_MIN_DIST`` (a pole right at the gate
-        mouth) add a small perpendicular nudge, capped at ``GATE_WP_MAX_SHIFT`` so the waypoint
-        stays well inside the opening. Falls back to the shortened point if nothing clears (the
-        MPCC capsule avoidance is the backstop).
+        poles, but never below ``min_dist`` (the exit floor is larger so the gate pass still
+        completes). Only if it still can't clear at ``min_dist`` (a pole right at the gate mouth)
+        add a small perpendicular nudge, capped at ``GATE_WP_MAX_SHIFT`` so the waypoint stays well
+        inside the opening. Falls back to the shortened point if nothing clears (the MPCC capsule
+        avoidance is the backstop).
         """
 
         def clear(p: np.ndarray) -> bool:
@@ -614,14 +632,14 @@ class SimplePlanner:
             )
 
         steps = 12
-        for k in range(steps + 1):  # shorten base_dist -> GATE_WP_MIN_DIST
-            d = base_dist - (base_dist - self.GATE_WP_MIN_DIST) * k / steps
+        for k in range(steps + 1):  # shorten base_dist -> min_dist
+            d = base_dist - (base_dist - min_dist) * k / steps
             p = center + axis * d
             if clear(p):
                 return p
         # Still blocked at the minimum offset: small bounded perpendicular nudge (in the gate
         # plane), kept inside the opening so it never approaches the frame bars.
-        p = center + axis * self.GATE_WP_MIN_DIST
+        p = center + axis * min_dist
         right = np.array([-axis[1], axis[0], 0.0])
         right = right / (np.linalg.norm(right) + 1e-9)
         for s in np.linspace(0.0, self.GATE_WP_MAX_SHIFT, steps + 1):
