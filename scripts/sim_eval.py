@@ -52,11 +52,85 @@ def _classify_crash(prev_pos: np.ndarray, config) -> str:
     return "collision"
 
 
+# ── Crash diagnostics: which physical object was the drone closest to? ──────────────────────
+# Physical geometry of the track objects (no avoidance margin) — matched to the simulator and to
+# the controller's capsule model, so the "nearest object at crash" is a real collision check, not
+# the inflated keep-out the controller plans against.
+_POLE_RADIUS = 0.015  # obstacle pole (0.03 m diameter)
+_POLE_HEIGHT = 1.52
+_GATE_OUTER = 0.72  # outer frame width
+_GATE_BAR_DIST = 0.28  # bar-centre distance from the gate centre
+_GATE_BAR_RADIUS = 0.08  # frame-bar half-thickness
+_GATE_STAND_RADIUS = 0.05  # stand (leg) radius
+
+
+def _seg_clearance(p: np.ndarray, a: np.ndarray, b: np.ndarray, r: float) -> float:
+    """Signed clearance from point ``p`` to the capsule (segment ``a→b``, radius ``r``).
+
+    Distance from ``p`` to the closest point on the segment minus ``r``: > 0 outside the
+    capsule, < 0 inside it (penetrating). Used to find the object the drone hit.
+    """
+    ab = b - a
+    t = float(np.clip(np.dot(p - a, ab) / max(float(np.dot(ab, ab)), 1e-9), 0.0, 1.0))
+    return float(np.linalg.norm(p - (a + t * ab)) - r)
+
+
+def _collision_capsules(obs: dict) -> list[tuple]:
+    """Physical collision capsules ``(type, gate/obstacle idx, p1, p2, radius)`` from live poses.
+
+    Poles → one vertical capsule; each gate → a stand (if it has a leg) plus 4 frame bars, built
+    from the gate's up/right axes exactly like the controller's avoidance model but with physical
+    radii. ``type`` is ``"obstacle"``, ``"gate_frame"`` or ``"gate_stand"``.
+    """
+    # Imported lazily: importing scipy at module top (before lsy_drone_racing → crazyflow sets
+    # SCIPY_ARRAY_API) makes crazyflow raise at startup.
+    from scipy.spatial.transform import Rotation as R
+
+    caps: list[tuple] = []
+    for i, op in enumerate(obs["obstacles_pos"]):
+        a = np.array([op[0], op[1], 0.0])
+        b = np.array([op[0], op[1], _POLE_HEIGHT])
+        caps.append(("obstacle", i, a, b, _POLE_RADIUS))
+    half = _GATE_OUTER / 2.0
+    bd = _GATE_BAR_DIST
+    for gi, (gp, gq) in enumerate(zip(obs["gates_pos"], obs["gates_quat"])):
+        rot = R.from_quat(gq)
+        up = rot.apply([0.0, 0.0, 1.0])
+        right = rot.apply([0.0, 1.0, 0.0])
+
+        def bar(p1, p2, typ="gate_frame", r=_GATE_BAR_RADIUS, gi=gi):  # noqa: ANN001, ANN202
+            caps.append((typ, gi, p1, p2, r))
+
+        stand_h = float(gp[2]) - half
+        if stand_h > 0:  # leg down to the ground (airborne gates have no stand)
+            bar(gp - up * half, gp - up * (half + stand_h), "gate_stand", _GATE_STAND_RADIUS)
+        bar(gp + up * bd - right * half, gp + up * bd + right * half)
+        bar(gp - up * bd - right * half, gp - up * bd + right * half)
+        bar(gp - right * bd + up * half, gp - right * bd - up * half)
+        bar(gp + right * bd + up * half, gp + right * bd - up * half)
+    return caps
+
+
+def _diagnose_crash(prev_pos: np.ndarray, obs: dict) -> dict:
+    """Nearest physical object to the last alive position → likely crash cause.
+
+    Returns the closest capsule's type/index and the signed clearance (negative ⇒ the drone
+    was inside that object). For a true collision this pins down whether it was a gate frame,
+    a pole or a gate stand; for ground/out-of-bounds it's just the nearest object for context.
+    """
+    caps = _collision_capsules(obs)
+    if not caps:
+        return {"obj_type": "none", "obj_idx": -1, "clearance": float("inf")}
+    typ, idx, a, b, r = min(caps, key=lambda c: _seg_clearance(prev_pos, c[2], c[3], c[4]))
+    return {"obj_type": typ, "obj_idx": int(idx), "clearance": _seg_clearance(prev_pos, a, b, r)}
+
+
 def evaluate(
     config: str = "level2.toml",
     controller: str | None = None,
     n_runs: int = 20,
     render: bool = False,
+    seed: int | None = None,
 ) -> dict:
     """Run ``n_runs`` episodes and print a summary of outcomes.
 
@@ -65,12 +139,15 @@ def evaluate(
         controller: Controller file in ``lsy_drone_racing/control/`` or None (use config).
         n_runs: Number of episodes to run.
         render: Enable rendering (slow; off by default for batch evaluation).
-
-    Returns:
-        A dict with the aggregated statistics.
+        seed: Base seed for reproducibility. When given, run ``r`` is reset with ``seed + r``,
+            so the same ``--seed`` always produces the exact same sequence of randomized tracks
+            (level 3) / object positions (level 2) — letting you compare controller changes on an
+            identical scenario set. ``None`` (default) keeps the config's behaviour (random).
     """
     config = load_config(Path(__file__).parents[1] / "config" / config)
     config.sim.render = render
+    if seed is not None:
+        config.env.seed = int(seed)
 
     control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
     controller_path = control_path / (controller or config.controller.file)
@@ -93,7 +170,9 @@ def evaluate(
     results = []  # per-episode dicts
 
     for run in range(n_runs):
-        obs, info = env.reset()
+        # Deterministic per-run seed when one was given, so the whole batch is reproducible and
+        # comparable across controller changes; otherwise reset randomly as before.
+        obs, info = env.reset() if seed is None else env.reset(seed=int(seed) + run)
         controller: Controller = controller_cls(obs, info, config)
         i = 0
         prev_pos = np.asarray(obs["pos"], dtype=float).copy()
@@ -125,18 +204,30 @@ def evaluate(
         else:
             outcome = _classify_crash(prev_pos, config)
 
+        diag = None if success or outcome == "timeout" else _diagnose_crash(prev_pos, obs)
         results.append(
             {
                 "outcome": outcome,
                 "gates_passed": gates_passed,
                 "gate_at_crash": None if success else target_gate,
                 "time": curr_time if success else None,
+                "crash_obj": None if diag is None else f"{diag['obj_type']}[{diag['obj_idx']}]",
+                "crash_obj_type": None if diag is None else diag["obj_type"],
+                "crash_clearance": None if diag is None else diag["clearance"],
             }
         )
         controller.episode_reset()
+        diag_str = ""
+        if diag is not None:
+            px, py, pz = prev_pos
+            diag_str = (
+                f"  near={diag['obj_type']}[{diag['obj_idx']}]"
+                f" clr={diag['clearance']:+.3f}m at ({px:+.2f},{py:+.2f},{pz:.2f})"
+            )
         logger.info(
             f"run {run + 1}/{n_runs}: {outcome:13s} gates={gates_passed}/{n_gates}"
             + (f"  time={curr_time:.2f}s" if success else "")
+            + diag_str
         )
 
     env.close()
@@ -149,6 +240,8 @@ def _summarize(results: list[dict], n_gates: int, n_runs: int) -> dict:
     outcomes = Counter(r["outcome"] for r in results)
     gates_hist = Counter(r["gates_passed"] for r in results)
     crash_gate = Counter(r["gate_at_crash"] for r in results if r["gate_at_crash"] is not None)
+    crash_obj_type = Counter(r["crash_obj_type"] for r in results if r.get("crash_obj_type"))
+    crash_obj = Counter(r["crash_obj"] for r in results if r.get("crash_obj"))
     times = [r["time"] for r in results if r["time"] is not None]
     return {
         "n_runs": n_runs,
@@ -157,6 +250,8 @@ def _summarize(results: list[dict], n_gates: int, n_runs: int) -> dict:
         "outcomes": dict(outcomes),
         "gates_hist": dict(gates_hist),
         "crash_by_gate": dict(crash_gate),
+        "crash_by_object_type": dict(crash_obj_type),
+        "crash_by_object": dict(crash_obj),
         "avg_success_time": float(np.mean(times)) if times else None,
         "avg_gates_passed": float(np.mean([r["gates_passed"] for r in results])),
     }
@@ -194,6 +289,14 @@ def _print_summary(s: dict, n_gates: int, n_runs: int):
         for g in sorted(s["crash_by_gate"]):
             c = s["crash_by_gate"][g]
             print(f"   heading to gate {g}: {c:3d}  ({pct(c):5.1f}%)")
+
+    if s.get("crash_by_object_type"):
+        print("\n Nearest object at crash (frame vs pole — physical clearance):")
+        for k, c in sorted(s["crash_by_object_type"].items(), key=lambda kv: -kv[1]):
+            print(f"   {k:12s}: {c:3d}  ({pct(c):5.1f}%) {_bar(c / n_runs)}")
+        print("\n   by specific object:")
+        for k, c in sorted(s["crash_by_object"].items(), key=lambda kv: -kv[1]):
+            print(f"     {k:16s}: {c:3d}")
     print("=" * 60 + "\n")
 
 

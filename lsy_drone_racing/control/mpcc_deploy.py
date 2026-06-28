@@ -301,7 +301,11 @@ def create_mpcc_ocp_solver(
     ocp.solver_options.tol = 1e-3
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
-    ocp.solver_options.qp_solver_iter_max = 10
+    # HPIPM QP iteration cap. At 10 the QP was hitting the limit near gates (status 3 at "QP
+    # iteration 9" → solve fails → braking to hover → crash), so give it room to converge. This
+    # is baked into the generated code, but _solver_signature hashes this function's source, so
+    # editing the value here auto-invalidates the cache and rebuilds the solver.
+    ocp.solver_options.qp_solver_iter_max = 30
     ocp.solver_options.nlp_solver_max_iter = 1
     if time_steps is not None:
         # Non-uniform shooting grid: same N nodes, but the intervals grow toward the end so
@@ -814,6 +818,16 @@ class MPCCController(Controller):
     GROUND_Z = 0.0
     V_TARGET = 3  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 5  # m/s — hard-ish cap on progress speed
+    #: Curvature speed limit: cap the progress target by the path curvature so the drone slows
+    #: through sharp turns (e.g. the ~180° reversal at a gate exit) and cruises on straights,
+    #: instead of carrying full V_TARGET into a corner and overshooting into the frame. The cap is
+    #: a lateral-acceleration limit, v_cap = sqrt(MAX_LAT_ACC / kappa), evaluated over a short
+    #: arc-length LOOKAHEAD ahead of the drone so braking starts BEFORE the curve. The MPCC tracks
+    #: its own v_target (not the planner's speed profile), so this must cap v_target here to bite.
+    USE_CURVATURE_SPEED = True
+    MAX_LAT_ACC = 20.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
+    CURVE_MIN_SPEED = 0.8  # m/s — floor so a very tight turn never stalls progress
+    CURVE_LOOKAHEAD = 1.0  # m — arc length ahead scanned for the tightest upcoming curvature
     #: Distance (m) from the path end within which the controller switches to end-hover:
     #: it freezes every stage's progress at theta=length and sets the target progress speed
     #: to 0, so contouring+lag pull the drone onto the final path point and v_theta decays to
@@ -827,12 +841,13 @@ class MPCCController(Controller):
     #: corrected path). Implemented by scaling the progress target v_target toward
     #: CAUTION_SPEED_FACTOR as the drone closes within CAUTION_RADIUS of such an object.
     USE_CAUTION = True
-    CAUTION_SPEED_FACTOR = 0.45  # fraction of V_TARGET when right at an unmeasured object
+    CAUTION_SPEED_FACTOR = 0.35  # fraction of V_TARGET when right at an unmeasured object
     #: xy-distance (m) within which an unmeasured object starts slowing us. MUST be larger than
     #: the env's sensor_range (the xy-distance at which the exact pose is revealed and the object
     #: becomes "visited" — 0.7 m in the level configs), otherwise the pose snaps to exact before
-    #: caution ever engages and this has no effect.
-    CAUTION_RADIUS = 1.2  # m
+    #: caution ever engages and this has no effect. Set a bit above sensor_range so the approach
+    #: is already slow when the true pose is revealed and the replan onto it kicks in.
+    CAUTION_RADIUS = 1.4  # m
     #: Gate-progress barrier: tie the MPCC progress state θ to the env's authoritative gate-pass
     #: detection. The env only increments target_gate once the drone has actually flown THROUGH
     #: the current gate's opening; until then θ is not allowed past (gate centre + GATE_PASS_LEAD).
@@ -898,6 +913,10 @@ class MPCCController(Controller):
         """Build the MPCC solver and the initial path."""
         super().__init__(obs, info, config)
         self._config = config
+        # xy-distance at which the env reveals an object's true pose (and marks it "visited").
+        # The caution slowdown bottoms out here, so the drone is already at its slowest the
+        # moment a blind-approached gate's real position is revealed and its replan kicks in.
+        self._sensor_range = float(getattr(config.env, "sensor_range", 0.7))
         self._N = self.N_HORIZON
         self._dt = 1 / config.env.freq
         # Non-uniform shooting grid: first interval = the real control period dt, each later
@@ -930,7 +949,6 @@ class MPCCController(Controller):
 
         # Background replanning (never stalls the 50 Hz loop).
         self._executor = ThreadPoolExecutor(max_workers=1)
-        self._hover_cmd = np.array([0.0, 0.0, 0.0, self._hover_thrust])
         self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
 
         # RL weight planner (third layer). The deployment policy runs internally; the trainer
@@ -958,6 +976,8 @@ class MPCCController(Controller):
         # coefficients the model needs to evaluate p_d(theta) symbolically. Rebuilt on replan.
         self._cubic = None
         self._cubic_smax = 0.0
+        self._curv_s = None  # arc-length grid of the curvature speed cap (set by _build_cubic)
+        self._vcap = None  # curvature-limited speed cap v_cap(s) along the path
         self._build_cubic()
         self._snapshot_objects(obs)
         self._replan_future = None
@@ -1032,12 +1052,45 @@ class MPCCController(Controller):
         length = float(getattr(self.planner, "length", 0.0))
         if length <= 1e-6:
             self._cubic = None
+            self._curv_s = None
+            self._vcap = None
             return
         n = max(self._N + 2, int(length / self._CUBIC_DS) + 1)
         s = np.linspace(0.0, length, n)
         pos, _ = self.planner.path_point_tangent(s)
         self._cubic = CubicSpline(s, np.asarray(pos, dtype=float))
         self._cubic_smax = length
+        self._build_curvature_cap(s)
+
+    def _build_curvature_cap(self, s: np.ndarray) -> None:
+        """Precompute the curvature-limited speed cap v_cap(s) along the path.
+
+        The internal cubic is parameterised by arc length, so its second derivative is the
+        curvature vector and ``kappa = |r''(s)|``. The cap is the lateral-accel limit
+        ``sqrt(MAX_LAT_ACC / kappa)``, clipped to ``[CURVE_MIN_SPEED, V_TARGET]`` (full speed on
+        straights, floored on the sharpest turns). Looked up per tick by ``_curvature_speed_cap``.
+        """
+        if not self.USE_CURVATURE_SPEED or self._cubic is None:
+            self._curv_s = None
+            self._vcap = None
+            return
+        kappa = np.linalg.norm(self._cubic(s, 2), axis=1)
+        vcap = np.sqrt(self.MAX_LAT_ACC / np.maximum(kappa, 1e-6))
+        self._curv_s = s
+        self._vcap = np.clip(vcap, self.CURVE_MIN_SPEED, self.V_TARGET)
+
+    def _curvature_speed_cap(self, theta0: float) -> float:
+        """Tightest curvature speed cap over the next ``CURVE_LOOKAHEAD`` metres of path.
+
+        Scanning ahead (not just at theta0) makes the drone start braking BEFORE it enters a
+        curve, so it is already slow at the apex. Returns V_TARGET when the cap is unavailable.
+        """
+        if not self.USE_CURVATURE_SPEED or self._vcap is None:
+            return float(self.V_TARGET)
+        mask = (self._curv_s >= theta0) & (self._curv_s <= theta0 + self.CURVE_LOOKAHEAD)
+        if not np.any(mask):
+            return float(self.V_TARGET)
+        return float(np.min(self._vcap[mask]))
 
     def _path_segment_coeffs(
         self, theta: float
@@ -1147,8 +1200,16 @@ class MPCCController(Controller):
         pos = obs["pos"]
         uncertain = []
         tg = int(obs["target_gate"])
-        if tg >= 0 and not bool(obs["gates_visited"][tg]):  # the gate we're flying at
-            uncertain.append(obs["gates_pos"][tg])
+        # The gate we're flying at stays a caution source until its true pose is measured AND the
+        # replan onto that corrected pose has been installed (no replan still in flight). Keying
+        # only on "not visited" let the drone snap back to full speed the instant the pose was
+        # revealed (at the sensor range, ~0.7 m) while the corrected path was still being computed
+        # in the background — so it committed at cruise speed to the stale nominal line and clipped
+        # the frame. Staying slow until the replan lands gives it room to react to the new path.
+        if tg >= 0:  # the gate we're flying at
+            gate_unknown = not bool(obs["gates_visited"][tg]) or self._replan_future is not None
+            if gate_unknown:
+                uncertain.append(obs["gates_pos"][tg])
         for i, op in enumerate(obs["obstacles_pos"]):
             if not bool(obs["obstacles_visited"][i]):
                 uncertain.append(op)
@@ -1159,7 +1220,14 @@ class MPCCController(Controller):
         # comparable to sensor_range and MUST exceed it, or the pose snaps to exact before the
         # slowdown ever engages.
         dmin = min(float(np.linalg.norm(np.asarray(u)[:2] - pos[:2])) for u in uncertain)
-        frac = np.clip(dmin / self.CAUTION_RADIUS, 0.0, 1.0)  # 0 at the object, 1 at the radius
+        # Bottom the ramp out at the sensor range, not at distance 0 (which a gate is never
+        # reached — the drone flies through it). So the slowdown is already FULL by the time the
+        # true pose is revealed and the replan onto it kicks in: frac = 1 at CAUTION_RADIUS,
+        # falling to 0 (full caution) once dmin <= sensor_range. This is what gives a blind
+        # approach room to react to the corrected path instead of committing to it at speed.
+        floor = self._sensor_range
+        denom = max(self.CAUTION_RADIUS - floor, 1e-3)
+        frac = np.clip((dmin - floor) / denom, 0.0, 1.0)
         return float(self.CAUTION_SPEED_FACTOR + (1.0 - self.CAUTION_SPEED_FACTOR) * frac)
 
     def _gate_progress_cap(self, obs: dict) -> float:
@@ -1243,7 +1311,8 @@ class MPCCController(Controller):
             thetas = np.full(self._N + 1, self.planner.length)
         else:
             brake = float(np.clip((theta_cap - theta0) / self.GATE_PASS_LEAD, 0.0, 1.0))
-            v_target = self.V_TARGET * self._caution_factor(obs) * brake
+            v_cruise = self._curvature_speed_cap(theta0)  # slow into sharp turns, full on straights
+            v_target = v_cruise * self._caution_factor(obs) * brake
             thetas = np.minimum(self._stage_thetas(theta0), theta_cap)
         caps = self._build_capsule_params(obs) if self._n_caps else None
         for k in range(self._N + 1):
@@ -1252,16 +1321,17 @@ class MPCCController(Controller):
             p_k = head if caps is None else np.concatenate((head, caps))
             self._solver.set(k, "p", p_k)
 
-        # RL weight planner: adapt the MPCC cost weights for this tick. Multipliers come from the
-        # trainer (external override) or the internal policy; weight_diagonals rebuilds the same
-        # W layout the solver was built with, so multipliers=1 is an exact no-op. acados updates
-        # W in place (no rebuild). Skipped entirely when USE_RL_WEIGHTS is off.
+        # Per-tick cost weights = baseline × multipliers. Multipliers come from the RL weight
+        # planner (trainer override or internal policy) when it's on, else identity (an exact
+        # no-op: weight_diagonals rebuilds the same W layout the solver was built with). W is only
+        # re-set when RL is on, so the no-RL path stays as cheap as before; acados updates W in
+        # place.
         if self.USE_RL_WEIGHTS:
             if self._external_mult is not None:
-                mult = self._external_mult
+                mult = self._external_mult.copy()
             else:
                 self._last_features = wp.build_features(obs, self.planner, self._theta_est)
-                mult = self._weight_policy.multipliers(self._last_features)
+                mult = self._weight_policy.multipliers(self._last_features).copy()
             self._last_mult = mult  # remember the applied multipliers (render overlay / logging)
             w_stage, w_term = wp.weight_diagonals(
                 mult, BASELINE_WEIGHTS, self._n_caps, self.CAPSULE_PENALTY
@@ -1300,7 +1370,7 @@ class MPCCController(Controller):
         if self._last_u is not None and self._consec_fail <= self.MAX_HOLD_TICKS:
             return self._last_u
         print(f"[MPCC] solve failed (status={status}) at theta={theta0:.2f}; braking to hover")
-        return self._hover_cmd
+        return self._safe_fallback_cmd(obs)
 
     def _profile_tick(self, proj: float, setp: float, solve: float) -> None:
         """Accumulate per-tick timings and print a rolling average every 50 ticks."""
@@ -1318,6 +1388,42 @@ class MPCCController(Controller):
                 f" | total {tot:.2f} ms (budget {self._dt * 1e3:.0f} ms)"
             )
             self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
+
+    def _safe_fallback_cmd(self, obs: dict) -> NDArray[np.floating]:
+        """Stabilising attitude command for when the solver can't be trusted (Befund 2).
+
+        The old fallback was a zero-attitude hover: level, so it could not arrest the horizontal
+        momentum the drone carried in at cruise speed — it coasted ballistically into a gate
+        frame or out of the arena (the out_of_bounds / frame-streifer cases). Instead, tilt to
+        brake: build a desired specific-force vector that damps the measured velocity and
+        compensates gravity, turn it into a roll/pitch/yaw attitude (geometric reconstruction,
+        round-tripped through the same scipy 'xyz' Euler convention used to read the state) plus a
+        matching collective thrust. With zero velocity this reduces exactly to a heading-aligned
+        hover; with velocity it decelerates and holds altitude.
+        """
+        g = float(-self.drone_params["gravity_vec"][-1])
+        mass = float(self.drone_params["mass"])
+        vel = np.asarray(obs["vel"], dtype=float)
+        k_xy, k_z = 2.0, 1.5  # velocity-damping gains (horizontal / vertical)
+        f = np.array([-k_xy * vel[0], -k_xy * vel[1], g - k_z * vel[2]])
+        f[2] = max(f[2], 0.5 * g)  # never command near-zero / downward thrust
+        zb = f / np.linalg.norm(f)
+        psi = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])  # hold current heading
+        x_c = np.array([np.cos(psi), np.sin(psi), 0.0])
+        y_b = np.cross(zb, x_c)
+        y_b /= np.linalg.norm(y_b)
+        x_b = np.cross(y_b, zb)
+        roll, pitch, _ = R.from_matrix(np.column_stack((x_b, y_b, zb))).as_euler("xyz")
+        thrust = float(
+            np.clip(
+                mass * float(np.linalg.norm(f)),
+                self.drone_params["thrust_min"] * 4,
+                self.drone_params["thrust_max"] * 4,
+            )
+        )
+        roll = float(np.clip(roll, -0.7, 0.7))
+        pitch = float(np.clip(pitch, -0.7, 0.7))
+        return np.array([roll, pitch, psi, thrust])
 
     def step_callback(
         self,
