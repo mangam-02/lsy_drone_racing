@@ -315,6 +315,8 @@ def evaluate(
     # Percentages are over the runs actually completed (n_done), not the requested n_runs, so an
     # interrupted batch still reports correct rates.
     summary = _summarize(results, n_gates, n_done)
+    summary["config"] = config  # so the printed summary states which level/track it was
+    summary["seed"] = seed  # so the summary records which seed set the scenario sequence
     _print_summary(summary, n_gates, n_done)
     return summary
 
@@ -347,7 +349,12 @@ def _bar(frac: float, width: int = 20) -> str:
 def _print_summary(s: dict, n_gates: int, n_runs: int):
     pct = lambda c: 100.0 * c / n_runs  # noqa: E731
     print("\n" + "=" * 60)
-    print(f" EVALUATION SUMMARY  ({n_runs} runs)")
+    cfg = s.get("config")
+    seed = s.get("seed")
+    head = f" EVALUATION SUMMARY  ({n_runs} runs"
+    head += f", {cfg}" if cfg else ""
+    head += f", seed={seed}" if seed is not None else ", seed=random"
+    print(head + ")")
     print("=" * 60)
     print(f" Success (all {n_gates} gates): {s['success']:3d}  ({pct(s['success']):5.1f}%)")
     print(f" Avg gates passed:            {s['avg_gates_passed']:.2f} / {n_gates}")

@@ -167,6 +167,8 @@ def create_mpcc_ocp_solver(
     atheta_max: float = 6.0,
     n_caps: int = 0,
     capsule_penalty: float = 5000.0,
+    ground_soft_z: float = 0.0,
+    ground_penalty: float = 0.0,
     time_steps: np.ndarray | None = None,
     verbose: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
@@ -237,10 +239,18 @@ def create_mpcc_ocp_solver(
     # adding hard constraints, so the QP never goes infeasible and the gate opening stays free.
     y_obs = _capsule_barrier(p[n_head:], pos, n_caps)
 
+    # Ground-clearance soft penalty: one-sided residual max(0, ground_soft_z - z), weighted
+    # ground_penalty. Penalises altitude below ground_soft_z (zero above), so the optimiser climbs
+    # off the floor while accelerating toward the first gate instead of sinking into it. Appended
+    # LAST so the weight layout is [weight_diagonals(...), ground_penalty].
+    r_ground = ca.fmax(0.0, ground_soft_z - pos[2])
+
     # Nonlinear least-squares residual (nonlinear in theta now; acados' Gauss-Newton SQP
     # re-linearises the path each iteration).
-    y = ca.vertcat(e_c, e_l, rpy, drpy, e_v, rpy_cmd, thrust - hover_thrust, a_theta, y_obs)
-    y_e = ca.vertcat(e_c, e_l, rpy, drpy, e_v, y_obs)
+    y = ca.vertcat(
+        e_c, e_l, rpy, drpy, e_v, rpy_cmd, thrust - hover_thrust, a_theta, y_obs, r_ground
+    )
+    y_e = ca.vertcat(e_c, e_l, rpy, drpy, e_v, y_obs, r_ground)
     ocp.model.cost_y_expr = y
     ocp.model.cost_y_expr_e = y_e
     ocp.cost.cost_type = "NONLINEAR_LS"
@@ -262,6 +272,9 @@ def create_mpcc_ocp_solver(
     w_stage, w_term = wp.weight_diagonals(
         np.ones(wp.N_ACTIONS), BASELINE_WEIGHTS, n_caps, capsule_penalty
     )
+    # Append the ground-clearance residual weight last (matches the y / y_e ordering above).
+    w_stage = np.append(w_stage, ground_penalty)
+    w_term = np.append(w_term, ground_penalty)
     W = np.diag(w_stage)
     W_e = np.diag(w_term)
     ocp.cost.W = W
@@ -345,6 +358,8 @@ def create_mpcc_ocp_solver(
             "atheta_max": atheta_max,
             "n_caps": n_caps,
             "capsule_penalty": capsule_penalty,
+            "ground_soft_z": ground_soft_z,
+            "ground_penalty": ground_penalty,
             "time_steps": None if time_steps is None else np.asarray(time_steps, float),
             "parameters": parameters,
             # Baseline weights are a module constant, not in this function's source, so the source
@@ -597,7 +612,12 @@ class SimplePlanner:
             # a pole on the approach/departure line otherwise forces a contorted swerve. The exit
             # uses a LARGER floor so the drone still crosses the gate plane (completes the pass).
             entry = self._clear_waypoint(
-                center, -x_axis, self.APPROACH_DIST, obstacles_xy, self.GATE_WP_MIN_DIST
+                center,
+                -x_axis,
+                self.APPROACH_DIST,
+                obstacles_xy,
+                self.GATE_WP_MIN_DIST,
+                check_approach=True,
             )
             exit_ = self._clear_waypoint(
                 center, x_axis, self.DEPART_DIST, obstacles_xy, self.GATE_EXIT_MIN_DIST
@@ -613,6 +633,7 @@ class SimplePlanner:
         base_dist: float,
         obstacles_xy: list,
         min_dist: float,
+        check_approach: bool = False,
     ) -> np.ndarray:
         """Entry/exit waypoint at ``center + axis*base_dist``, kept clear of every obstacle pole.
 
@@ -624,9 +645,18 @@ class SimplePlanner:
         add a small perpendicular nudge, capped at ``GATE_WP_MAX_SHIFT`` so the waypoint stays well
         inside the opening. Falls back to the shortened point if nothing clears (the MPCC capsule
         avoidance is the backstop).
+
+        With ``check_approach`` (entry only), clearance is tested against the whole committed
+        approach LINE ``waypoint → center`` instead of just the waypoint point: a pole sitting on
+        the approach line but slightly outside the entry point's own keep-out previously left the
+        entry unmoved (the path still grazed the pole — only MPCC caught it). Checking the segment
+        lets the shorten/nudge actually push the entry aside. The free intermediates handle the
+        path BEFORE the entry, so only the entry→center stretch needs this.
         """
 
         def clear(p: np.ndarray) -> bool:
+            if check_approach:
+                return self._segment_clear(p, center, obstacles_xy)
             return all(
                 np.hypot(p[0] - ox, p[1] - oy) >= self.PLAN_CLEARANCE for ox, oy in obstacles_xy
             )
@@ -647,6 +677,21 @@ class SimplePlanner:
                 if clear(q):
                     return q
         return p
+
+    def _segment_clear(self, a: np.ndarray, b: np.ndarray, obstacles_xy: list) -> bool:
+        """True if every pole stays ≥ ``PLAN_CLEARANCE`` from the xy segment ``a``–``b``."""
+        ax, ay, bx, by = a[0], a[1], b[0], b[1]
+        dx, dy = bx - ax, by - ay
+        denom = dx * dx + dy * dy
+        for ox, oy in obstacles_xy:
+            if denom < 1e-12:
+                dist = np.hypot(ox - ax, oy - ay)
+            else:
+                t = min(1.0, max(0.0, ((ox - ax) * dx + (oy - ay) * dy) / denom))
+                dist = np.hypot(ox - (ax + t * dx), oy - (ay + t * dy))
+            if dist < self.PLAN_CLEARANCE:
+                return False
+        return True
 
     def _segment_starts(self, drone_pos: np.ndarray, gate_data: list[tuple]) -> list:
         return [drone_pos] + [gd[3] for gd in gate_data[:-1]]
@@ -882,6 +927,15 @@ class MPCCController(Controller):
     """MPCC controller: contouring control along the warm-started SimplePlanner path."""
 
     GROUND_Z = 0.0
+    #: Ground-clearance soft penalty (added to the MPCC cost): the drone starts on the ground
+    #: (z ≈ 0.01) and, if nothing discourages it, tilts to chase the mostly-horizontal first path
+    #: segment, trading away vertical thrust → it sinks into the floor before climbing (the
+    #: "ground" crashes at the start). A one-sided residual max(0, GROUND_SOFT_Z − z) penalises any
+    #: altitude below GROUND_SOFT_Z (zero above), so the optimiser climbs off the ground WHILE
+    #: accelerating toward gate 0 — no separate takeoff phase, no wasted seconds. Also keeps a floor
+    #: margin everywhere. Gates sit at 0.7/1.2 m (above GROUND_SOFT_Z), so it never fights a gate.
+    GROUND_SOFT_Z = 0.35  # m — altitude below which the penalty engages
+    GROUND_PENALTY = 400.0  # weight of the ground-clearance residual (higher = climbs harder)
     V_TARGET = 4  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 6  # m/s — hard-ish cap on progress speed
     #: Curvature speed limit: cap the progress target by the path curvature so the drone slows
@@ -901,6 +955,15 @@ class MPCCController(Controller):
     #: Averaging kappa over a window the size of a REAL corner (~0.4 m) kills that high-frequency
     #: noise while keeping genuine turns. 0 disables smoothing. Raise if straights still crawl.
     CURVE_SMOOTH_M = 0.7
+    #: Near-gate contouring boost. The drone tends to drift off the path LATERALLY right at a gate
+    #: (a contouring error) and clip the frame. For shooting nodes whose progress θ sits within
+    #: GATE_TRACK_RADIUS arc length of a gate centre, the per-stage contouring weight q_c is
+    #: multiplied by GATE_TRACK_BOOST, pulling the prediction tightly onto the gate-centred line
+    #: exactly where precision matters — while straights keep the loose, fast baseline weighting.
+    #: Applied every tick on top of whatever weights are active (baseline or RL-scaled q_c).
+    USE_GATE_TRACK_BOOST = False  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
+    GATE_TRACK_BOOST = 4.0  # × q_c near a gate centre
+    GATE_TRACK_RADIUS = 0.5  # m — arc-length half-window around each gate centre
     #: Distance (m) from the path end within which the controller switches to end-hover:
     #: it freezes every stage's progress at theta=length and sets the target progress speed
     #: to 0, so contouring+lag pull the drone onto the final path point and v_theta decays to
@@ -981,6 +1044,13 @@ class MPCCController(Controller):
     #: Print a rolling per-tick timing breakdown (project / set-params / solve) every 50
     #: ticks, to find what eats the 20 ms control budget. Off by default.
     PROFILE = False
+    #: Debug the "suddenly too fast" spike: print a one-line snapshot whenever the drone's actual
+    #: speed exceeds DEBUG_SPIKE_FACTOR × v_target. Shows v_target, the progress speed v_theta, the
+    #: lag (drone ahead of its reference point), target_gate and ticks since the last re-localise —
+    #: so we can see whether the over-speed is a lag-driven sprint after a relocalise. Off by
+    #: default.
+    DEBUG_SPIKE = False
+    DEBUG_SPIKE_FACTOR = 1.3
 
     #: RL weight planner (third layer): adapt the MPCC cost weights per tick from the drone
     #: state via a trained policy (mpcc_weight_policy). Off by default → exact baseline weights.
@@ -1034,10 +1104,20 @@ class MPCCController(Controller):
             vtheta_max=self.VTHETA_MAX,
             n_caps=self._n_caps,
             capsule_penalty=self.CAPSULE_PENALTY,
+            ground_soft_z=self.GROUND_SOFT_Z,
+            ground_penalty=self.GROUND_PENALTY,
             time_steps=self._time_steps if self.HORIZON_GROWTH != 1.0 else None,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
+
+        # Baseline cost diagonals the solver was built with (multipliers = 1, ground weight
+        # appended last). Used as the static base for the near-gate q_c boost on the no-RL path.
+        w_s, w_t = wp.weight_diagonals(
+            np.ones(wp.N_ACTIONS), BASELINE_WEIGHTS, self._n_caps, self.CAPSULE_PENALTY
+        )
+        self._w_stage_base = np.append(w_s, self.GROUND_PENALTY)
+        self._w_term_base = np.append(w_t, self.GROUND_PENALTY)
 
         # Background replanning (never stalls the 50 Hz loop).
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -1074,6 +1154,16 @@ class MPCCController(Controller):
         self._snapshot_objects(obs)
         self._replan_future = None
 
+        # Near-gate contouring boost: live per-node q_c factor currently pushed to the solver.
+        # The reused solver may still carry the previous episode's boosts, so re-base every stage
+        # and clear the tracker (skipped under RL, which rebuilds every node's W each tick anyway).
+        self._boost_applied: dict[int, float] = {}
+        if self.USE_GATE_TRACK_BOOST and not self.USE_RL_WEIGHTS:
+            W_s, W_t = np.diag(self._w_stage_base), np.diag(self._w_term_base)
+            for k in range(self._N):
+                self._solver.cost_set(k, "W", W_s)
+            self._solver.cost_set(self._N, "W", W_t)
+
         self._theta_pred = None  # last solve's per-stage theta (warm start for relinearisation)
         self._pos_pred = None  # last solve's per-stage positions (keep-out linearisation point)
         self._x_pred = None  # last solve's full state trajectory (N+1, nx) — primal warm start
@@ -1085,6 +1175,7 @@ class MPCCController(Controller):
         self._theta_est = None  # last tick's progress θ; constrains the projection (no jumps)
         self._progress_point = None  # drone's current projection on the path (render marker)
         self._external_mult = None
+        self._ticks_since_reloc = 0  # ticks since the last re-localise (DEBUG_SPIKE context)
 
         # Gate-retry recovery state (see USE_GATE_RETRY).
         self._stuck_ticks = 0  # consecutive stalled ticks at the current (unpassed) gate
@@ -1276,6 +1367,52 @@ class MPCCController(Controller):
         th[0] = theta0  # re-anchor to where the drone actually is
         return np.maximum.accumulate(th)  # keep monotonic
 
+    def _gate_track_boosts(self, thetas: np.ndarray) -> np.ndarray:
+        """Per-stage contouring (q_c) multiplier: GATE_TRACK_BOOST near a gate centre, else 1.0."""
+        gt = getattr(self.planner, "gate_thetas", None)
+        if not self.USE_GATE_TRACK_BOOST or gt is None:
+            return np.ones(self._N + 1)
+        gt = np.asarray(gt, dtype=float)
+        dist = np.abs(thetas[:, None] - gt[None, :]).min(axis=1)
+        return np.where(dist <= self.GATE_TRACK_RADIUS, self.GATE_TRACK_BOOST, 1.0)
+
+    @staticmethod
+    def _boosted_diag(w: np.ndarray, factor: float) -> np.ndarray:
+        """Diagonal cost matrix from ``w`` with the contouring entries (q_c, diag 0..2) scaled."""
+        if factor == 1.0:
+            return np.diag(w)
+        w = w.copy()
+        w[:3] *= factor
+        return np.diag(w)
+
+    def _apply_stage_weights(
+        self, thetas: np.ndarray, w_stage: np.ndarray, w_term: np.ndarray, rl_active: bool
+    ) -> None:
+        """Push the per-stage cost weights to the solver, with the near-gate contouring boost.
+
+        ``w_stage``/``w_term`` are the active baseline (or RL-scaled) diagonals. Nodes whose
+        progress θ sits within ``GATE_TRACK_RADIUS`` of a gate centre get their q_c entries scaled
+        by ``GATE_TRACK_BOOST`` (see :data:`USE_GATE_TRACK_BOOST`). When RL is on, W is rebuilt for
+        every node each tick anyway, so all nodes are set. With RL off the base W is static in the
+        solver, so only nodes whose boost CHANGED since last tick are touched (straights stay
+        free); ``self._boost_applied`` tracks the live per-node factor.
+        """
+        boosts = self._gate_track_boosts(thetas)
+        if rl_active:
+            for k in range(self._N):
+                self._solver.cost_set(k, "W", self._boosted_diag(w_stage, boosts[k]))
+            self._solver.cost_set(self._N, "W", self._boosted_diag(w_term, boosts[self._N]))
+            return
+        for k in range(self._N + 1):
+            if boosts[k] == self._boost_applied.get(k, 1.0):
+                continue
+            base = w_stage if k < self._N else w_term
+            self._solver.cost_set(k, "W", self._boosted_diag(base, boosts[k]))
+            if boosts[k] == 1.0:
+                self._boost_applied.pop(k, None)
+            else:
+                self._boost_applied[k] = float(boosts[k])
+
     def _shift_warm_start(self) -> None:
         """Receding-horizon primal warm start.
 
@@ -1383,6 +1520,7 @@ class MPCCController(Controller):
         # — all signalled by _theta_pred having been cleared. The projection is window-
         # constrained around the last θ so it can never snap onto an earlier/later branch.
         relocalize = self._theta_pred is None or self._x_pred is None
+        self._ticks_since_reloc = 0 if relocalize else self._ticks_since_reloc + 1
         if relocalize:
             theta0 = self.planner.project_to_theta(
                 obs["pos"], obs["vel"], theta_prev=self._theta_est
@@ -1442,9 +1580,10 @@ class MPCCController(Controller):
 
         # Per-tick cost weights = baseline × multipliers. Multipliers come from the RL weight
         # planner (trainer override or internal policy) when it's on, else identity (an exact
-        # no-op: weight_diagonals rebuilds the same W layout the solver was built with). W is only
-        # re-set when RL is on, so the no-RL path stays as cheap as before; acados updates W in
-        # place.
+        # no-op: weight_diagonals rebuilds the same W layout the solver was built with). The
+        # near-gate q_c boost (_apply_stage_weights) then tightens contouring around each gate; on
+        # the no-RL path it only touches the few nodes near a gate, so straights stay as cheap as
+        # before. acados updates W in place.
         if self.USE_RL_WEIGHTS:
             if self._external_mult is not None:
                 mult = self._external_mult.copy()
@@ -1455,10 +1594,12 @@ class MPCCController(Controller):
             w_stage, w_term = wp.weight_diagonals(
                 mult, BASELINE_WEIGHTS, self._n_caps, self.CAPSULE_PENALTY
             )
-            W_stage, W_term = np.diag(w_stage), np.diag(w_term)
-            for k in range(self._N):
-                self._solver.cost_set(k, "W", W_stage)
-            self._solver.cost_set(self._N, "W", W_term)
+            # Append the ground-clearance weight — same layout the solver was built with.
+            w_stage = np.append(w_stage, self.GROUND_PENALTY)
+            w_term = np.append(w_term, self.GROUND_PENALTY)
+        else:
+            w_stage, w_term = self._w_stage_base, self._w_term_base
+        self._apply_stage_weights(thetas, w_stage, w_term, self.USE_RL_WEIGHTS)
         t_setp = time.perf_counter()
 
         # SQP_RTI solve: phase 1 prepares (linearise + condense the QP at the warm-started
@@ -1474,6 +1615,14 @@ class MPCCController(Controller):
             status = self._solver.solve()
         if self.PROFILE:
             self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
+        if self.DEBUG_SPIKE:
+            speed = float(np.linalg.norm(obs["vel"]))
+            if speed > self.DEBUG_SPIKE_FACTOR * max(v_target, 1e-3):
+                print(
+                    f"[MPCC spike] speed={speed:.2f} v_target={v_target:.2f} "
+                    f"vtheta0={vtheta0:.2f} theta0={theta0:.2f} gate={int(obs['target_gate'])} "
+                    f"reloc={relocalize} dt_reloc={self._ticks_since_reloc} status={status}"
+                )
         self.last_solve_ok = status == 0
         if status == 0:
             xs = np.array([self._solver.get(k, "x") for k in range(self._N + 1)])
