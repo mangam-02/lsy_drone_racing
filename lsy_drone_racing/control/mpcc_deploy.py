@@ -283,8 +283,8 @@ def create_mpcc_ocp_solver(
     ocp.cost.yref_e = np.zeros(y_e.rows())
 
     # State bounds: z floor/ceiling (2), rpy (3,4,5), vel (6,7,8), v_theta (13: 0..vtheta).
-    ocp.constraints.lbx = np.array([z_min, -0.7, -0.7, -0.7, -v_max, -v_max, -v_max, 0.0])
-    ocp.constraints.ubx = np.array([z_max, 0.7, 0.7, 0.7, v_max, v_max, v_max, vtheta_max])
+    ocp.constraints.lbx = np.array([z_min, -0.6, -0.6, -0.6, -v_max, -v_max, -v_max, 0.0])
+    ocp.constraints.ubx = np.array([z_max, 0.6, 0.6, 0.6, v_max, v_max, v_max, vtheta_max])
     ocp.constraints.idxbx = np.array([2, 3, 4, 5, 6, 7, 8, 13])
     # Soften the velocity and v_theta bounds so a transient overspeed never makes the QP
     # infeasible (positions 4,5,6,7 within idxbx → vel x/y/z and v_theta).
@@ -297,8 +297,8 @@ def create_mpcc_ocp_solver(
     ocp.cost.Zu = 1e3 * np.ones(4)
 
     # Input bounds: rpy commands, collective thrust, progress acceleration.
-    ocp.constraints.lbu = np.array([-0.7, -0.7, -0.7, parameters["thrust_min"] * 4, -atheta_max])
-    ocp.constraints.ubu = np.array([0.7, 0.7, 0.7, parameters["thrust_max"] * 4, atheta_max])
+    ocp.constraints.lbu = np.array([-0.6, -0.6, -0.6, parameters["thrust_min"] * 4, -atheta_max])
+    ocp.constraints.ubu = np.array([0.6, 0.6, 0.6, parameters["thrust_max"] * 4, atheta_max])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
@@ -405,7 +405,7 @@ class SimplePlanner:
     optimiser (identical waypoint structure across replans ⇒ direct reuse).
     """
 
-    TARGET_SPEED = 3  # m/s — cruise speed of the velocity profile
+    TARGET_SPEED = 2  # m/s — cruise speed of the velocity profile
     V_EDGE = 0.6  # m/s — speed at trajectory start/end
     ACCEL_DIST = 0.8  # m — ramp-up arc length
     DECEL_DIST = 0.8  # m — ramp-down arc length
@@ -936,7 +936,7 @@ class MPCCController(Controller):
     #: margin everywhere. Gates sit at 0.7/1.2 m (above GROUND_SOFT_Z), so it never fights a gate.
     GROUND_SOFT_Z = 0.35  # m — altitude below which the penalty engages
     GROUND_PENALTY = 400.0  # weight of the ground-clearance residual (higher = climbs harder)
-    V_TARGET = 4  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
+    V_TARGET = 2  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 6  # m/s — hard-ish cap on progress speed
     #: Per-axis velocity state bound (vel x/y/z) the solver is built with — the real cap on how
     #: fast the drone may fly (softened, so a transient overspeed only costs slack, never QP
