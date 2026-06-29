@@ -974,7 +974,7 @@ class MPCCController(Controller):
     #: pose. This matters most for the gate currently being approached: until the drone is close
     #: enough to measure it, the planned path through it may be off, so the controller creeps in
     #: and only resumes cruise once the true pose is known (which also triggers a replan onto the
-    #: corrected path). Implemented by scaling the progress target v_target toward
+    #: corrected path). Implemented by scaling the progress target v_target toward.
     #: CAUTION_SPEED_FACTOR as the drone closes within CAUTION_RADIUS of such an object.
     USE_CAUTION = True
     CAUTION_SPEED_FACTOR = 0.5  # fraction of V_TARGET when right at an unmeasured object
