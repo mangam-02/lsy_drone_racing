@@ -1163,15 +1163,9 @@ class MPCCController(Controller):
         self._snapshot_objects(obs)
         self._replan_future = None
 
-        # Near-gate contouring boost: live per-node q_c factor currently pushed to the solver.
-        # The reused solver may still carry the previous episode's boosts, so re-base every stage
-        # and clear the tracker (skipped under RL, which rebuilds every node's W each tick anyway).
-        self._boost_applied: dict[int, float] = {}
-        if self.USE_GATE_TRACK_BOOST and not self.USE_RL_WEIGHTS:
-            W_s, W_t = np.diag(self._w_stage_base), np.diag(self._w_term_base)
-            for k in range(self._N):
-                self._solver.cost_set(k, "W", W_s)
-            self._solver.cost_set(self._N, "W", W_t)
+        # Near-gate contouring boost: re-base every stage's weight and clear the boost tracker so a
+        # reused solver doesn't carry the previous episode's boosts (no-op under RL).
+        self._rebase_stage_weights()
 
         self._theta_pred = None  # last solve's per-stage theta (warm start for relinearisation)
         self._pos_pred = None  # last solve's per-stage positions (keep-out linearisation point)
@@ -1450,6 +1444,25 @@ class MPCCController(Controller):
             self._solver.set(k, "u", ug[min(k + 1, self._N - 1)])
         self._solver.set(self._N, "x", xg[self._N])
 
+    def _rebase_stage_weights(self) -> None:
+        """Write the static baseline cost weight W back onto every node and clear the boost tracker.
+
+        Used after a fresh start of the solver (episode reset, or ``solver.reset()`` on a
+        re-localise), where the per-node W in the solver may be stale or cleared. The no-RL
+        near-gate q_c boost path (:meth:`_apply_stage_weights`) updates W *incrementally* — it
+        assumes the baseline already sits on every non-boosted node and tracks the live boosts in
+        ``_boost_applied``. So after a reset we must (1) rewrite the baseline W onto every node and
+        (2) clear ``_boost_applied``, or the tracker desyncs and non-boosted nodes are left without
+        weights. No-op under RL, which rebuilds every node's W from scratch each tick anyway.
+        """
+        self._boost_applied: dict[int, float] = {}
+        if self.USE_RL_WEIGHTS:
+            return
+        W_s, W_t = np.diag(self._w_stage_base), np.diag(self._w_term_base)
+        for k in range(self._N):
+            self._solver.cost_set(k, "W", W_s)
+        self._solver.cost_set(self._N, "W", W_t)
+
     def _seed_warm_start(self, x0: np.ndarray) -> None:
         """Consistent cold-start primal guess: every node = the current augmented state ``x0``.
 
@@ -1580,6 +1593,14 @@ class MPCCController(Controller):
         # consistent cold start (every node = x0) instead of inheriting acados' stale old-path
         # iterate — the latter mismatches the freshly set path cubics and drove HPIPM to NaN.
         if relocalize:
+            # Wipe acados' internal iterate (primal AND dual / HPIPM QP memory) before seeding a
+            # fresh cold start. _seed_warm_start only overwrites the primal node states, but the
+            # stale dual variables from the old-path solve can still drive HPIPM to NaN after a
+            # replan (the persistent solve failures → coast-into-wall). reset() also drops the
+            # per-node cost weights, so _rebase_stage_weights writes the baseline W back and resets
+            # the boost tracker (no-op under RL) — keeping it compatible with USE_GATE_TRACK_BOOST.
+            self._solver.reset()
+            self._rebase_stage_weights()
             self._seed_warm_start(x0)
         else:
             self._shift_warm_start()
