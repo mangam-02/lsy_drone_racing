@@ -936,7 +936,7 @@ class MPCCController(Controller):
     #: margin everywhere. Gates sit at 0.7/1.2 m (above GROUND_SOFT_Z), so it never fights a gate.
     GROUND_SOFT_Z = 0.35  # m — altitude below which the penalty engages
     GROUND_PENALTY = 400.0  # weight of the ground-clearance residual (higher = climbs harder)
-    V_TARGET = 3.5  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
+    V_TARGET = 2.5  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 6  # m/s — hard-ish cap on progress speed
     #: Curvature speed limit: cap the progress target by the path curvature so the drone slows
     #: through sharp turns (e.g. the ~180° reversal at a gate exit) and cruises on straights,
