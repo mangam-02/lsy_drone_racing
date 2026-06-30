@@ -952,7 +952,7 @@ class MPCCController(Controller):
     #: arc-length LOOKAHEAD ahead of the drone so braking starts BEFORE the curve. The MPCC tracks
     #: its own v_target (not the planner's speed profile), so this must cap v_target here to bite.
     USE_CURVATURE_SPEED = True
-    MAX_LAT_ACC = 20.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
+    MAX_LAT_ACC = 28.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
     CURVE_MIN_SPEED = 0.8  # m/s — floor so a very tight turn never stalls progress
     CURVE_LOOKAHEAD = 1.5  # m — arc length ahead scanned for the tightest upcoming curvature
     #: Arc-length window (m) over which the path curvature is smoothed before forming v_cap. The
