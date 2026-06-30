@@ -1219,6 +1219,15 @@ class MPCCController(Controller):
                 # re-localises by projecting onto the fresh path on the next tick (#2).
                 self._theta_pred = None
                 self._pos_pred = None
+                # The primal warm start carries the OLD path's progress state θ in column 12 of
+                # every node; on the new path those θ values are meaningless. Seeding the solver
+                # with them (via _shift_warm_start) starts the SQP from an iterate whose θ-state and
+                # the freshly set per-node path cubic disagree, so the prediction (the blue marker)
+                # shoots off the line right after a replan — most visibly where the new path jumps
+                # (e.g. a sudden climb). Clear them too so the next tick re-localises from a clean
+                # warm start and the RTI_BUMP_ITERS burst re-converges within the tick.
+                self._x_pred = None
+                self._u_pred = None
 
             except Exception as exc:
                 print(f"[MPCC] background replan failed: {exc!r}")
@@ -1634,8 +1643,16 @@ class MPCCController(Controller):
             self._last_u = self._solver.get(0, "u")[:4]  # drop a_theta
             self._consec_fail = 0
             return self._last_u
+        # Solve failed: instead of dead-holding the single last command (which lets the drone
+        # coast off the line), replay the NEXT input from the last good MPCC prediction — node
+        # _consec_fail of the previous optimal trajectory, i.e. exactly the step the controller had
+        # already planned to take next. This keeps executing the intended path for the few ticks the
+        # solver needs to recover, instead of hovering. Falls back to the braking command when there
+        # is no usable prediction (e.g. a failure on the first tick after a replan cleared _u_pred).
         self._consec_fail += 1
-        if self._last_u is not None and self._consec_fail <= self.MAX_HOLD_TICKS:
+        if self._u_pred is not None and self._consec_fail <= self.MAX_HOLD_TICKS:
+            idx = min(self._consec_fail, self._N - 1)
+            self._last_u = self._u_pred[idx][:4]
             return self._last_u
         print(f"[MPCC] solve failed (status={status}) at theta={theta0:.2f}; braking to hover")
         return self._safe_fallback_cmd(obs)
