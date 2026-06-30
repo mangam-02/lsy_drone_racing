@@ -283,8 +283,8 @@ def create_mpcc_ocp_solver(
     ocp.cost.yref_e = np.zeros(y_e.rows())
 
     # State bounds: z floor/ceiling (2), rpy (3,4,5), vel (6,7,8), v_theta (13: 0..vtheta).
-    ocp.constraints.lbx = np.array([z_min, -0.7, -0.7, -0.7, -v_max, -v_max, -v_max, 0.0])
-    ocp.constraints.ubx = np.array([z_max, 0.7, 0.7, 0.7, v_max, v_max, v_max, vtheta_max])
+    ocp.constraints.lbx = np.array([z_min, -0.6, -0.6, -0.6, -v_max, -v_max, -v_max, 0.0])
+    ocp.constraints.ubx = np.array([z_max, 0.6, 0.6, 0.6, v_max, v_max, v_max, vtheta_max])
     ocp.constraints.idxbx = np.array([2, 3, 4, 5, 6, 7, 8, 13])
     # Soften the velocity and v_theta bounds so a transient overspeed never makes the QP
     # infeasible (positions 4,5,6,7 within idxbx → vel x/y/z and v_theta).
@@ -297,8 +297,8 @@ def create_mpcc_ocp_solver(
     ocp.cost.Zu = 1e3 * np.ones(4)
 
     # Input bounds: rpy commands, collective thrust, progress acceleration.
-    ocp.constraints.lbu = np.array([-0.7, -0.7, -0.7, parameters["thrust_min"] * 4, -atheta_max])
-    ocp.constraints.ubu = np.array([0.7, 0.7, 0.7, parameters["thrust_max"] * 4, atheta_max])
+    ocp.constraints.lbu = np.array([-0.6, -0.6, -0.6, parameters["thrust_min"] * 4, -atheta_max])
+    ocp.constraints.ubu = np.array([0.6, 0.6, 0.6, parameters["thrust_max"] * 4, atheta_max])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
