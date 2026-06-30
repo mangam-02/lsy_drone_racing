@@ -1441,6 +1441,24 @@ class MPCCController(Controller):
             self._solver.set(k, "u", ug[min(k + 1, self._N - 1)])
         self._solver.set(self._N, "x", xg[self._N])
 
+    def _seed_warm_start(self, x0: np.ndarray) -> None:
+        """Consistent cold-start primal guess: every node = the current augmented state ``x0``.
+
+        Used on a re-localise (first tick / episode reset / right after a replan installs a new
+        path), where there is no valid previous trajectory on the *current* path. After a replan
+        the receding-horizon shift is skipped (``_x_pred`` was cleared), so acados would otherwise
+        keep its internal iterate from the OLD path — whose progress state ``theta`` no longer
+        matches the freshly swapped per-node path cubics. That primal/parameter mismatch is what
+        drove HPIPM to NaN (QP status 3) right after a replan and sent the terminal prediction (the
+        blue marker) off the line. Overwriting every node with the self-consistent ``x0`` keeps the
+        QP well-conditioned; the ``RTI_BUMP_ITERS`` burst then rolls it out onto the new path.
+        """
+        u0 = np.array([0.0, 0.0, 0.0, self._hover_thrust, 0.0])
+        for k in range(self._N):
+            self._solver.set(k, "x", x0)
+            self._solver.set(k, "u", u0)
+        self._solver.set(self._N, "x", x0)
+
     def _caution_factor(self, obs: dict) -> float:
         """Speed scale in [CAUTION_SPEED_FACTOR, 1] based on nearby UNMEASURED objects.
 
@@ -1547,9 +1565,15 @@ class MPCCController(Controller):
         rpy = R.from_quat(obs["quat"]).as_euler("xyz")
         drpy = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
         x0 = np.concatenate((obs["pos"], rpy, obs["vel"], drpy, [theta0, vtheta0]))
-        # Receding-horizon warm start: reuse the previous solve's trajectory, shifted one
-        # node forward, as the initial guess (so SQP converges in a few iterations).
-        self._shift_warm_start()
+        # Warm start. On a normal tick: reuse the previous solve's trajectory shifted one node
+        # forward (SQP converges in a few iterations). On a re-localise (first tick / reset / right
+        # after a replan): there is no valid previous trajectory on the current path, so seed a
+        # consistent cold start (every node = x0) instead of inheriting acados' stale old-path
+        # iterate — the latter mismatches the freshly set path cubics and drove HPIPM to NaN.
+        if relocalize:
+            self._seed_warm_start(x0)
+        else:
+            self._shift_warm_start()
         self._solver.set(0, "lbx", x0)
         self._solver.set(0, "ubx", x0)
         t_proj = time.perf_counter()
