@@ -439,8 +439,24 @@ class SimplePlanner:
     OBSTACLE_BUFFER = 0.20  # m — extra safety gap to the pole surface
     PLAN_CLEARANCE = OBSTACLE_RADIUS + DRONE_RADIUS + OBSTACLE_BUFFER  # center-to-center
     GATE_FRAME_WEIGHT = 40.0  # cost weight: entering gate-frame material
-    CYL_WEIGHT = 20.0  # cost weight: violating obstacle clearance
-    DEVIATION_WEIGHT = 2.0  # cost weight: straying from the straight-line path
+    CYL_WEIGHT = 20.0  # cost weight: violating obstacle clearance (gentle buffer-zone shaping)
+    #: Steep inner-core barrier weight. The gentle CYL_WEIGHT penalty is quadratic and FINITE, so
+    #: once CURVE_WEIGHT rewards straightening a corner the optimiser can "pay it off" and route the
+    #: racing line straight THROUGH a pole. This term penalises penetration of the actual collision
+    #: body only (pole radius + drone radius, NO buffer), so it never widens the line in the buffer
+    #: zone (keeps the gate-2 reversal from contorting) but makes planning through a pole hugely
+    #: expensive → the line rounds it instead.
+    CYL_CORE_WEIGHT = 5000.0
+    DEVIATION_WEIGHT = 0.5  # cost weight: straying from the warm-start anchor (regulariser)
+    #: Minimum-curvature (racing-line) weight. Penalises the integrated squared path curvature
+    #: ∫κ²ds over the sampled spline, so the free intermediate waypoints bow OUT to round sharp
+    #: corners (esp. the gate-2 reversal) instead of hugging the tight centreline. Lower curvature
+    #: → the controller's curvature speed cap v_cap=√(MAX_LAT_ACC/κ) permits more speed AND the
+    #: wider arc clears the frame — faster and safer at once. Gate entry/centre/exit stay fixed
+    #: high-weight FIT points, so widening the line never moves the gate crossing. DEVIATION_WEIGHT
+    #: was lowered (2.0 → 0.5) so this term isn't fought by the straight-line pull. 0 → old
+    #: centreline behaviour; raise for a wider/smoother line, too high bows into other obstacles.
+    CURVE_WEIGHT = 5
     N_INTERMEDIATE = 4  # free waypoints per inter-gate segment
     N_SAMPLE = 100  # samples along the curve for the cost
     OPT_MAXITER = 200  # max L-BFGS-B iterations
@@ -774,19 +790,35 @@ class SimplePlanner:
         return pts
 
     def _trajectory_cost(self, raw: list[tuple], cyl_tuples: list, frames: list) -> float:
-        """Obstacle (cylinder) + gate-frame penalty along the sampled spline."""
+        """Obstacle (cylinder) + gate-frame + path-curvature penalty along the sampled spline."""
         try:
             tck = self._fit(raw)
-            x, y, z = splev(np.linspace(0.0, 1.0, self.N_SAMPLE), tck)
-            traj = np.stack([x, y, z], axis=1)
+            u = np.linspace(0.0, 1.0, self.N_SAMPLE)
+            traj = np.stack(splev(u, tck), axis=1)
+            d1 = np.stack(splev(u, tck, der=1), axis=1)
+            d2 = np.stack(splev(u, tck, der=2), axis=1)
         except Exception:
             return 1e6
         cost = 0.0
+        core = self.OBSTACLE_RADIUS + self.DRONE_RADIUS  # physical collision radius (no buffer)
         for cx, cy, r in cyl_tuples:
-            viol = np.maximum(0.0, r - np.linalg.norm(traj[:, :2] - np.array([cx, cy]), axis=1))
+            dist = np.linalg.norm(traj[:, :2] - np.array([cx, cy]), axis=1)
+            viol = np.maximum(0.0, r - dist)
             cost += self.CYL_WEIGHT * float(np.sum(viol**2))
+            # Steep core barrier: routing the line through the actual pole+drone body must never
+            # be "paid off" by the curvature reward. Only bites inside the collision radius.
+            pen = np.maximum(0.0, core - dist)
+            cost += self.CYL_CORE_WEIGHT * float(np.sum(pen**2))
         for fr in frames:
             cost += self.GATE_FRAME_WEIGHT * float(np.sum(fr.penetration(traj) ** 2))
+        if self.CURVE_WEIGHT > 0.0:
+            # Minimum-curvature (racing-line) term: integrate κ²·ds over the spline, with
+            # κ = |r'×r''| / |r'|³ and ds = |r'|·du. Penalising it widens sharp corners, which
+            # raises the controller's v_cap=√(MAX_LAT_ACC/κ) and clears the frame.
+            speed = np.linalg.norm(d1, axis=1)
+            kappa = np.linalg.norm(np.cross(d1, d2), axis=1) / np.clip(speed**3, 1e-9, None)
+            ds = speed / (self.N_SAMPLE - 1)
+            cost += self.CURVE_WEIGHT * float(np.sum(kappa**2 * ds))
         return cost
 
     # ── Spline fit + speed profile ────────────────────────────────────────────
@@ -952,7 +984,7 @@ class MPCCController(Controller):
     #: arc-length LOOKAHEAD ahead of the drone so braking starts BEFORE the curve. The MPCC tracks
     #: its own v_target (not the planner's speed profile), so this must cap v_target here to bite.
     USE_CURVATURE_SPEED = True
-    MAX_LAT_ACC = 20.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
+    MAX_LAT_ACC = 14.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
     CURVE_MIN_SPEED = 0.8  # m/s — floor so a very tight turn never stalls progress
     CURVE_LOOKAHEAD = 1.5  # m — arc length ahead scanned for the tightest upcoming curvature
     #: Arc-length window (m) over which the path curvature is smoothed before forming v_cap. The
@@ -984,13 +1016,23 @@ class MPCCController(Controller):
     #: corrected path). Implemented by scaling the progress target v_target toward.
     #: CAUTION_SPEED_FACTOR as the drone closes within CAUTION_RADIUS of such an object.
     USE_CAUTION = True
-    CAUTION_SPEED_FACTOR = 0.5  # fraction of V_TARGET when right at an unmeasured object
+    CAUTION_SPEED_FACTOR = 0.4  # fraction of V_TARGET when right at an unmeasured object
     #: xy-distance (m) within which an unmeasured object starts slowing us. MUST be larger than
     #: the env's sensor_range (the xy-distance at which the exact pose is revealed and the object
     #: becomes "visited" — 0.7 m in the level configs), otherwise the pose snaps to exact before
     #: caution ever engages and this has no effect. Set a bit above sensor_range so the approach
     #: is already slow when the true pose is revealed and the replan onto it kicks in.
-    CAUTION_RADIUS = 1.3  # m
+    CAUTION_RADIUS = 1.4  # m
+    #: Post-replan speed dip. When a replan installs the corrected path (true gate/obstacle pose
+    #: sensed within sensor_range), the gate entry/centre/exit waypoints jump → the embedded path
+    #: shifts under the drone → at cruise speed the MPCC can't track the discontinuity and the
+    #: drone strauchelt off the line into the frame/ground (the recurring LAST-gate failure). This
+    #: dips v_target to REPLAN_DIP_FACTOR right after a replan and ramps it linearly back to full
+    #: over REPLAN_DIP_TICKS, so the controller absorbs the path jump at low speed. Unlike caution
+    #: (a whole-lap radius tax) this only costs time the few times a replan actually fires.
+    USE_REPLAN_DIP = True
+    REPLAN_DIP_FACTOR = 0.5  # fraction of v_target on the tick a replan installs
+    REPLAN_DIP_TICKS = 12  # ticks to ramp back to full speed (~0.24 s @ 50 Hz)
     #: Gate-progress barrier: tie the MPCC progress state θ to the env's authoritative gate-pass
     #: detection. The env only increments target_gate once the drone has actually flown THROUGH
     #: the current gate's opening; until then θ is not allowed past (gate centre + GATE_PASS_LEAD).
@@ -1184,6 +1226,7 @@ class MPCCController(Controller):
         self._progress_point = None  # drone's current projection on the path (render marker)
         self._external_mult = None
         self._ticks_since_reloc = 0  # ticks since the last re-localise (DEBUG_SPIKE context)
+        self._ticks_since_replan = 10**9  # ticks since a replan installed a path (post-replan dip)
 
         # Gate-retry recovery state (see USE_GATE_RETRY).
         self._stuck_ticks = 0  # consecutive stalled ticks at the current (unpassed) gate
@@ -1227,6 +1270,7 @@ class MPCCController(Controller):
                 # re-localises by projecting onto the fresh path on the next tick (#2).
                 self._theta_pred = None
                 self._pos_pred = None
+                self._ticks_since_replan = 0  # arm the post-replan speed dip (path just jumped)
 
             except Exception as exc:
                 print(f"[MPCC] background replan failed: {exc!r}")
@@ -1440,6 +1484,19 @@ class MPCCController(Controller):
             self._solver.set(k, "u", ug[min(k + 1, self._N - 1)])
         self._solver.set(self._N, "x", xg[self._N])
 
+    def _replan_dip_factor(self) -> float:
+        """Speed scale in [REPLAN_DIP_FACTOR, 1] for the window right after a replan installs.
+
+        REPLAN_DIP_FACTOR on the tick the corrected path jumps in, ramping linearly back to 1 over
+        REPLAN_DIP_TICKS so the MPCC absorbs the path discontinuity at low speed before resuming
+        cruise. 1 (no dip) once the window has elapsed or the feature is off.
+        """
+        n = self._ticks_since_replan
+        if not self.USE_REPLAN_DIP or n >= self.REPLAN_DIP_TICKS:
+            return 1.0
+        frac = n / self.REPLAN_DIP_TICKS
+        return float(self.REPLAN_DIP_FACTOR + (1.0 - self.REPLAN_DIP_FACTOR) * frac)
+
     def _caution_factor(self, obs: dict) -> float:
         """Speed scale in [CAUTION_SPEED_FACTOR, 1] based on nearby UNMEASURED objects.
 
@@ -1529,6 +1586,7 @@ class MPCCController(Controller):
         # constrained around the last θ so it can never snap onto an earlier/later branch.
         relocalize = self._theta_pred is None or self._x_pred is None
         self._ticks_since_reloc = 0 if relocalize else self._ticks_since_reloc + 1
+        self._ticks_since_replan += 1  # advance the post-replan dip window
         if relocalize:
             theta0 = self.planner.project_to_theta(
                 obs["pos"], obs["vel"], theta_prev=self._theta_est
@@ -1577,7 +1635,7 @@ class MPCCController(Controller):
         else:
             brake = float(np.clip((theta_cap - theta0) / self.GATE_PASS_LEAD, 0.0, 1.0))
             v_cruise = self._curvature_speed_cap(theta0)  # slow into sharp turns, full on straights
-            v_target = v_cruise * self._caution_factor(obs) * brake
+            v_target = v_cruise * self._caution_factor(obs) * brake * self._replan_dip_factor()
             thetas = np.minimum(self._stage_thetas(theta0), theta_cap)
         caps = self._build_capsule_params(obs) if self._n_caps else None
         for k in range(self._N + 1):
