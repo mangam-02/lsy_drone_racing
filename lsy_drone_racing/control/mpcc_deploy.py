@@ -1016,6 +1016,19 @@ class MPCCController(Controller):
     RETRY_MAX = 3  # give up after this many retries on one gate (then let it hover → timeout)
     REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
     MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
+    #: Prediction-divergence safety net. The MPCC can occasionally return a "successful" (status 0)
+    #: solve whose predicted trajectory shoots off the planned path — the terminal "blue marker"
+    #: flies away. Executing such a command on real hardware risks slamming a gate frame. We measure
+    #: DIVERGENCE = how far the prediction strays from the path BEYOND the drone's current offset
+    #: (max node deviation − node-0 deviation), NOT absolute deviation. Node 0 is the drone's actual
+    #: (lbx-pinned) offset, which may legitimately be large after a disturbance — a correct recovery
+    #: solve STARTS there and converges back, so an absolute-deviation check would reject the very
+    #: solves that fly it home and leave it stuck braking/sinking off-path. When the divergence
+    #: exceeds MAX_PRED_DEV the solve is UNTRUSTED: not committed, not stored as a warm start; a
+    #: clean re-localise (solver.reset + reseed) is forced next tick to re-converge, and meanwhile
+    #: the controller replays the last TRUSTED plan / brakes. Off → no check.
+    USE_PRED_SAFETY = True
+    MAX_PRED_DEV = 1.5  # m — how far the prediction may stray PAST the current offset before reject
     #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
     #: episode reset), where the warm start is far from the new optimum. Normal ticks run 1.
     RTI_BUMP_ITERS = 5
@@ -1703,19 +1716,36 @@ class MPCCController(Controller):
         if status == 0:
             xs = np.array([self._solver.get(k, "x") for k in range(self._N + 1)])
             us = np.array([self._solver.get(k, "u") for k in range(self._N)])
-            self._theta_pred = xs[:, 12]
-            self._pos_pred = xs[:, 0:3]  # warm start for the next tick's keep-out linearisation
-            self._x_pred = xs  # full primal trajectory → shifted warm start next tick
-            self._u_pred = us
-            self._last_u = self._solver.get(0, "u")[:4]  # drop a_theta
-            self._consec_fail = 0
-            return self._last_u
-        # Solve failed: instead of dead-holding the single last command (which lets the drone
-        # coast off the line), replay the NEXT input from the last good MPCC prediction — node
-        # _consec_fail of the previous optimal trajectory, i.e. exactly the step the controller had
-        # already planned to take next. This keeps executing the intended path for the few ticks the
-        # solver needs to recover, instead of hovering. Falls back to the braking command when there
-        # is no usable prediction (e.g. a failure on the first tick after a replan cleared _u_pred).
+            # Prediction-divergence safety net (real-hardware guard): if the predicted trajectory
+            # has run far off the planned path (the blue marker flying away), DON'T commit it and
+            # DON'T warm-start from it — clear the warm-start caches so the next tick re-localises
+            # (solver.reset + reseed) and re-converges, and fall through to replay/brake. This stops
+            # the controller ever flying a divergent solution into a gate frame. _u_pred is kept
+            # as-is (the last TRUSTED plan) so the replay below continues that, not this solve.
+            if self.USE_PRED_SAFETY and self._pred_deviation(xs) > self.MAX_PRED_DEV:
+                self._theta_pred = None
+                self._pos_pred = None
+                self._x_pred = None
+                self.last_solve_ok = False
+                print(
+                    f"[MPCC] prediction diverged (>{self.MAX_PRED_DEV:.2f} m) at "
+                    f"theta={theta0:.2f}; rejecting solve and re-localising"
+                )
+            else:
+                self._theta_pred = xs[:, 12]
+                self._pos_pred = xs[:, 0:3]  # warm start for next tick's keep-out linearisation
+                self._x_pred = xs  # full primal trajectory → shifted warm start next tick
+                self._u_pred = us
+                self._last_u = self._solver.get(0, "u")[:4]  # drop a_theta
+                self._consec_fail = 0
+                return self._last_u
+        # Solve failed OR was rejected as divergent: instead of dead-holding the single last
+        # command (which lets the drone coast off the line), replay the NEXT input from the last
+        # TRUSTED MPCC prediction — node _consec_fail of that optimal trajectory, i.e. the step the
+        # controller had already planned to take next. This keeps executing the intended path for
+        # the few ticks the solver needs to recover, instead of hovering. Falls back to the braking
+        # command when there is no usable prediction (e.g. a failure on the first tick after a
+        # replan cleared _u_pred).
         self._consec_fail += 1
         if self._u_pred is not None and self._consec_fail <= self.MAX_HOLD_TICKS:
             idx = min(self._consec_fail, self._N - 1)
@@ -1723,6 +1753,22 @@ class MPCCController(Controller):
             return self._last_u
         print(f"[MPCC] solve failed (status={status}) at theta={theta0:.2f}; braking to hover")
         return self._safe_fallback_cmd(obs)
+
+    def _pred_deviation(self, xs: np.ndarray) -> float:
+        """How far the predicted trajectory strays from the path BEYOND the drone's current offset.
+
+        Per node, the distance to the path point at that node's own progress state θ (column 12).
+        Node 0 is the drone's current (lbx-pinned) offset from the path, which may legitimately be
+        large after a disturbance — a correct recovery solve STARTS there and converges back. So we
+        return the *growth* beyond that start offset (``dev.max() - dev[0]``): ~0 (or negative) for
+        a solve that tracks or flies home, large only when the prediction genuinely shoots off the
+        path (the blue marker flying away). Returning absolute deviation instead would reject every
+        solve whenever the drone is merely off-path — blocking the very recovery it needs (the
+        reject loop that left it braking/sinking off-track). Vectorised (one path_point_tangent).
+        """
+        p_path, _ = self.planner.path_point_tangent(xs[:, 12])
+        dev = np.linalg.norm(xs[:, 0:3] - p_path, axis=1)
+        return float(dev.max() - dev[0])
 
     def _profile_tick(self, proj: float, setp: float, solve: float) -> None:
         """Accumulate per-tick timings and print a rolling average every 50 ticks."""
