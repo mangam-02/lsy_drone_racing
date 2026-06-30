@@ -961,7 +961,7 @@ class MPCCController(Controller):
     #: multiplied by GATE_TRACK_BOOST, pulling the prediction tightly onto the gate-centred line
     #: exactly where precision matters — while straights keep the loose, fast baseline weighting.
     #: Applied every tick on top of whatever weights are active (baseline or RL-scaled q_c).
-    USE_GATE_TRACK_BOOST = False  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
+    USE_GATE_TRACK_BOOST = True  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
     GATE_TRACK_BOOST = 4.0  # × q_c near a gate centre
     GATE_TRACK_RADIUS = 0.5  # m — arc-length half-window around each gate centre
     #: Distance (m) from the path end within which the controller switches to end-hover:
