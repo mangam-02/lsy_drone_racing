@@ -338,6 +338,7 @@ def _summarize(results: list[dict], n_gates: int, n_runs: int) -> dict:
         "crash_by_object_type": dict(crash_obj_type),
         "crash_by_object": dict(crash_obj),
         "avg_success_time": float(np.mean(times)) if times else None,
+        "median_success_time": float(np.median(times)) if times else None,
         "avg_gates_passed": float(np.mean([r["gates_passed"] for r in results])),
     }
 
@@ -360,6 +361,7 @@ def _print_summary(s: dict, n_gates: int, n_runs: int):
     print(f" Avg gates passed:            {s['avg_gates_passed']:.2f} / {n_gates}")
     if s["avg_success_time"] is not None:
         print(f" Avg time (successful runs):  {s['avg_success_time']:.2f}s")
+        print(f" Median time (successful):    {s['median_success_time']:.2f}s")
 
     print("\n Gates-passed distribution:")
     for g in range(n_gates + 1):
