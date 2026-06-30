@@ -40,11 +40,75 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control import mpcc_weight_policy as wp
-from lsy_drone_racing.control.mpc_planner_controller import _Cylinder, _GateFrame
 from lsy_drone_racing.control.mpcc_weight_policy import WeightPolicy
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+
+# ── Obstacle / gate geometry (inlined so this controller is self-contained) ─────────────────
+# Formerly imported from mpc_planner_controller; copied here verbatim so mpcc_deploy.py no longer
+# depends on that module for the planner cost / render geometry.
+
+
+class _Cylinder:
+    """Vertical cylinder obstacle (pole)."""
+
+    def __init__(self, pos: np.ndarray, radius: float, height: float = 1.52):
+        self.xy = pos[:2].copy()
+        self.radius = radius
+        self.height = height
+
+    def contains(self, p: np.ndarray) -> bool:
+        return np.linalg.norm(p[:2] - self.xy) < self.radius and 0.0 <= p[2] <= self.height
+
+
+class _GateFrame:
+    """Square gate frame — free inside the opening, solid frame material.
+
+    Gate local frame: x = approach axis, y = horizontal, z = vertical.
+    Outer: 0.72 m. Opening: 0.40 m.
+    """
+
+    OUTER = 0.72
+    OPENING = 0.40
+    DEPTH = 0.10
+
+    def __init__(self, center: np.ndarray, quat: np.ndarray, drone_r: float = 0.07):
+        self.center = center.copy()
+        self.rot = R.from_quat(quat)
+        self.rot_inv = self.rot.inv()
+        self.ho = self.OUTER / 2 + drone_r
+        self.hi = self.OPENING / 2 - drone_r
+        self.hd = self.DEPTH / 2 + drone_r
+
+    def contains(self, p: np.ndarray) -> bool:
+        local = self.rot_inv.apply(p - self.center)
+        if abs(local[0]) > self.hd:
+            return False
+        if abs(local[1]) > self.ho or abs(local[2]) > self.ho:
+            return False
+        return not (abs(local[1]) <= self.hi and abs(local[2]) <= self.hi)
+
+    def penetration(self, points: np.ndarray) -> np.ndarray:
+        """Per-point penetration depth (m) into the solid frame material.
+
+        Returns 0 where a point is safe — i.e. far from the gate plane
+        (outside the depth slab), inside the opening (fly-through), or outside the
+        outer square (flying around). Inside the square frame ring it returns the
+        distance to the nearest safe edge, so the optimizer is pushed either into
+        the opening or out past the frame.
+
+        The frame is a square annulus in the gate plane, so the Chebyshev distance
+        ``m = max(|y|, |z|)`` cleanly separates opening (m<=hi), frame (hi<m<ho)
+        and free space (m>=ho).
+        """
+        local = self.rot_inv.apply(points - self.center)
+        lx, ly, lz = np.abs(local[:, 0]), np.abs(local[:, 1]), np.abs(local[:, 2])
+        m = np.maximum(ly, lz)
+        in_material = (lx <= self.hd) & (m > self.hi) & (m < self.ho)
+        depth = np.minimum(m - self.hi, self.ho - m)
+        return np.where(in_material, depth, 0.0)
 
 
 # ── MPCC cost weights (the controller's single source of truth) ─────────────────────────────
@@ -147,7 +211,15 @@ def _solver_signature(payload: dict) -> str:
 
     src = "".join(
         inspect.getsource(fn)
-        for fn in (create_mpcc_model, _capsule_barrier, create_mpcc_ocp_solver)
+        for fn in (
+            create_mpcc_model,
+            _capsule_barrier,
+            _build_mpcc_cost,
+            _build_mpcc_constraints,
+            _set_mpcc_solver_options,
+            _maybe_reuse_solver,
+            create_mpcc_ocp_solver,
+        )
     )
     blob = json.dumps(
         {"args": _jsonable(payload), "src": hashlib.sha256(src.encode()).hexdigest()},
@@ -156,42 +228,21 @@ def _solver_signature(payload: dict) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-def create_mpcc_ocp_solver(
-    Tf: float,
-    N: int,
+def _build_mpcc_cost(
+    ocp: AcadosOcp,
     parameters: dict,
-    z_min: float = 0.0,
-    z_max: float = 2.5,
-    v_max: float = 2.0,
-    vtheta_max: float = 2.5,
-    atheta_max: float = 6.0,
-    n_caps: int = 0,
-    capsule_penalty: float = 5000.0,
-    ground_soft_z: float = 0.0,
-    ground_penalty: float = 0.0,
-    time_steps: np.ndarray | None = None,
-    verbose: bool = False,
-) -> tuple[AcadosOcpSolver, AcadosOcp]:
-    """Build the acados OCP/solver for MPCC.
+    n_caps: int,
+    capsule_penalty: float,
+    ground_soft_z: float,
+    ground_penalty: float,
+) -> None:
+    """Set up the NONLINEAR_LS contouring/lag/progress cost on ``ocp`` (mutates it in place).
 
-    NONLINEAR_LS cost on contouring/lag/progress; the per-stage path cubic + target speed are
-    model parameters set per solve. When ``n_caps`` > 0, obstacle/gate avoidance is added as a
-    smooth soft-barrier in the COST (not a hard constraint): each keep-out is a capsule
-    (segment ``p1->p2`` with radius ``r``) and the barrier ``max(0, 1 - d^2/r^2)^2`` (``d`` =
-    distance from the drone to the capsule axis) is penalised with weight ``capsule_penalty``.
-    A cost barrier never makes the QP infeasible and is cheap (no extra inequality rows /
-    slacks), and the capsule shape lets the drone fly through a gate opening while avoiding the
-    frame bars — so no per-gate enable/disable is needed.
-
-    Parameter layout per stage: ``p = [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1),
-    <p1(3), p2(3), r(1)> * n_caps]``. The cubic head defines ``p_d(theta) = c*(theta-theta_i)``
-    so the path point/tangent are functions of the progress state (re-linearised per node).
+    Declares the per-stage parameter vector ``p`` (path cubic head + avoidance capsules),
+    builds the embedded-path residuals (contouring ``e_c``, lag ``e_l``, progress ``e_v``), the
+    capsule soft-barrier and the ground-clearance residual, and installs the diagonal weight
+    matrices ``W`` / ``W_e`` from :data:`BASELINE_WEIGHTS`.
     """
-    ocp = AcadosOcp()
-    ocp.model = create_mpcc_model(parameters)
-    nx = ocp.model.x.rows()  # 14
-    ocp.solver_options.N_horizon = N
-
     hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
 
     # Per-stage parameters: contouring head [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1)]
@@ -282,6 +333,19 @@ def create_mpcc_ocp_solver(
     ocp.cost.yref = np.zeros(y.rows())
     ocp.cost.yref_e = np.zeros(y_e.rows())
 
+
+def _build_mpcc_constraints(
+    ocp: AcadosOcp,
+    parameters: dict,
+    z_min: float,
+    z_max: float,
+    v_max: float,
+    vtheta_max: float,
+    atheta_max: float,
+) -> None:
+    """Install the state/input box constraints and the softened velocity slacks on ``ocp``."""
+    nx = ocp.model.x.rows()  # 14
+
     # State bounds: z floor/ceiling (2), rpy (3,4,5), vel (6,7,8), v_theta (13: 0..vtheta).
     ocp.constraints.lbx = np.array([z_min, -0.6, -0.6, -0.6, -v_max, -v_max, -v_max, 0.0])
     ocp.constraints.ubx = np.array([z_max, 0.6, 0.6, 0.6, v_max, v_max, v_max, vtheta_max])
@@ -303,6 +367,11 @@ def create_mpcc_ocp_solver(
 
     ocp.constraints.x0 = np.zeros(nx)
 
+
+def _set_mpcc_solver_options(
+    ocp: AcadosOcp, N: int, Tf: float, time_steps: np.ndarray | None
+) -> None:
+    """Configure the SQP_RTI / HPIPM solver options and the (optional) non-uniform time grid."""
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
@@ -341,32 +410,17 @@ def create_mpcc_ocp_solver(
     else:
         ocp.solver_options.tf = Tf
 
-    # Reuse the already-generated/compiled solver when nothing that affects the C code has
-    # changed. Generating + compiling the OCP costs many seconds at every start; it only needs
-    # redoing when the OCP structure changes (N, n_caps, the drone model, the time grid, the
-    # bounds/penalties) or the builder source is edited — all captured by the signature below.
+
+def _maybe_reuse_solver(ocp: AcadosOcp, signature: str, verbose: bool) -> AcadosOcpSolver:
+    """Build the acados solver, reusing the cached C code when its signature is unchanged.
+
+    Generating + compiling the OCP costs many seconds at every start; it only needs redoing when
+    the OCP structure changes (N, n_caps, the drone model, the time grid, the bounds/penalties)
+    or the builder source is edited — all captured by ``signature`` (see :func:`_solver_signature`).
+    """
     gen_dir = "c_generated_code"
     json_file = os.path.join(gen_dir, "mpcc_planner.json")
     sig_file = os.path.join(gen_dir, "mpcc_planner.sig")
-    signature = _solver_signature(
-        {
-            "N": N,
-            "z_min": z_min,
-            "z_max": z_max,
-            "v_max": v_max,
-            "vtheta_max": vtheta_max,
-            "atheta_max": atheta_max,
-            "n_caps": n_caps,
-            "capsule_penalty": capsule_penalty,
-            "ground_soft_z": ground_soft_z,
-            "ground_penalty": ground_penalty,
-            "time_steps": None if time_steps is None else np.asarray(time_steps, float),
-            "parameters": parameters,
-            # Baseline weights are a module constant, not in this function's source, so the source
-            # hash would miss a baseline edit; include them here to keep the cache honest.
-            "weight_baseline": BASELINE_WEIGHTS,
-        }
-    )
     lib_exists = bool(glob.glob(os.path.join(gen_dir, "libacados_ocp_solver_mpcc_planner.*")))
     cached_sig = None
     if os.path.exists(sig_file):
@@ -381,6 +435,72 @@ def create_mpcc_ocp_solver(
         os.makedirs(gen_dir, exist_ok=True)
         with open(sig_file, "w") as f:
             f.write(signature)
+    return solver
+
+
+def create_mpcc_ocp_solver(
+    Tf: float,
+    N: int,
+    parameters: dict,
+    z_min: float = 0.0,
+    z_max: float = 2.5,
+    v_max: float = 2.0,
+    vtheta_max: float = 2.5,
+    atheta_max: float = 6.0,
+    n_caps: int = 0,
+    capsule_penalty: float = 5000.0,
+    ground_soft_z: float = 0.0,
+    ground_penalty: float = 0.0,
+    time_steps: np.ndarray | None = None,
+    verbose: bool = False,
+) -> tuple[AcadosOcpSolver, AcadosOcp]:
+    """Build the acados OCP/solver for MPCC.
+
+    NONLINEAR_LS cost on contouring/lag/progress; the per-stage path cubic + target speed are
+    model parameters set per solve. When ``n_caps`` > 0, obstacle/gate avoidance is added as a
+    smooth soft-barrier in the COST (not a hard constraint): each keep-out is a capsule
+    (segment ``p1->p2`` with radius ``r``) and the barrier ``max(0, 1 - d^2/r^2)^2`` (``d`` =
+    distance from the drone to the capsule axis) is penalised with weight ``capsule_penalty``.
+    A cost barrier never makes the QP infeasible and is cheap (no extra inequality rows /
+    slacks), and the capsule shape lets the drone fly through a gate opening while avoiding the
+    frame bars — so no per-gate enable/disable is needed.
+
+    Parameter layout per stage: ``p = [theta_i(1), c_x(4), c_y(4), c_z(4), v_target(1),
+    <p1(3), p2(3), r(1)> * n_caps]``. The cubic head defines ``p_d(theta) = c*(theta-theta_i)``
+    so the path point/tangent are functions of the progress state (re-linearised per node).
+
+    The OCP is assembled by the dedicated builders :func:`_build_mpcc_cost`,
+    :func:`_build_mpcc_constraints` and :func:`_set_mpcc_solver_options`; the compiled solver is
+    cached and reused by :func:`_maybe_reuse_solver`.
+    """
+    ocp = AcadosOcp()
+    ocp.model = create_mpcc_model(parameters)
+    ocp.solver_options.N_horizon = N
+
+    _build_mpcc_cost(ocp, parameters, n_caps, capsule_penalty, ground_soft_z, ground_penalty)
+    _build_mpcc_constraints(ocp, parameters, z_min, z_max, v_max, vtheta_max, atheta_max)
+    _set_mpcc_solver_options(ocp, N, Tf, time_steps)
+
+    signature = _solver_signature(
+        {
+            "N": N,
+            "z_min": z_min,
+            "z_max": z_max,
+            "v_max": v_max,
+            "vtheta_max": vtheta_max,
+            "atheta_max": atheta_max,
+            "n_caps": n_caps,
+            "capsule_penalty": capsule_penalty,
+            "ground_soft_z": ground_soft_z,
+            "ground_penalty": ground_penalty,
+            "time_steps": None if time_steps is None else np.asarray(time_steps, float),
+            "parameters": parameters,
+            # Baseline weights are a module constant, not in any builder's source, so the source
+            # hash would miss a baseline edit; include them here to keep the cache honest.
+            "weight_baseline": BASELINE_WEIGHTS,
+        }
+    )
+    solver = _maybe_reuse_solver(ocp, signature, verbose)
     return solver, ocp
 
 
@@ -1558,7 +1678,12 @@ class MPCCController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        """Project onto the path, set per-stage contouring params, solve MPCC."""
+        """Project onto the path, set per-stage contouring params, solve MPCC.
+
+        Runs one control tick as an ordered sequence of phases, each a dedicated helper so this
+        method stays a readable outline: re-plan check → missed-gate retry → progress state →
+        warm start → per-stage parameters → cost weights → SQP solve → commit-or-recover.
+        """
         self._last_obs = obs
         self._maybe_replan(obs)
 
@@ -1571,16 +1696,44 @@ class MPCCController(Controller):
             return retry_cmd
 
         tic = time.perf_counter()
+        theta0, vtheta0, relocalize = self._progress_state(obs)
 
-        # Progress state θ / v_theta. θ is a genuine progress STATE that evolves inside the
-        # solve (MPCC++ eq. 6) — it must NOT be re-pinned to the geometric projection every
-        # tick, or its lag dynamics collapse and the cost degenerates back to point-tracking.
-        # So on a NORMAL tick we INHERIT θ / v_theta from the previous solution at node 1
-        # (the node that becomes "now" once the horizon advances one control step). We
-        # re-localise by projecting ONLY when there is no valid prediction on the current
-        # path: the first tick, an episode reset, or right after a replan installs a new path
-        # — all signalled by _theta_pred having been cleared. The projection is window-
-        # constrained around the last θ so it can never snap onto an earlier/later branch.
+        # Initial state (augmented).
+        rpy = R.from_quat(obs["quat"]).as_euler("xyz")
+        drpy = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
+        x0 = np.concatenate((obs["pos"], rpy, obs["vel"], drpy, [theta0, vtheta0]))
+        self._apply_warm_start(x0, relocalize)
+        t_proj = time.perf_counter()
+
+        v_target, thetas = self._set_stage_parameters(obs, theta0)
+        self._apply_tick_weights(obs, thetas)
+        t_setp = time.perf_counter()
+
+        status = self._run_sqp(relocalize)
+        if self.PROFILE:
+            self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
+        if self.DEBUG_SPIKE:
+            speed = float(np.linalg.norm(obs["vel"]))
+            if speed > self.DEBUG_SPIKE_FACTOR * max(v_target, 1e-3):
+                print(
+                    f"[MPCC spike] speed={speed:.2f} v_target={v_target:.2f} "
+                    f"vtheta0={vtheta0:.2f} theta0={theta0:.2f} gate={int(obs['target_gate'])} "
+                    f"reloc={relocalize} dt_reloc={self._ticks_since_reloc} status={status}"
+                )
+        return self._commit_or_recover(status, obs, theta0)
+
+    def _progress_state(self, obs: dict) -> tuple[float, float, bool]:
+        """Initial progress state ``(theta0, v_theta0)`` for this tick, plus the re-localise flag.
+
+        θ is a genuine progress STATE that evolves inside the solve (MPCC++ eq. 6) — it must NOT
+        be re-pinned to the geometric projection every tick, or its lag dynamics collapse and the
+        cost degenerates back to point-tracking. So on a NORMAL tick we INHERIT θ / v_theta from
+        the previous solution at node 1 (the node that becomes "now" once the horizon advances one
+        control step). We re-localise by projecting ONLY when there is no valid prediction on the
+        current path: the first tick, an episode reset, or right after a replan installs a new path
+        — all signalled by _theta_pred having been cleared. The projection is window-constrained
+        around the last θ so it can never snap onto an earlier/later branch.
+        """
         relocalize = self._theta_pred is None or self._x_pred is None
         self._ticks_since_reloc = 0 if relocalize else self._ticks_since_reloc + 1
         if relocalize:
@@ -1595,16 +1748,17 @@ class MPCCController(Controller):
             vtheta0 = float(np.clip(self._x_pred[1, 13], 0.0, self.VTHETA_MAX))
         self._theta_est = theta0  # window centre for the next re-localisation projection
         self._progress_point = p0  # the single "where is the drone along the path" marker
+        return theta0, vtheta0, relocalize
 
-        # Initial state (augmented).
-        rpy = R.from_quat(obs["quat"]).as_euler("xyz")
-        drpy = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        x0 = np.concatenate((obs["pos"], rpy, obs["vel"], drpy, [theta0, vtheta0]))
-        # Warm start. On a normal tick: reuse the previous solve's trajectory shifted one node
-        # forward (SQP converges in a few iterations). On a re-localise (first tick / reset / right
-        # after a replan): there is no valid previous trajectory on the current path, so seed a
-        # consistent cold start (every node = x0) instead of inheriting acados' stale old-path
-        # iterate — the latter mismatches the freshly set path cubics and drove HPIPM to NaN.
+    def _apply_warm_start(self, x0: np.ndarray, relocalize: bool) -> None:
+        """Seed the solver for this tick and pin node 0 to the measured state ``x0``.
+
+        On a normal tick: reuse the previous solve's trajectory shifted one node forward (SQP
+        converges in a few iterations). On a re-localise (first tick / reset / right after a
+        replan): there is no valid previous trajectory on the current path, so seed a cold start
+        (every node = x0) instead of inheriting acados' stale old-path iterate — the latter
+        mismatches the freshly set path cubics and drove HPIPM to NaN.
+        """
         if relocalize:
             # Wipe acados' internal iterate (primal AND dual / HPIPM QP memory) before seeding a
             # fresh cold start. _seed_warm_start only overwrites the primal node states, but the
@@ -1619,24 +1773,29 @@ class MPCCController(Controller):
             self._shift_warm_start()
         self._solver.set(0, "lbx", x0)
         self._solver.set(0, "ubx", x0)
-        t_proj = time.perf_counter()
 
-        # Per-stage path: the LOCAL CUBIC of the path around each node's predicted theta, so
-        # acados can evaluate p_d(theta) symbolically. Plus the avoidance capsules (same for
-        # every node), built once from the live gate/obstacle poses.
-        # End-hover: once the drone's progress reaches the end of the path, freeze every
-        # stage's reference at theta=length and drop the target progress speed to 0. The
-        # contouring+lag cost then pulls the drone onto the final path point p_d(length) and
-        # the progress reward drives v_theta -> 0, so it station-keeps on the last trajectory
-        # point instead of overrunning the path end.
-        # Gate barrier with a smooth approach brake. The per-stage θ anchors are clamped at the
-        # barrier so the horizon never references a gate we haven't passed, and v_target is ramped
-        # linearly to 0 over the last GATE_PASS_LEAD metres before it. The brake is what keeps the
-        # predicted progress from overshooting the clamped anchors: without it the path cubic gets
-        # evaluated far outside its segment and the terminal prediction (the blue marker) shoots
-        # off the trajectory. On a clean pass target_gate increments around the gate centre, so the
-        # barrier jumps ahead before the brake really bites and cruise speed is barely affected; it
-        # only slows things when a pass is actually failing. End-of-path hover always wins.
+    def _set_stage_parameters(self, obs: dict, theta0: float) -> tuple[float, np.ndarray]:
+        """Write each node's path-cubic + avoidance params; return ``(v_target, thetas)``.
+
+        Per-stage path: the LOCAL CUBIC of the path around each node's predicted theta, so acados
+        can evaluate p_d(theta) symbolically. Plus the avoidance capsules (same for every node),
+        built once from the live gate/obstacle poses.
+
+        End-hover: once the drone's progress reaches the end of the path, freeze every stage's
+        reference at theta=length and drop the target progress speed to 0. The contouring+lag cost
+        then pulls the drone onto the final path point p_d(length) and the progress reward drives
+        v_theta -> 0, so it station-keeps on the last trajectory point instead of overrunning the
+        path end.
+
+        Gate barrier with a smooth approach brake. The per-stage θ anchors are clamped at the
+        barrier so the horizon never references a gate we haven't passed, and v_target is ramped
+        linearly to 0 over the last GATE_PASS_LEAD metres before it. The brake is what keeps the
+        predicted progress from overshooting the clamped anchors: without it the path cubic gets
+        evaluated far outside its segment and the terminal prediction (the blue marker) shoots
+        off the trajectory. On a clean pass target_gate increments around the gate centre, so the
+        barrier jumps ahead before the brake really bites and cruise speed is barely affected; it
+        only slows things when a pass is actually failing. End-of-path hover always wins.
+        """
         finishing = theta0 >= self.planner.length - self.END_HOVER_TOL
         theta_cap = self._gate_progress_cap(obs)
         if finishing:
@@ -1666,13 +1825,18 @@ class MPCCController(Controller):
             head = np.concatenate(([theta_i], cx, cy, cz, [v_target]))
             p_k = head if caps is None else np.concatenate((head, caps))
             self._solver.set(k, "p", p_k)
+        return v_target, thetas
 
-        # Per-tick cost weights = baseline × multipliers. Multipliers come from the RL weight
-        # planner (trainer override or internal policy) when it's on, else identity (an exact
-        # no-op: weight_diagonals rebuilds the same W layout the solver was built with). The
-        # near-gate q_c boost (_apply_stage_weights) then tightens contouring around each gate; on
-        # the no-RL path it only touches the few nodes near a gate, so straights stay as cheap as
-        # before. acados updates W in place.
+    def _apply_tick_weights(self, obs: dict, thetas: np.ndarray) -> None:
+        """Push this tick's cost weights (RL-scaled or baseline) + near-gate q_c boost.
+
+        Per-tick cost weights = baseline × multipliers. Multipliers come from the RL weight planner
+        (trainer override or internal policy) when it's on, else identity (an exact no-op:
+        weight_diagonals rebuilds the same W layout the solver was built with). The near-gate q_c
+        boost (_apply_stage_weights) then tightens contouring around each gate; on the no-RL path it
+        only touches the few nodes near a gate, so straights stay as cheap as before. acados updates
+        W in place.
+        """
         if self.USE_RL_WEIGHTS:
             if self._external_mult is not None:
                 mult = self._external_mult.copy()
@@ -1689,29 +1853,31 @@ class MPCCController(Controller):
         else:
             w_stage, w_term = self._w_stage_base, self._w_term_base
         self._apply_stage_weights(thetas, w_stage, w_term, self.USE_RL_WEIGHTS)
-        t_setp = time.perf_counter()
 
-        # SQP_RTI solve: phase 1 prepares (linearise + condense the QP at the warm-started
-        # iterate), phase 2 solves the QP and applies the feedback step. Normally one iteration
-        # per tick; on a fresh path (replan just installed / first tick / reset) the warm start
-        # is far from the new optimum, so run a short burst to re-converge within this tick
-        # instead of lagging the jump over the next several ticks.
+    def _run_sqp(self, relocalize: bool) -> int:
+        """Run the SQP_RTI solve(s) for this tick and return the acados solver status.
+
+        SQP_RTI solve: phase 1 prepares (linearise + condense the QP at the warm-started iterate),
+        phase 2 solves the QP and applies the feedback step. Normally one iteration per tick; on a
+        fresh path (replan just installed / first tick / reset) the warm start is far from the new
+        optimum, so run a short burst to re-converge within this tick instead of lagging the jump
+        over the next several ticks.
+        """
         n_iters = self.RTI_BUMP_ITERS if relocalize else 1
         for _ in range(n_iters):
             self._solver.options_set("rti_phase", 1)
             self._solver.solve()
             self._solver.options_set("rti_phase", 2)
             status = self._solver.solve()
-        if self.PROFILE:
-            self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
-        if self.DEBUG_SPIKE:
-            speed = float(np.linalg.norm(obs["vel"]))
-            if speed > self.DEBUG_SPIKE_FACTOR * max(v_target, 1e-3):
-                print(
-                    f"[MPCC spike] speed={speed:.2f} v_target={v_target:.2f} "
-                    f"vtheta0={vtheta0:.2f} theta0={theta0:.2f} gate={int(obs['target_gate'])} "
-                    f"reloc={relocalize} dt_reloc={self._ticks_since_reloc} status={status}"
-                )
+        return status
+
+    def _commit_or_recover(self, status: int, obs: dict, theta0: float) -> NDArray[np.floating]:
+        """Commit a trusted solve, else replay the last plan / brake. Returns the executed command.
+
+        On a successful, non-divergent solve the trajectory is committed (warm-start caches updated)
+        and node 0's input returned. A divergent or failed solve is not committed; the controller
+        replays the next input from the last TRUSTED prediction, falling back to a braking command.
+        """
         self.last_solve_ok = status == 0
         if status == 0:
             xs = np.array([self._solver.get(k, "x") for k in range(self._N + 1)])
