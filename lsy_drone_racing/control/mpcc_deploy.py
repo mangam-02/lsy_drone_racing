@@ -927,7 +927,7 @@ class MPCCController(Controller):
     """MPCC controller: contouring control along the warm-started SimplePlanner path."""
 
     GROUND_Z = 0.0
-    #: Ground-clearance soft penalty (added to the MPCC cost): the drone starts on the ground
+    #: .Ground-clearance soft penalty (added to the MPCC cost): the drone starts on the ground
     #: (z ≈ 0.01) and, if nothing discourages it, tilts to chase the mostly-horizontal first path
     #: segment, trading away vertical thrust → it sinks into the floor before climbing (the
     #: "ground" crashes at the start). A one-sided residual max(0, GROUND_SOFT_Z − z) penalises any
