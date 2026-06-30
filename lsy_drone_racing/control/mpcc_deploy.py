@@ -938,13 +938,6 @@ class MPCCController(Controller):
     GROUND_PENALTY = 400.0  # weight of the ground-clearance residual (higher = climbs harder)
     V_TARGET = 2  # m/s — target progress speed (cruise); matched to SimplePlanner.TARGET_SPEED
     VTHETA_MAX = 6  # m/s — hard-ish cap on progress speed
-    #: Per-axis velocity state bound (vel x/y/z) the solver is built with — the real cap on how
-    #: fast the drone may fly (softened, so a transient overspeed only costs slack, never QP
-    #: infeasibility). Previously left at create_mpcc_ocp_solver's 2.0 default, which silently
-    #: capped cruise at ~2 m/s regardless of V_TARGET. Now coupled here as the single knob: raise
-    #: it (with V_TARGET ≥ it) to fly faster. Editing it rebuilds the solver (it's in the cache
-    #: signature). Keep ≥ V_TARGET / √3 so the progress target is actually reachable.
-    V_MAX = 3.0  # m/s — raise to go faster (e.g. 3.0–3.5)
     #: Curvature speed limit: cap the progress target by the path curvature so the drone slows
     #: through sharp turns (e.g. the ~180° reversal at a gate exit) and cruises on straights,
     #: instead of carrying full V_TARGET into a corner and overshooting into the frame. The cap is
@@ -952,7 +945,7 @@ class MPCCController(Controller):
     #: arc-length LOOKAHEAD ahead of the drone so braking starts BEFORE the curve. The MPCC tracks
     #: its own v_target (not the planner's speed profile), so this must cap v_target here to bite.
     USE_CURVATURE_SPEED = True
-    MAX_LAT_ACC = 28.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
+    MAX_LAT_ACC = 20.0  # m/s² — lateral-accel budget in turns (lower = slower/safer corners)
     CURVE_MIN_SPEED = 0.8  # m/s — floor so a very tight turn never stalls progress
     CURVE_LOOKAHEAD = 1.5  # m — arc length ahead scanned for the tightest upcoming curvature
     #: Arc-length window (m) over which the path curvature is smoothed before forming v_cap. The
@@ -968,7 +961,7 @@ class MPCCController(Controller):
     #: multiplied by GATE_TRACK_BOOST, pulling the prediction tightly onto the gate-centred line
     #: exactly where precision matters — while straights keep the loose, fast baseline weighting.
     #: Applied every tick on top of whatever weights are active (baseline or RL-scaled q_c).
-    USE_GATE_TRACK_BOOST = True  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
+    USE_GATE_TRACK_BOOST = False  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
     GATE_TRACK_BOOST = 4.0  # × q_c near a gate centre
     GATE_TRACK_RADIUS = 0.5  # m — arc-length half-window around each gate centre
     #: Distance (m) from the path end within which the controller switches to end-hover:
@@ -1108,7 +1101,6 @@ class MPCCController(Controller):
             self._N,
             self.drone_params,
             z_min=self.GROUND_Z,
-            v_max=self.V_MAX,
             vtheta_max=self.VTHETA_MAX,
             n_caps=self._n_caps,
             capsule_penalty=self.CAPSULE_PENALTY,
