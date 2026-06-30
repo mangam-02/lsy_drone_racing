@@ -992,6 +992,15 @@ class MPCCController(Controller):
     #: pure path progress with no gate gating.
     USE_GATE_BARRIER = True
     GATE_PASS_LEAD = 0.4  # m past the gate centre θ may reach before the env confirms the pass
+    #: Floor on the gate-barrier brake so v_target never ramps fully to 0 at the barrier. Without
+    #: it the drone could decelerate to a dead stop just SHORT of the gate plane; the env only
+    #: registers a pass on a real x<0 → x>0 crossing of the drone's true position, so a parked
+    #: drone never triggers it and the barrier never lifts (the "waiting after the gate" deadlock).
+    #: The floor keeps a small forward push so the drone always creeps the final centimetres THROUGH
+    #: the plane. It can't overshoot a genuinely missed gate: the per-stage θ stays clamped at
+    #: theta_cap, so the drone settles at the capped reference (≈ gate centre + GATE_PASS_LEAD) and
+    #: a real miss still ends in the gate-retry recovery.
+    GATE_BRAKE_FLOOR = 0.25
     #: Gate-retry recovery. The progress θ is monotonic (v_theta >= 0) and clamped at the gate
     #: barrier, so if the drone MISSES a gate (overshoots / flies past the opening without the env
     #: confirming the pass) it can't reverse on its own — v_target brakes to 0 and it dead-hovers
@@ -1600,7 +1609,20 @@ class MPCCController(Controller):
             v_target = 0.0
             thetas = np.full(self._N + 1, self.planner.length)
         else:
-            brake = float(np.clip((theta_cap - theta0) / self.GATE_PASS_LEAD, 0.0, 1.0))
+            # Brake on the gate barrier using the drone's TRUE progress (geometric projection of the
+            # measured position), NOT the inherited progress state theta0. theta0 can lead the real
+            # position (lag), so braking on it slowed the drone to a stop while it was still
+            # physically SHORT of the gate plane — and since the env only registers a pass on a real
+            # x<0 → x>0 crossing, it never confirmed and the barrier never lifted (the drone waited
+            # at the gate). Gating the brake on where the drone actually is makes it bite only once
+            # the body itself is past the gate centre (a genuine missed pass), not merely when the
+            # progress state is. The floor (GATE_BRAKE_FLOOR) then keeps a small forward push so the
+            # drone always creeps the last centimetres through the plane instead of parking short.
+            theta_phys = self.planner.project_to_theta(
+                obs["pos"], obs["vel"], theta_prev=self._theta_est
+            )
+            brake = float(np.clip((theta_cap - theta_phys) / self.GATE_PASS_LEAD, 0.0, 1.0))
+            brake = max(brake, self.GATE_BRAKE_FLOOR)
             v_cruise = self._curvature_speed_cap(theta0)  # slow into sharp turns, full on straights
             v_target = v_cruise * self._caution_factor(obs) * brake
             thetas = np.minimum(self._stage_thetas(theta0), theta_cap)
