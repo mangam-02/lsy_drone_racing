@@ -725,8 +725,8 @@ class SimplePlanner:
         data, prev = [], self._start_pos.copy()
         for i in range(len(gates_pos)):
             x_axis = R.from_quat(gates_quat[i]).apply([1.0, 0.0, 0.0])
-            if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
-                x_axis = -x_axis
+            #if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
+                #x_axis = -x_axis
             center = gates_pos[i] + bias
             # Keep the entry/exit waypoints out of any obstacle's keep-out (see GATE_WP_MIN_DIST):
             # a pole on the approach/departure line otherwise forces a contorted swerve. The exit
@@ -1081,7 +1081,7 @@ class MPCCController(Controller):
     #: multiplied by GATE_TRACK_BOOST, pulling the prediction tightly onto the gate-centred line
     #: exactly where precision matters — while straights keep the loose, fast baseline weighting.
     #: Applied every tick on top of whatever weights are active (baseline or RL-scaled q_c).
-    USE_GATE_TRACK_BOOST = True  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
+    USE_GATE_TRACK_BOOST = False  # A/B: ×4 q_c near gates stayed within eval noise, hurt gate 0
     GATE_TRACK_BOOST = 4.0  # × q_c near a gate centre
     GATE_TRACK_RADIUS = 0.5  # m — arc-length half-window around each gate centre
     #: Distance (m) from the path end within which the controller switches to end-hover:
@@ -1128,7 +1128,7 @@ class MPCCController(Controller):
     #: BEFORE the gate with a simple position controller (bypassing the MPCC), then hands back so
     #: the MPCC re-approaches and re-threads. The back-and-forth also raises the chance of finally
     #: sensing the real gate pose (→ replan onto the correct line). Off → old dead-hover behaviour.
-    USE_GATE_RETRY = True
+    USE_GATE_RETRY = False
     RETRY_STUCK_SPEED = 0.3  # m/s — below this, at/past the gate, counts as stalled
     RETRY_STUCK_TICKS = 40  # consecutive stalled ticks before a retry triggers (~0.8 s @ 50 Hz)
     RETRY_BACK_DIST = 0.8  # m (arc length) before the gate centre the recovery retreats to
@@ -1151,7 +1151,7 @@ class MPCCController(Controller):
     MAX_PRED_DEV = 1.5  # m — how far the prediction may stray PAST the current offset before reject
     #: SQP_RTI iterations to run on a "fresh path" tick (replan just installed / first tick /
     #: episode reset), where the warm start is far from the new optimum. Normal ticks run 1.
-    RTI_BUMP_ITERS = 5
+    RTI_BUMP_ITERS = 10
 
     #: Per-node growth of the shooting interval (non-uniform time grid). The first interval
     #: is the real control period dt; each later one is this much longer, so the same N
