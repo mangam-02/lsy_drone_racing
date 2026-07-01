@@ -223,7 +223,7 @@ USE_RL_WEIGHTS = False
 #: Checkpoint for the weight policy (produced by train_mpcc_weights.py).
 RL_WEIGHT_CKPT = "lsy_drone_racing/control/mpcc_weights.ckpt"
 
-#: MPC prediction-horizon length (number of shooting nodes). THIS is the one knob for the
+#: MPCC prediction-horizon length (number of shooting nodes). THIS is the one knob for the
 #: horizon: deployment uses 25. Training (train_mpcc_weights.py --mpc_horizon) temporarily
 #: lowers it for speed by overriding this class attribute in its worker processes — it does
 #: NOT edit this value, so deployment keeps 25. The weight policy is horizon-agnostic (its
@@ -232,7 +232,7 @@ RL_WEIGHT_CKPT = "lsy_drone_racing/control/mpcc_weights.ckpt"
 N_HORIZON = 25
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
-# MPC COST WEIGHTS  (the controller's single source of truth)
+# MPCC COST WEIGHTS  (the controller's single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
 #: Baseline diagonal cost weights of the MPCC NONLINEAR_LS cost. These ARE the controller's
