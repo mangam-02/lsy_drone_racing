@@ -22,11 +22,18 @@
 
 ## Demo
 
-<div align="center">
-  <img width="800" src="docs/img/race.gif"/>
-  <br/>
-  <sub><sup style="font-size: 0.8em;">Racing environment — powered by <a href="https://github.com/learnsyslab/crazyflow">Crazyflow</a></sup></sub>
-</div>
+<table>
+  <tr>
+    <td align="center"><b>Real Crazyflie — hardware deployment</b></td>
+    <td align="center"><b>Crazyflow simulator</b></td>
+  </tr>
+  <tr>
+    <td><img src="figures/real_deployment.gif" width="400"/></td>
+    <td><img src="docs/img/race.gif" width="400"/></td>
+  </tr>
+</table>
+
+<sub><sup style="font-size: 0.8em;">Left: the MPCC controller flown on a real Crazyflie. Right: the racing environment — powered by <a href="https://github.com/learnsyslab/crazyflow">Crazyflow</a>.</sup></sub>
 
 ---
 
@@ -289,25 +296,31 @@ must be rebuilt for arm64 — see the project notes.
 ### Simulation
 
 The MPCC controller is wired into every race config via `[controller] file = "mpcc/controller.py"`.
-Run it in the simulator on any difficulty level:
+
+**`sim_eval.py` — headless batch evaluation.** Runs `-n` episodes in parallel and prints an
+end-of-run summary: how often the run succeeded (all gates passed), the distribution of gates
+passed, and how/where it crashed (collision / ground / out-of-bounds / timeout, and at which
+gate). This is the number that matters — success rate and lap time across randomised tracks:
 
 ```bash
-python scripts/sim.py --config config/level2.toml
+python3 scripts/sim_eval.py --config level3.toml -n 100
 ```
 
-Evaluate over randomised episodes (success rate + lap times):
+**`sim.py` — run and watch a race.** Same env and controller loading, but with rendering on and
+per-episode lap times printed. Use it to *see* what the controller does on a few runs:
 
 ```bash
-python scripts/sim_eval.py --config config/level3.toml
+python3 scripts/sim.py --config level2.toml -n 20
 ```
 
-The competition environment uses **level 2** (randomised inertia + moving gates/obstacles,
-re-planning required), which is what the background-replanning path planner is built for.
+Level 2 is the competition setting (randomised inertia + moving gates/obstacles, re-planning
+required); level 3 additionally randomises the whole track (online planning) and is the harder
+stress test.
 
 ### Real hardware
 
 ```bash
-python scripts/deploy.py --config config/level0.toml
+python3 scripts/deploy.py --config level2.toml
 ```
 
 ### Tuning
