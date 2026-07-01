@@ -17,6 +17,9 @@ c_generated_code/
 # wandb training artifacts
 wandb/
 
+# ProperDocs build output
+site/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
