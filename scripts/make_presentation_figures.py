@@ -2,10 +2,10 @@
 
 Produces four figures into ``figures/``:
 
-1. ``planning_topdown``  — bird's-eye view of the level-3 track + the
-   ``BSplinePlanner`` trajectory, waypoints, gates and obstacles (slide 1).
-2. ``speed_profile``     — the trapezoidal speed profile along arc length
-   (slide 1).
+1. ``planning_topdown``  — bird's-eye view of the level-3 track + the current
+   ``SimplePlanner`` (mpcc) trajectory, waypoints, gates and obstacles (slide 1).
+2. ``speed_profile``     — the trapezoidal reference speed along arc length,
+   overlaid with the controller's curvature speed cap (slide 1).
 3. ``mpc_blockdiagram``  — Planner -> MPC -> Drone control loop (slide 2).
 4. ``rl_blockdiagram``   — the future RL-tuning layer on top (slide 3).
 
@@ -29,7 +29,8 @@ from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control.mpc_planner_controller import BSplinePlanner, _GateFrame
+from lsy_drone_racing.control.mpcc import config as cfg
+from lsy_drone_racing.control.mpcc.planner import SimplePlanner, _GateFrame
 from lsy_drone_racing.utils import load_config
 
 SEED = 7
@@ -86,7 +87,7 @@ def draw_gate_topdown(ax, center, quat, label):
             fontweight="bold", zorder=6)
 
 
-def fig_topdown(planner: BSplinePlanner, obs: dict):
+def fig_topdown(planner: SimplePlanner, obs: dict):
     traj = planner.pos
     raw = planner._raw_waypoints
 
@@ -112,7 +113,7 @@ def fig_topdown(planner: BSplinePlanner, obs: dict):
 
     # Obstacles: physical pole + clearance ring.
     for opos in obs["obstacles_pos"]:
-        ax.add_patch(plt.Circle(opos[:2], BSplinePlanner.PLAN_CLEARANCE,
+        ax.add_patch(plt.Circle(opos[:2], SimplePlanner.PLAN_CLEARANCE,
                                 color="orange", alpha=0.25, zorder=1))
         ax.add_patch(plt.Circle(opos[:2], 0.04, color="#8B4513", zorder=5))
     ax.scatter([], [], marker="o", s=140, color="orange", alpha=0.25,
@@ -139,27 +140,51 @@ def fig_topdown(planner: BSplinePlanner, obs: dict):
 # ── Figure 2: speed profile ──────────────────────────────────────────────────
 
 
-def fig_speed(planner: BSplinePlanner):
+def curvature_cap(planner: SimplePlanner):
+    """Reproduce the controller's curvature speed cap v_cap(s)=sqrt(a_lat/kappa).
+
+    Curvature is taken from the change of the unit tangent along arc length of the
+    planner's dense geometric path, smoothed and clipped exactly as in
+    ``MPCCController._build_curvature_cap`` (mpcc/controller.py).
+    """
+    p = planner._path_dense
+    s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))])
+    tan = planner._path_dense_tan
+    dtds = np.gradient(tan, s, axis=0)
+    kappa = np.linalg.norm(dtds, axis=1)
+    ds = np.mean(np.diff(s)) if len(s) > 1 else 0.0
+    win = int(round(cfg.CURVE_SMOOTH_M / ds)) if ds > 0 else 0
+    if win > 1:
+        kernel = np.ones(win) / win
+        kappa = np.convolve(np.pad(kappa, win // 2, mode="edge"), kernel, mode="valid")[: len(s)]
+    vcap = np.sqrt(cfg.MAX_LAT_ACC / np.maximum(kappa, 1e-6))
+    return s, np.clip(vcap, cfg.CURVE_MIN_SPEED, planner.TARGET_SPEED)
+
+
+def fig_speed(planner: SimplePlanner):
     pos, vel = planner.pos, planner.vel
     s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pos, axis=0), axis=1))])
     speed = np.linalg.norm(vel, axis=1)
+    s_cap, vcap = curvature_cap(planner)
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(s, speed, "-", color="#1f77b4", lw=2.5, label="Reference speed")
-    ax.axhline(BSplinePlanner.TARGET_SPEED, ls="--", color="#2ca02c", lw=1.5,
-               label=f"Cruise speed ({BSplinePlanner.TARGET_SPEED} m/s)")
+    ax.plot(s, speed, "-", color="#1f77b4", lw=2.5, label="Planned reference speed")
+    ax.plot(s_cap, vcap, "-", color="#d94801", lw=2.2,
+            label=r"Curvature cap $v_{\mathrm{cap}}(s)=\sqrt{a_{\mathrm{lat}}/\kappa}$")
+    ax.axhline(planner.TARGET_SPEED, ls="--", color="#2ca02c", lw=1.5,
+               label=f"Cruise target $V_{{\\mathrm{{tgt}}}}$ ({planner.TARGET_SPEED} m/s)")
 
     # Shade ramp regions.
-    a = BSplinePlanner.ACCEL_DIST
-    ax.axvspan(0, a, color="orange", alpha=0.15)
-    ax.axvspan(s[-1] - BSplinePlanner.DECEL_DIST, s[-1], color="orange", alpha=0.15)
-    ax.text(a / 2, 0.2, "accel", ha="center", color="darkorange", fontsize=9)
-    ax.text(s[-1] - BSplinePlanner.DECEL_DIST / 2, 0.2, "decel", ha="center",
+    a = SimplePlanner.ACCEL_DIST
+    ax.axvspan(0, a, color="orange", alpha=0.12)
+    ax.axvspan(s[-1] - SimplePlanner.DECEL_DIST, s[-1], color="orange", alpha=0.12)
+    ax.text(a / 2, 0.15, "accel", ha="center", color="darkorange", fontsize=9)
+    ax.text(s[-1] - SimplePlanner.DECEL_DIST / 2, 0.15, "decel", ha="center",
             color="darkorange", fontsize=9)
 
-    ax.set_xlabel("Arc length along trajectory [m]")
+    ax.set_xlabel("Arc length along path $s$ [m]")
     ax.set_ylabel("Speed [m/s]")
-    ax.set_ylim(0, BSplinePlanner.TARGET_SPEED + 0.4)
+    ax.set_ylim(0, planner.TARGET_SPEED + 0.4)
     ax.set_xlim(0, s[-1])
     ax.legend(loc="lower center", fontsize=9)
     ax.grid(True, alpha=0.3)
@@ -249,7 +274,8 @@ def main():
     print(f"Building level-3 track (seed {SEED}) ...")
     obs = get_track_obs(config)
     obs["target_gate"] = np.int32(0)
-    planner = BSplinePlanner(obs, config, N=25)
+    # Match the deployed controller: it pins the planner cruise to its own V_TARGET.
+    planner = SimplePlanner(obs, config, N=25, target_speed=cfg.V_TARGET)
 
     print("Rendering figures ...")
     fig_topdown(planner, obs)

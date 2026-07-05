@@ -17,6 +17,10 @@ c_generated_code/
 # wandb training artifacts
 wandb/
 
+report/sim_eval_results.md
+report/user_instructions_log.md
+
+
 # ProperDocs build output
 site/
 
