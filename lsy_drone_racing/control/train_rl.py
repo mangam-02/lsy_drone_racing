@@ -1,6 +1,6 @@
 """A naive RL pipeline for drone racing."""
 
-import random
+import random  # noqa: I001  (import order is env-dependent: a local `wandb/` dir flips wandb's section)
 import time
 from dataclasses import dataclass
 from pathlib import Path
