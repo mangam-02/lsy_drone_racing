@@ -1356,8 +1356,8 @@ class MPCCController(Controller):
 
         Gates (yellow + cyan/white frames), obstacles (orange poles), the planned path (green
         line) with the gate waypoints (magenta), a red marker at the drone's current progress
-        along the path (its projection point θ), and a single blue marker at the far end of
-        the MPCC horizon (how far ahead the controller plans).
+        along the path (its projection point θ), and a blue line tracing the MPCC predicted
+        horizon (with a dot at its far end — how far ahead the controller plans).
         """
         obs = self._last_obs
         if obs is not None:
@@ -1386,9 +1386,18 @@ class MPCCController(Controller):
                 size=0.07,
             )
 
-        # Single blue marker: the far end of the MPC horizon (last predicted stage position)
-        # — i.e. how far ahead the controller is currently planning.
-        if self._pos_pred is not None:
+        # Blue line: the full MPC predicted horizon (all N+1 stage positions) — the trajectory
+        # the controller is planning over the next ~0.5 s. The line shows the whole prediction
+        # so its divergence from the green planned path is visible at a glance; the dot at the
+        # far end marks how far ahead the controller is currently planning.
+        if self._pos_pred is not None and len(self._pos_pred) > 1:
+            draw_line(
+                sim,
+                self._pos_pred,
+                rgba=np.array([0.0, 0.0, 1.0, 1.0]),
+                start_size=0.008,
+                end_size=0.008,
+            )
             draw_points(
                 sim,
                 np.atleast_2d(self._pos_pred[-1]),
