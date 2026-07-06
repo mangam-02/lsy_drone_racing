@@ -176,7 +176,17 @@ def record(
         proc.wait()
         env.close()
 
+    # Classify how the run ended so callers/loops can react (e.g. "keep the crash-at-gate-0 take").
+    target_gate = int(obs["target_gate"])  # -1 once the final gate is passed
+    if target_gate == -1:
+        outcome, crash_gate = "success", None
+    elif truncated and not terminated:
+        outcome, crash_gate = "timeout", target_gate
+    else:
+        outcome, crash_gate = "crash", target_gate
     logger.info(f"done: {n_frames} frames, {curr_time:.2f}s flight → {out_path}")
+    # Parseable one-liner for shell loops (grep 'RESULT: ... gate=0').
+    print(f"RESULT: outcome={outcome} gate={crash_gate} time={curr_time:.2f} out={out_path}", flush=True)
     return str(out_path)
 
 

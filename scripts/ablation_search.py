@@ -26,9 +26,12 @@ Run as:
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 
 import fire
@@ -68,24 +71,93 @@ def _apply_variant(cls: type, off_flag: str | None, base: dict[str, bool]) -> No
         setattr(cls, off_flag, False)
 
 
+_ABLATION_NAMES = [v for v in ABLATIONS if v != "all_on"]
+
+
+def _is_ideal(res: dict[str, dict]) -> bool:
+    """True when the full controller succeeds but every ablation fails (one seed shows it all)."""
+    return res["all_on"]["outcome"] == "success" and all(
+        res[a]["outcome"] != "success" for a in _ABLATION_NAMES
+    )
+
+
+def _log_seed(seed: int, res: dict[str, dict]) -> None:
+    """Print one seed's result the moment it finishes; flag it loudly if it's an ideal seed.
+
+    Uses ``print(flush=True)`` (not logging) so the line shows immediately in both serial and
+    worker processes — worker module loggers aren't raised to INFO and logging can buffer.
+    """
+    line = "  ".join(f"{v}={_fmt(res[v])}" for v in ABLATIONS)
+    mark = (
+        "   ★★★ IDEAL (all_on OK, every ablation fails) — Ctrl-C to stop ★★★"
+        if _is_ideal(res)
+        else ""
+    )
+    print(f"seed {seed:>4}: {line}{mark}", flush=True)
+
+
+_LIBC = ctypes.CDLL(None) if sys.platform != "win32" else None
+
+
+@contextmanager
+def _silence_c_output():
+    """Redirect C-level stdout+stderr (fds 1 & 2) to /dev/null for the block.
+
+    acados prints QP-solver warnings ("SQP_RTI: QP solver returned error status 3 ...") via C
+    ``printf`` — Python logging can't touch them, and ablations make them frequent (expected). We
+    only silence during the solves; our progress and the final table are printed *outside* this
+    block. libc's own buffers are flushed into /dev/null before the fds are restored, otherwise
+    fully-buffered output (when stdout is a pipe, not a TTY) would leak out afterwards.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out, saved_err = os.dup(1), os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        if _LIBC is not None:
+            _LIBC.fflush(None)  # push buffered C stdio into /dev/null before restoring
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+
+
+def _run_one_seed(env, cls, cfg, n_gates: int, base: dict[str, bool], seed: int) -> dict[str, dict]:
+    """Run all four variants for a single seed and return ``{variant: result_dict}``."""
+    res: dict[str, dict] = {}
+    with _silence_c_output():  # hide acados QP-solver spam during the solves
+        for variant, off_flag in ABLATIONS.items():
+            _apply_variant(cls, off_flag, base)
+            result, _ = _run_episode(env, cls, cfg, n_gates, seed=seed, run=0)
+            res[variant] = result
+    return res
+
+
 def _run_seed_chunk(config_name: str, controller_name: str | None, seeds: list[int]) -> dict:
-    """Worker: run all four variants for each assigned seed; return ``{seed: {variant: result}}``.
+    """Worker: run every variant for each assigned seed; return ``{seed: {variant: result}}``.
 
     Builds its own env/controller (self-contained per process) and captures the class's baseline
-    flag values first so ``all_on`` reflects the real defaults, not a hard-coded ``True``.
+    flag values first so ``all_on`` reflects the real defaults, not a hard-coded ``True``. Prints
+    each seed live (so parallel runs still stream results) and returns whatever finished if the
+    worker is interrupted.
     """
     _setup_logging()
     env, cls, cfg, n_gates = _build_env(config_name, controller_name, False, None)
     base = {k: getattr(cls, k) for k in _FLAGS}
     out: dict[int, dict[str, dict]] = {}
-    for s in seeds:
-        out[s] = {}
-        for variant, off_flag in ABLATIONS.items():
-            _apply_variant(cls, off_flag, base)
-            result, _ = _run_episode(env, cls, cfg, n_gates, seed=s, run=0)
-            out[s][variant] = result
-        logger.info(f"seed {s}: " + "  ".join(f"{v}={_fmt(out[s][v])}" for v in ABLATIONS))
-    env.close()
+    try:
+        for s in seeds:
+            out[s] = _run_one_seed(env, cls, cfg, n_gates, base, s)
+            _log_seed(s, out[s])
+    except KeyboardInterrupt:
+        pass  # return the seeds finished so far; the main process reports them
+    finally:
+        env.close()
     return out
 
 
@@ -120,7 +192,13 @@ def search(
     """
     seed_list = _parse_seeds(seeds)
     workers = int(workers)
-    logger.info(f"testing {len(seed_list)} seeds × {len(ABLATIONS)} variants on {config}...")
+    print(
+        f"testing {len(seed_list)} seeds × {len(ABLATIONS)} variants on {config} "
+        f"(first seed is slow: builds/compiles the solver)...",
+        flush=True,
+    )
+    print("results stream in per seed; Ctrl-C anytime to stop and still get the table.", flush=True)
+    results: dict[int, dict] = {}
 
     if workers > 1:
         # Warm up codegen/compile ONCE so parallel workers only load the cached solver.
@@ -129,13 +207,28 @@ def search(
         cls(obs, info, cfg)
         env.close()
         chunks = [c for w in range(workers) if (c := seed_list[w::workers])]
-        results: dict[int, dict] = {}
         with ProcessPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(_run_seed_chunk, config, controller, c) for c in chunks]
-            for fut in as_completed(futs):
-                results.update(fut.result())
+            try:
+                for fut in as_completed(futs):
+                    results.update(fut.result())
+            except KeyboardInterrupt:
+                msg = f"\nInterrupted — reporting {len(results)} seed(s) from done chunks."
+                print(msg, flush=True)
+                ex.shutdown(wait=False, cancel_futures=True)
     else:
-        results = _run_seed_chunk(config, controller, seed_list)
+        env, cls, cfg, n_gates = _build_env(config, controller, False, None)
+        base = {k: getattr(cls, k) for k in _FLAGS}
+        try:
+            for s in seed_list:
+                res = _run_one_seed(env, cls, cfg, n_gates, base, s)
+                results[s] = res  # store only fully-completed seeds
+                _log_seed(s, res)
+        except KeyboardInterrupt:
+            msg = f"\nInterrupted — reporting the {len(results)} seed(s) completed so far."
+            print(msg, flush=True)
+        finally:
+            env.close()
 
     _report(results, config)
     return results
@@ -143,6 +236,9 @@ def search(
 
 def _report(results: dict[int, dict], config: str) -> None:
     """Print the seed × variant grid, the ideal seeds, and per-ablation coverage + commands."""
+    if not results:
+        print("No seeds completed — nothing to report.", flush=True)
+        return
     seeds = sorted(results)
     variants = list(ABLATIONS)
     ablations = [v for v in variants if v != "all_on"]

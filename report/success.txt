@@ -1,0 +1,116 @@
+jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ pixi shell -e deploy
+
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:42:09.133699  216046 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:42:09.136025  215939 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.010s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.002s.
+INFO:__main__:Track time: 9.244s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:42:53.317811  217054 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:42:53.319799  216931 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.002s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.002s.
+INFO:__main__:Track time: 8.720s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:43:57.698339  218148 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:43:57.701655  218013 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.005s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.000s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.004s.
+INFO:__main__:Track time: 8.843s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:45:01.621251  219037 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:45:01.623603  218931 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.006s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.007s.
+INFO:__main__:Track time: 8.791s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:45:53.982585  220093 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:45:53.985411  219988 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.002s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.004s.
+INFO:__main__:Track time: 8.198s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:46:38.609055  220929 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:46:38.611082  220824 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.001s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.006s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.010s.
+INFO:__main__:Track time: 8.705s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:47:32.030939  221963 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:47:32.032998  221857 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.005s.
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.006s.
+INFO:__main__:Track time: 8.525s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:48:17.337282  222797 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:48:17.339349  222672 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/jax/_src/compiler.py:834: UserWarning: Error writing persistent compilation cache entry for 'jit_gate_passed': PermissionError: [Errno 13] Permission denied: '/tmp/jax_cache/jit_gate_passed-155eab0b1fe2813c3023a99c71c71ff845c10aef695bbf73737c89ecb2957a9f-cache'
+  warnings.warn(
+INFO:lsy_drone_racing.envs.real_race_env:Waiting for drone 52 to connect...
+INFO:lsy_drone_racing.envs.real_race_env:Drone 52 connected to radio://0/80/2M/E7E7E7E734
+WARNING:__main__:Controller execution time exceeded loop frequency by 0.005s.
+INFO:__main__:Track time: 8.539s
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-(lsy_drone_racing:deploy) jeffr((lsy_drone_racin(l(lsy(ls(ls(l(l((l(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ python scripts/deploy.py --config final.toml
+W0701 12:54:34.780760  228880 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0701 12:54:34.782997  228710 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+Traceback (most recent call last):
+  File "/home/jeffrey/clean/lsy_drone_racing/scripts/deploy.py", line 87, in <module>
+    fire.Fire(main)
+  File "/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/fire/core.py", line 135, in Fire
+    component_trace = _Fire(component, args, parsed_flag_args, context, name)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/fire/core.py", line 468, in _Fire
+    component, remaining_args = _CallAndUpdateTrace(
+                                ^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/fire/core.py", line 684, in _CallAndUpdateTrace
+    component = fn(*varargs, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeffrey/clean/lsy_drone_racing/scripts/deploy.py", line 41, in main
+    env: RealDroneRaceEnv = gymnasium.make(
+                            ^^^^^^^^^^^^^^^
+  File "/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/gymnasium/envs/registration.py", line 734, in make
+    env = env_creator(**env_spec_kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeffrey/clean/lsy_drone_racing/lsy_drone_racing/envs/real_race_env.py", line 529, in __init__
+    super().__init__(
+  File "/home/jeffrey/clean/lsy_drone_racing/lsy_drone_racing/envs/real_race_env.py", line 128, in __init__
+    self._ros_connector = ROSConnector(
+                          ^^^^^^^^^^^^^
+  File "/home/jeffrey/clean/lsy_drone_racing/.pixi/envs/deploy/lib/python3.12/site-packages/drone_estimators/ros_nodes/ros2_connector.py", line 185, in __init__
+    raise TimeoutError(
+TimeoutError: Timeout while fetching initial positions for tracked objects. 
+Estimator data is missing for ['cf52'] objects. Is the estimator node running?
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ ^C
+(lsy_drone_racing:deploy) jeffrey@tueilsy-st-14:~/clean/lsy_drone_racing$ 
+

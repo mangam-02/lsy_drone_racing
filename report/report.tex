@@ -43,8 +43,10 @@ MPCC cost weights online, but found end-to-end training impractical because the
 embedded solver is sequential; the hand-designed context heuristics distil the
 same idea at negligible cost. On a fixed racing track our controller finishes
 $88\%$ of runs at a $7.37\,\mathrm{s}$ average lap time, and generalises to
-fully randomised tracks at $87\%$. An ablation study quantifies the contribution
-of each component.
+fully randomised tracks at $87\%$. Deployed unchanged on the physical
+Crazyflie, it completed all eight test flights at an $8.70\,\mathrm{s}$ mean lap
+time, confirming the sim-to-real transfer. An ablation study quantifies the
+contribution of each component.
 \end{abstract}
 
 \section{Introduction}
@@ -437,6 +439,42 @@ Level~3 (randomised) & $87.0\%$ & $8.51$ & $8.50$\\
 \end{tabular}
 \end{table}
 
+\subsection{Real-world deployment}
+The ultimate test is the physical Crazyflie. We deployed the \emph{exact} controller
+(config \texttt{final.toml}, $V_{\mathrm{tgt}}=2.5\,\mathrm{m/s}$, no re-tuning) on
+the real drone with a motion-capture state estimate. Across eight consecutive
+flights the drone completed the track \emph{every time}, with lap times of
+$\{8.20, 8.53, 8.54, 8.71, 8.72, 8.79, 8.84, 9.24\}\,\mathrm{s}$
+(Table~\ref{tab:real}). The mean of $8.70\,\mathrm{s}$ lies within
+$0.2\,\mathrm{s}$ of the Level-3 simulation mean ($8.51\,\mathrm{s}$), a small
+sim-to-real gap: the physical laps are marginally slower and more variable,
+consistent with unmodelled aerodynamics, battery sag, and estimator latency. The
+RTI solve held the $50\,\mathrm{Hz}$ deadline, with only occasional overruns of a
+few milliseconds ($\le 10\,\mathrm{ms}$) that did not affect completion. A ninth
+attempt aborted \emph{before} take-off due to a motion-capture estimator
+time-out---an infrastructure fault, not a controller failure. The controller thus
+transfers to hardware without modification, validating the simulation results.
+
+\begin{table}[t]
+\centering
+\caption{Real-world deployment on the physical Crazyflie
+(\texttt{final.toml}, $V_{\mathrm{tgt}}=2.5\,\mathrm{m/s}$): eight consecutive
+completed flights.}
+\label{tab:real}
+\begin{tabular}{lc}
+\toprule
+Metric & Value\\
+\midrule
+Completed flights & $8/8$\\
+Mean lap time & $8.70\,\mathrm{s}$\\
+Median lap time & $8.71\,\mathrm{s}$\\
+Best / worst & $8.20$ / $9.24\,\mathrm{s}$\\
+Std.\ deviation & $0.30\,\mathrm{s}$\\
+Level-3 simulation reference & $8.51\,\mathrm{s}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Ablation study}
 To quantify each component we perform a leave-one-out ablation (remove one
 mechanism, keep the rest) and an all-off reference (raw MPCC), all on Level~2
@@ -618,7 +656,10 @@ an ablation study attributes a distinct role to each. A held-out ablation on the
 randomised tracks further shows that the physics-based curvature rule generalises,
 whereas the two rules whose radii were tuned to the fixed track are mildly
 specialised to it---while the stack as a whole still beats the raw controller on
-unseen geometry.
+unseen geometry. Deployed unchanged on the physical Crazyflie, the controller
+completed all eight test flights at a $8.70\,\mathrm{s}$ mean lap time---within
+$0.2\,\mathrm{s}$ of the simulated Level-3 result---demonstrating that the
+approach transfers to hardware with only a small sim-to-real gap.
 
 The approach has limitations. Performance is corner-limited: reaching
 sub-$5\,\mathrm{s}$ laps would require a structurally better racing line (a
@@ -627,10 +668,10 @@ same lateral-acceleration budget) rather than higher cruise speed. The
 adaptation rules, though effective, are hand-designed; the reinforcement-learning
 weight scheduler that motivated them could not be trained affordably because the
 embedded \texttt{acados} solver is sequential and non-vectorisable, so its online
-promise remains untested. Finally, all results are in simulation; closing the
-sim-to-real gap on the physical Crazyflie is the ultimate objective. Future work
-therefore targets a minimum-curvature racing line, completion of the RL weight
-policy on parallel (Linux/GPU) infrastructure, and hardware validation.
+promise remains untested. Future work therefore targets a minimum-curvature
+racing line and completion of the RL weight policy on parallel (Linux/GPU)
+infrastructure to make the geometry-specific rules adaptive rather than
+hand-tuned.
 
 
 \bibliographystyle{IEEEtran}
