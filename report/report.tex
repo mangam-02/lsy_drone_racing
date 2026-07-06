@@ -10,6 +10,8 @@
 \usepackage{booktabs}
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+% Let columns end naturally instead of stretching vertical space to fill the page.
+\raggedbottom
 \begin{document}
 
 \title{Autonomous Drone Racing Report}
@@ -34,8 +36,8 @@ order while avoiding obstacles, with gate and obstacle poses only revealed once
 the drone is within sensor range, forcing online replanning. We embed a
 geometric racing line, produced by a B-spline planner, directly into the
 prediction model as a function of a progress state, so that the reference cannot
-"run away" from the drone---a failure mode we observed with a time-indexed
-reference-tracking MPC. On top of the nominal MPCC we add three lightweight,
+"run away" from the drone, a failure mode we observed with a time-indexed
+reference-tracking Model Predictive Control (MPC). On top of the nominal MPCC we add three lightweight,
 context-dependent mechanisms: a curvature-based speed cap, a near-gate
 contouring boost, and a caution mode that slows the drone near unmeasured
 objects. We also implemented a reinforcement-learning (RL) layer that adapts the
@@ -57,8 +59,8 @@ limits, and hard geometric constraints (the gates) in a single task
 performance using both learning-based \cite{kaufmann2023champion} and
 optimisation-based \cite{foehn2021timeoptimal,romero2022mpcc} approaches, and the
 gap between the two is an active research direction. Beyond racing, the
-underlying problem---flying a prescribed path as fast as possible while
-respecting dynamics and safety limits---is representative of a broad class of
+underlying problem (flying a prescribed path as fast as possible while
+respecting dynamics and safety limits) is representative of a broad class of
 agile aerial applications such as inspection and delivery.
 
 In this work we consider the drone-racing task posed by the course simulator: a
@@ -75,7 +77,7 @@ real hardware, so overfitting to one geometry is penalised by the sim-to-real
 gap and by unseen layouts.
 
 We address this with Model Predictive Contouring Control (MPCC)
-\cite{lam2010mpcc,liniger2015racing,romero2022mpcc}, which optimises progress
+\cite{lam2010mpcc,liniger2015racing,romero2022mpcc,krinner2024mpccpp}, which optimises progress
 along a geometric reference path rather than tracking a time-parameterised
 trajectory. We contribute (i) a complete MPCC realisation for the Crazyflie with
 soft obstacle and gate-frame avoidance embedded in the cost, (ii) three
@@ -89,10 +91,12 @@ each component.
 \cite{lam2010mpcc} and adapted to autonomous racing of scale cars
 \cite{liniger2015racing}, where progress along a reference is maximised online.
 Romero et al.\ transferred MPCC to quadrotors and showed near-time-optimal flight
-\cite{romero2022mpcc}, while time-optimal planning approaches compute aggressive
-reference trajectories offline \cite{foehn2021timeoptimal,penicka2022}. Our work
-builds directly on the quadrotor MPCC of \cite{romero2022mpcc} but targets a
-partially observed, replanning setting rather than a known track.
+\cite{romero2022mpcc}, and Krinner et al.\ extended it with hard safety constraints in MPCC++ \cite{krinner2024mpccpp}, while time-optimal planning approaches compute
+aggressive reference trajectories offline \cite{foehn2021timeoptimal,penicka2022}.
+Our work builds directly on this quadrotor MPCC line
+\cite{romero2022mpcc,krinner2024mpccpp}, but keeps collision avoidance soft in the
+cost rather than as MPCC++'s hard tunnel, and targets a partially observed, replanning setting rather than a known
+track.
 
 \emph{Learning-based racing and control.} End-to-end reinforcement learning has
 reached champion-level performance from onboard sensing
@@ -201,7 +205,7 @@ replan converges in a few iterations.
 \end{figure}
 
 \subsection{MPCC formulation}
-Following \cite{lam2010mpcc,liniger2015racing,romero2022mpcc} we augment the
+Following \cite{lam2010mpcc,liniger2015racing,romero2022mpcc,krinner2024mpccpp} we augment the
 quadrotor state with a \emph{progress} state $\theta$ and its rate $v_\theta$,
 driven by a virtual input $a_\theta$:
 \begin{equation}
@@ -246,7 +250,7 @@ line is the core MPCC objective: track the line ($\mathbf{e}_c$), keep the
 progress state glued to the drone ($e_l$), and cruise ($e_v$). We deliberately
 set $q_l\!\gg\! q_v$ (here $150$ vs.\ $5$) so the progress state cannot sprint
 ahead of the physical drone. The remaining terms penalise attitude, body rate,
-and control effort. Collision avoidance is \emph{soft}: each obstacle and gate
+and control effort. Collision avoidance is \emph{soft}, in contrast to the hard tunnel constraint of MPCC++ \cite{krinner2024mpccpp}: each obstacle and gate
 frame is modelled as a capsule $\mathcal{C}_j$ and enters the cost through a
 one-sided barrier residual
 \begin{equation}
@@ -299,6 +303,25 @@ source-and-settings hash and reused across episodes, so only the first run pays
 the code-generation cost, and the resulting solve times are compatible with the
 $50\,\mathrm{Hz}$ loop.
 
+Problem \eqref{eq:cost} is transcribed with direct multiple shooting
+(explicit Runge--Kutta integration) and solved with \texttt{acados}
+\cite{verschueren2022acados} using a Gauss--Newton Hessian and the Real-Time
+Iteration (RTI) scheme \cite{diehl2005rti}, which replaces a fully converged SQP
+solve with a single SQP iteration per control tick, split into a preparation and a
+feedback phase; the resulting QP is solved by \texttt{HPIPM} \cite{frison2020hpipm}
+in full-condensing mode, and the symbolic model and cost are built with CasADi
+\cite{andersson2019casadi}. A receding-horizon warm start shifts the previous
+solution one node forward, keeping each tick near the previous optimum, so a single
+iteration suffices and the optimiser converges \emph{across} control ticks rather
+than within one. On a path swap, where this no longer holds, the solver is re-seeded
+and re-converged with a short iteration burst. The fixed per-tick cost is what keeps
+the $50\,\mathrm{Hz}$ deadline reliable, whereas a fully converged SQP would spend a
+data-dependent number of iterations and risk missing it. The generated C solver is
+cached by a source-and-settings hash and reused across episodes, so only the first
+run pays the code-generation cost.
+
+
+
 \subsection{Why contouring control instead of reference tracking}
 Our first controller was a reference-tracking MPC that followed a
 \emph{time-indexed} trajectory $\mathbf{p}_{\mathrm{ref}}(t_k)$. Because the
@@ -311,6 +334,18 @@ function of a \emph{state the optimiser itself controls}, so it can never outrun
 the drone \cite{romero2022mpcc}. This is the central reason we adopted MPCC; it
 also aligns naturally with the model-predictive path-following formulation of
 \cite{faulwasser2016mpfc}.
+
+Intuitively, $\theta$ is a virtual particle running along the racing line whose
+speed the optimiser sets, with the drone tethered to it by the contouring and lag
+costs. Because the far horizon nodes are evaluated at $\mathbf{p}_d(\theta)$ inside
+an upcoming corner (where a small contouring error at high speed would demand
+infeasible attitude), the optimiser slows $\theta$ before the apex and
+accelerates out, so MPCC already brakes implicitly through corners \cite{romero2022mpcc,krinner2024mpccpp}. This only works
+if the path enters the cost as the live function $\mathbf{p}_d(\theta)$;
+freezing a per-tick reference point drops $\theta$ from the objective and silently
+reduces the controller to point-tracking MPC, the very failure mode above. The lag
+weight $q_l\!\gg\!q_v$ is the soft anchor that keeps $\theta$ glued to the drone
+through the turn. Because our progress reward tracks a target speed rather than maximising raw progress, this implicit braking alone still carries too much speed into sharp turns; the explicit curvature cap of the next subsection lowers that target into corners. 
 
 \subsection{Context-dependent adaptation}
 Two properties of the track are known to the planner but not encoded in the
@@ -408,20 +443,22 @@ disturbances); and \emph{Level~3}, identical disturbances but with the whole
 track geometry randomised every episode. All numbers below are over $n=100$
 episodes at a \emph{fixed} seed ($\mathrm{seed}=0$): because the seed is held
 constant across configurations, every variant is evaluated on the \emph{same}
-sequence of disturbances---and, on Level~3, the same sequence of random
-tracks---so the comparisons are \emph{paired}. We treat Level~2 as the
+sequence of disturbances (and, on Level~3, the same sequence of random
+tracks), so the comparisons are \emph{paired}. We treat Level~2 as the
 \emph{development} track (on which the controller was tuned) and Level~3 as a
-\emph{held-out} test of generalisation. A run is a success iff all four gates are
+\emph{held-out} test of generalisation. A run is a success if all four gates are
 passed. We report success rate, the mean/median lap time over \emph{successful}
 runs, and a breakdown of failures by the nearest physical object at the crash.
 
 \subsection{Nominal performance}
 Table~\ref{tab:main} reports the full controller. On the fixed track it finishes
-$88\%$ of runs at $7.37\,\mathrm{s}$ mean lap time, and---importantly---it
+$88\%$ of runs at $7.37\,\mathrm{s}$ mean lap time, and, importantly, it
 retains $87\%$ on the fully randomised track, indicating that the method does not
-overfit the single Level~2 geometry. Lap time rises to $8.51\,\mathrm{s}$ on
-Level~3, reflecting the wider, more conservative lines the planner produces for
-unfamiliar layouts. Failures are dominated by gate-frame clips at the tight
+overfit the single Level~2 geometry. The mean lap time on Level~3
+($8.51\,\mathrm{s}$) is higher than on Level~2, but the two are not directly
+comparable: the randomised Level~3 tracks are on average longer than the fixed
+Level~2 layout, so the difference chiefly reflects track length rather than a
+slower or more conservative controller. Failures are dominated by gate-frame clips at the tight
 $180^\circ$ reversal (gate~2) and at the final gate, where a late pose reveal
 leaves the least room to correct.
 
@@ -450,9 +487,7 @@ $0.2\,\mathrm{s}$ of the Level-3 simulation mean ($8.51\,\mathrm{s}$), a small
 sim-to-real gap: the physical laps are marginally slower and more variable,
 consistent with unmodelled aerodynamics, battery sag, and estimator latency. The
 RTI solve held the $50\,\mathrm{Hz}$ deadline, with only occasional overruns of a
-few milliseconds ($\le 10\,\mathrm{ms}$) that did not affect completion. A ninth
-attempt aborted \emph{before} take-off due to a motion-capture estimator
-time-out---an infrastructure fault, not a controller failure. The controller thus
+few milliseconds ($\le 10\,\mathrm{ms}$) that did not affect completion. The controller thus
 transfers to hardware without modification, validating the simulation results.
 
 \begin{table}[t]
@@ -519,20 +554,20 @@ when removed; its value is as a \emph{speed-scaling safety margin} that becomes
 essential once $V_{\mathrm{tgt}}$ is raised, keeping a fast configuration from
 overshooting the reversal. Stacking all three converts the raw MPCC
 ($62\%$/$5.97\,\mathrm{s}$) into the full controller ($88\%$/$7.37\,\mathrm{s}$):
-$+26$ points of success for $+1.4\,\mathrm{s}$. Notably, the raw-MPCC figure
-matches the official $20$-run benchmark ($60\%$/$5.86\,\mathrm{s}$),
-cross-validating our measurements and confirming that the heuristics---not the
-base solver---are the source of robustness.
+$+26$ points of success for $+1.4\,\mathrm{s}$, which shows that the heuristics,
+not the base solver, are the source of robustness.
 
 \subsection{Speed/robustness trade-off}
-The ablation shows the geometric rules move the operating point outward; a
-natural question is how far a single \emph{scalar} speed knob can push instead.
+The ablation shows that the geometric rules improve the underlying trade-off
+between success rate and lap time, rather than merely exchanging one for the
+other. A natural follow-up is whether a single scalar speed parameter, the
+cruise target $V_{\mathrm{tgt}}$, could achieve the same gains on its own.
 Table~\ref{tab:sweep} sweeps the cruise target $V_{\mathrm{tgt}}$ of the full
 controller. Lowering it to $2.0\,\mathrm{m/s}$ trades $0.7\,\mathrm{s}$ of lap
 time for $2$ points of success, i.e.\ it stays on the same Pareto front. Pushing
 it past the matched value, however, falls off a cliff: at $3.0\,\mathrm{m/s}$
-success already drops to $79\%$, and at $3.5\,\mathrm{m/s}$---well above the soft
-per-axis velocity bound $v_{\max}=2.0\,\mathrm{m/s}$---the optimiser flies
+success already drops to $79\%$, and at $3.5\,\mathrm{m/s}$ (well above the soft
+per-axis velocity bound $v_{\max}=2.0\,\mathrm{m/s}$) the optimiser flies
 permanently against that bound, oversteering into the frames, yet buys almost no
 extra time ($6.83\!\to\!6.80\,\mathrm{s}$) while success collapses to $74\%$
 (collisions rise to $13\%$). The knob therefore only \emph{slides} the controller
@@ -570,12 +605,12 @@ however, only the \emph{curvature cap} transfers cleanly: removing it costs
 $4$ points on Level~3 (it was neutral on Level~2), matching the intuition that
 random layouts contain sharper corners where the lateral-acceleration limit
 actually binds. In contrast, the \emph{gate-track boost} and \emph{caution mode}
----the two components whose radii were tuned to Level~2's fixed reversal and gate
-spacing---do not help on Level~3; removing either even nudges success up ($+4$ and
+(the two components whose radii were tuned to Level~2's fixed reversal and gate
+spacing) do not help on Level~3; removing either even nudges success up ($+4$ and
 $+3$ points), i.e.\ they are mildly specialised to the development geometry. We
 keep them because they are strongly positive on the realistic fixed-track setting
 the controller is ultimately graded on, and are not harmful in aggregate, but
-this is a clear pointer to make them geometry-adaptive---a natural fit for the
+this is a clear pointer to make them geometry-adaptive, a natural fit for the
 learned weight policy that motivated them.
 
 \begin{table}[t]
@@ -601,7 +636,7 @@ All off (raw MPCC)     & $81.0\%$ & $7.30$ & $17$\\
   \caption{Held-out ablation on the randomised Level~3 ($n=100$): success rate
   (bars, left) and mean lap time (line, right). Unlike Level~2
   (Fig.~\ref{fig:ablation}), removing the gate-track boost or caution mode does
-  not lower success---these rules are specialised to the fixed track---whereas
+  not lower success (these rules are specialised to the fixed track), whereas
   removing the curvature cap does, and the raw controller is still worst.}
   \label{fig:ablation3}
 \end{figure}
@@ -649,16 +684,16 @@ Section~\ref{sec:conclusion}.
 We presented an MPCC-based drone-racing controller that embeds a
 collision-aware racing line into the prediction model as a function of a progress
 state, eliminating the reference-runaway failure of time-indexed reference
-tracking. Three lightweight context-adaptation rules---a curvature speed cap, a
-near-gate contouring boost, and a caution mode---lift a raw $62\%$ success rate
+tracking. Three lightweight context-adaptation rules (a curvature speed cap, a
+near-gate contouring boost, and a caution mode) lift a raw $62\%$ success rate
 to $88\%$ on a fixed track while retaining $87\%$ on fully randomised tracks, and
 an ablation study attributes a distinct role to each. A held-out ablation on the
 randomised tracks further shows that the physics-based curvature rule generalises,
 whereas the two rules whose radii were tuned to the fixed track are mildly
-specialised to it---while the stack as a whole still beats the raw controller on
+specialised to it, while the stack as a whole still beats the raw controller on
 unseen geometry. Deployed unchanged on the physical Crazyflie, the controller
-completed all eight test flights at a $8.70\,\mathrm{s}$ mean lap time---within
-$0.2\,\mathrm{s}$ of the simulated Level-3 result---demonstrating that the
+completed all eight test flights at a $8.70\,\mathrm{s}$ mean lap time, within
+$0.2\,\mathrm{s}$ of the simulated Level-3 result, demonstrating that the
 approach transfers to hardware with only a small sim-to-real gap.
 
 The approach has limitations. Performance is corner-limited: reaching
