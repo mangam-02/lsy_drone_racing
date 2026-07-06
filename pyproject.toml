@@ -74,7 +74,6 @@ compilers = ">=1.9.0, <1.11.0"
 cmake = "==3.26.0"  # Pinned for motion_capture_tracking
 make = "==4.4.1"  # Pinned for motion_capture_tracking
 openblas = ">=0.3.30,<0.4"
-pytest-forked = ">=1.6.0,<2"
 
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
@@ -87,7 +86,7 @@ evaluate = { cmd = "python scripts/evaluate.py", description = "Evaluate the con
 
 ### environments
 [tool.pixi.environments]
-default = { features = ["sim"], solve-group = "default" }
+default = { features = ["sim", "rl"], solve-group = "default" }
 deploy = { features = ["sim", "gpu", "kilted", "deploy"] }
 gpu = { features = ["sim", "gpu"], solve-group = "default" }
 tests = { features = ["sim", "rl", "tests"], solve-group = "default" }
