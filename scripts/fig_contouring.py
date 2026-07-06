@@ -29,8 +29,15 @@ def save(fig, name: str) -> None:
 def arrow(ax, p0, p1, color, lw=2.0, style="-|>", ms=14):
     ax.add_patch(
         FancyArrowPatch(
-            p0, p1, arrowstyle=style, mutation_scale=ms, lw=lw, color=color,
-            shrinkA=0, shrinkB=0, zorder=5,
+            p0,
+            p1,
+            arrowstyle=style,
+            mutation_scale=ms,
+            lw=lw,
+            color=color,
+            shrinkA=0,
+            shrinkB=0,
+            zorder=5,
         )
     )
 
@@ -60,8 +67,14 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(5.2, 3.4))
 
     # Path.
-    ax.plot(path[:, 0], path[:, 1], color="#1f4e79", lw=2.6, zorder=1,
-            label=r"reference path $p_d(\theta)$")
+    ax.plot(
+        path[:, 0],
+        path[:, 1],
+        color="#1f4e79",
+        lw=2.6,
+        zorder=1,
+        label=r"reference path $p_d(\theta)$",
+    )
 
     # Tangent line (thin, dashed) through pd.
     tl = np.array([pd - 1.15 * tan, pd + 1.15 * tan])
@@ -69,23 +82,32 @@ def main() -> None:
 
     # Deviation vector d = p - p_d.
     arrow(ax, pd, p, "#444444", lw=1.6, style="-|>", ms=11)
-    ax.annotate(r"$d = p - p_d$", (pd + p) / 2 + np.array([-0.55, 0.10]),
-                color="#444444", fontsize=11, ha="right")
+    ax.annotate(
+        r"$d = p - p_d$",
+        (pd + p) / 2 + np.array([-0.55, 0.10]),
+        color="#444444",
+        fontsize=11,
+        ha="right",
+    )
 
     # Lag error e_l along tangent.
     arrow(ax, pd, foot, "#2c7fb8", lw=2.4)
-    ax.annotate(r"$e_l\,t(\theta)$", (pd + foot) / 2 + np.array([-0.05, -0.22]),
-                color="#2c7fb8", fontsize=12)
+    ax.annotate(
+        r"$e_l\,t(\theta)$",
+        (pd + foot) / 2 + np.array([-0.05, -0.22]),
+        color="#2c7fb8",
+        fontsize=12,
+    )
 
     # Contouring error e_c perpendicular.
     arrow(ax, foot, p, "#d94801", lw=2.4)
-    ax.annotate(r"$e_c$", (foot + p) / 2 + np.array([0.10, -0.02]),
-                color="#d94801", fontsize=13)
+    ax.annotate(r"$e_c$", (foot + p) / 2 + np.array([0.10, -0.02]), color="#d94801", fontsize=13)
 
     # Tangent direction arrow.
     arrow(ax, pd, pd + 0.9 * tan, "#666666", lw=1.4, ms=10)
-    ax.annotate(r"$t(\theta)$", pd + 0.95 * tan + np.array([0.0, -0.2]),
-                color="#666666", fontsize=11)
+    ax.annotate(
+        r"$t(\theta)$", pd + 0.95 * tan + np.array([0.0, -0.2]), color="#666666", fontsize=11
+    )
 
     # Right-angle marker at the foot.
     d1 = -tan * 0.09
@@ -95,11 +117,11 @@ def main() -> None:
 
     # Points.
     ax.scatter(*pd, s=45, color="#1f4e79", zorder=7)
-    ax.annotate(r"$p_d(\theta)$", pd + np.array([-0.02, 0.16]),
-                color="#1f4e79", fontsize=11, ha="right")
+    ax.annotate(
+        r"$p_d(\theta)$", pd + np.array([-0.02, 0.16]), color="#1f4e79", fontsize=11, ha="right"
+    )
     ax.scatter(*p, s=60, color="black", zorder=7)
-    ax.annotate(r"drone $p$", p + np.array([0.14, -0.02]), color="black",
-                fontsize=11, ha="left")
+    ax.annotate(r"drone $p$", p + np.array([0.14, -0.02]), color="black", fontsize=11, ha="left")
 
     ax.set_aspect("equal")
     ax.set_xlim(px.min() - 0.3, px.max() + 0.3)

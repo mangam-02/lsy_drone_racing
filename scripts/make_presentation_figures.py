@@ -50,10 +50,15 @@ def save(fig, name: str) -> None:
 def get_track_obs(config) -> dict:
     config.sim.render = False
     env = gymnasium.make(
-        config.env.id, freq=config.env.freq, sim_config=config.sim,
-        sensor_range=config.env.sensor_range, control_mode=config.env.control_mode,
-        track=config.env.track, disturbances=config.env.get("disturbances"),
-        randomizations=config.env.get("randomizations"), seed=SEED,
+        config.env.id,
+        freq=config.env.freq,
+        sim_config=config.sim,
+        sensor_range=config.env.sensor_range,
+        control_mode=config.env.control_mode,
+        track=config.env.track,
+        disturbances=config.env.get("disturbances"),
+        randomizations=config.env.get("randomizations"),
+        seed=SEED,
     )
     env = JaxToNumpy(env)
     obs, _ = env.reset(seed=SEED)
@@ -72,19 +77,20 @@ def draw_gate_topdown(ax, center, quat, label):
     cx, cy = center[0], center[1]
 
     def rect(hy, hx):
-        return np.array([
-            [cx - hy * y_axis[0] - hx * x_axis[0], cy - hy * y_axis[1] - hx * x_axis[1]],
-            [cx + hy * y_axis[0] - hx * x_axis[0], cy + hy * y_axis[1] - hx * x_axis[1]],
-            [cx + hy * y_axis[0] + hx * x_axis[0], cy + hy * y_axis[1] + hx * x_axis[1]],
-            [cx - hy * y_axis[0] + hx * x_axis[0], cy - hy * y_axis[1] + hx * x_axis[1]],
-        ])
+        return np.array(
+            [
+                [cx - hy * y_axis[0] - hx * x_axis[0], cy - hy * y_axis[1] - hx * x_axis[1]],
+                [cx + hy * y_axis[0] - hx * x_axis[0], cy + hy * y_axis[1] - hx * x_axis[1]],
+                [cx + hy * y_axis[0] + hx * x_axis[0], cy + hy * y_axis[1] + hx * x_axis[1]],
+                [cx - hy * y_axis[0] + hx * x_axis[0], cy - hy * y_axis[1] + hx * x_axis[1]],
+            ]
+        )
 
     outer = rect(ho, hd)
     ax.fill(outer[:, 0], outer[:, 1], color="#c0392b", alpha=0.85, zorder=3)
     inner = rect(hi, hd)
     ax.fill(inner[:, 0], inner[:, 1], color="white", zorder=4)
-    ax.text(cx + 0.10, cy + 0.10, label, color="#c0392b", fontsize=11,
-            fontweight="bold", zorder=6)
+    ax.text(cx + 0.10, cy + 0.10, label, color="#c0392b", fontsize=11, fontweight="bold", zorder=6)
 
 
 def fig_topdown(planner: SimplePlanner, obs: dict):
@@ -92,35 +98,56 @@ def fig_topdown(planner: SimplePlanner, obs: dict):
     raw = planner._raw_waypoints
 
     fig, ax = plt.subplots(figsize=(11, 6.5))
-    ax.add_patch(plt.Polygon([[-2.5, -1.5], [2.5, -1.5], [2.5, 1.5], [-2.5, 1.5]],
-                             fill=False, edgecolor="gray", lw=1.5, ls="--"))
+    ax.add_patch(
+        plt.Polygon(
+            [[-2.5, -1.5], [2.5, -1.5], [2.5, 1.5], [-2.5, 1.5]],
+            fill=False,
+            edgecolor="gray",
+            lw=1.5,
+            ls="--",
+        )
+    )
 
     # Planned trajectory.
-    ax.plot(traj[:, 0], traj[:, 1], "-", color="#1f77b4", lw=2.5,
-            label="Planned B-spline trajectory", zorder=2)
+    ax.plot(
+        traj[:, 0],
+        traj[:, 1],
+        "-",
+        color="#1f77b4",
+        lw=2.5,
+        label="Planned B-spline trajectory",
+        zorder=2,
+    )
 
     # Waypoints: fixed gate waypoints (magenta) vs free intermediates (purple).
     for p, v in raw:
         c = "magenta" if v is not None else "#7f5fbf"
-        ax.scatter(p[0], p[1], color=c, s=45, zorder=5,
-                   edgecolors="white", linewidths=0.5)
+        ax.scatter(p[0], p[1], color=c, s=45, zorder=5, edgecolors="white", linewidths=0.5)
     ax.scatter([], [], color="magenta", s=45, label="Fixed gate waypoints")
     ax.scatter([], [], color="#7f5fbf", s=45, label="Optimized free waypoints")
 
     # Start.
-    ax.scatter(*obs["pos"][:2], color="#2ca02c", s=160, marker="*",
-               zorder=6, label="Start", edgecolors="black", linewidths=0.6)
+    ax.scatter(
+        *obs["pos"][:2],
+        color="#2ca02c",
+        s=160,
+        marker="*",
+        zorder=6,
+        label="Start",
+        edgecolors="black",
+        linewidths=0.6,
+    )
 
     # Obstacles: physical pole + clearance ring.
     for opos in obs["obstacles_pos"]:
-        ax.add_patch(plt.Circle(opos[:2], SimplePlanner.PLAN_CLEARANCE,
-                                color="orange", alpha=0.25, zorder=1))
+        ax.add_patch(
+            plt.Circle(opos[:2], SimplePlanner.PLAN_CLEARANCE, color="orange", alpha=0.25, zorder=1)
+        )
         ax.add_patch(plt.Circle(opos[:2], 0.04, color="#8B4513", zorder=5))
-    ax.scatter([], [], marker="o", s=140, color="orange", alpha=0.25,
-               label="Obstacle clearance")
+    ax.scatter([], [], marker="o", s=140, color="orange", alpha=0.25, label="Obstacle clearance")
 
     for i, (gpos, gquat) in enumerate(zip(obs["gates_pos"], obs["gates_quat"])):
-        draw_gate_topdown(ax, gpos, gquat, f"G{i+1}")
+        draw_gate_topdown(ax, gpos, gquat, f"G{i + 1}")
 
     ax.set_aspect("equal")
     ax.set_xlim(-2.6, 2.6)
@@ -129,9 +156,16 @@ def fig_topdown(planner: SimplePlanner, obs: dict):
     ax.set_ylabel("y [m]")
     ax.legend(loc="upper left", framealpha=0.9, fontsize=9)
     # Inside the dashed arena box, bottom-right corner.
-    ax.text(2.4, -1.4, f"level 3, seed {SEED}",
-            ha="right", va="bottom", fontsize=9, color="#555",
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#bbb", alpha=0.8))
+    ax.text(
+        2.4,
+        -1.4,
+        f"level 3, seed {SEED}",
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        color="#555",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#bbb", alpha=0.8),
+    )
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     save(fig, "planning_topdown")
@@ -169,18 +203,35 @@ def fig_speed(planner: SimplePlanner):
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(s, speed, "-", color="#1f77b4", lw=2.5, label="Planned reference speed")
-    ax.plot(s_cap, vcap, "-", color="#d94801", lw=2.2,
-            label=r"Curvature cap $v_{\mathrm{cap}}(s)=\sqrt{a_{\mathrm{lat}}/\kappa}$")
-    ax.axhline(planner.TARGET_SPEED, ls="--", color="#2ca02c", lw=1.5,
-               label=f"Cruise target $V_{{\\mathrm{{tgt}}}}$ ({planner.TARGET_SPEED} m/s)")
+    ax.plot(
+        s_cap,
+        vcap,
+        "-",
+        color="#d94801",
+        lw=2.2,
+        label=r"Curvature cap $v_{\mathrm{cap}}(s)=\sqrt{a_{\mathrm{lat}}/\kappa}$",
+    )
+    ax.axhline(
+        planner.TARGET_SPEED,
+        ls="--",
+        color="#2ca02c",
+        lw=1.5,
+        label=f"Cruise target $V_{{\\mathrm{{tgt}}}}$ ({planner.TARGET_SPEED} m/s)",
+    )
 
     # Shade ramp regions.
     a = SimplePlanner.ACCEL_DIST
     ax.axvspan(0, a, color="orange", alpha=0.12)
     ax.axvspan(s[-1] - SimplePlanner.DECEL_DIST, s[-1], color="orange", alpha=0.12)
     ax.text(a / 2, 0.15, "accel", ha="center", color="darkorange", fontsize=9)
-    ax.text(s[-1] - SimplePlanner.DECEL_DIST / 2, 0.15, "decel", ha="center",
-            color="darkorange", fontsize=9)
+    ax.text(
+        s[-1] - SimplePlanner.DECEL_DIST / 2,
+        0.15,
+        "decel",
+        ha="center",
+        color="darkorange",
+        fontsize=9,
+    )
 
     ax.set_xlabel("Arc length along path $s$ [m]")
     ax.set_ylabel("Speed [m/s]")
@@ -197,22 +248,57 @@ def fig_speed(planner: SimplePlanner):
 
 def box(ax, xy, w, h, text, fc, ec="black", fs=11, fontweight="bold"):
     cx, cy = xy
-    ax.add_patch(FancyBboxPatch(
-        (cx - w / 2, cy - h / 2), w, h,
-        boxstyle="round,pad=0.02,rounding_size=0.04",
-        fc=fc, ec=ec, lw=1.8, zorder=2))
-    ax.text(cx, cy, text, ha="center", va="center", fontsize=fs,
-            fontweight=fontweight, zorder=3, wrap=True)
+    ax.add_patch(
+        FancyBboxPatch(
+            (cx - w / 2, cy - h / 2),
+            w,
+            h,
+            boxstyle="round,pad=0.02,rounding_size=0.04",
+            fc=fc,
+            ec=ec,
+            lw=1.8,
+            zorder=2,
+        )
+    )
+    ax.text(
+        cx,
+        cy,
+        text,
+        ha="center",
+        va="center",
+        fontsize=fs,
+        fontweight=fontweight,
+        zorder=3,
+        wrap=True,
+    )
 
 
 def arrow(ax, p1, p2, text="", color="black", rad=0.0, fs=9, ls="-"):
-    ax.add_patch(FancyArrowPatch(
-        p1, p2, arrowstyle="-|>", mutation_scale=18, lw=1.8,
-        color=color, connectionstyle=f"arc3,rad={rad}", zorder=1, linestyle=ls))
+    ax.add_patch(
+        FancyArrowPatch(
+            p1,
+            p2,
+            arrowstyle="-|>",
+            mutation_scale=18,
+            lw=1.8,
+            color=color,
+            connectionstyle=f"arc3,rad={rad}",
+            zorder=1,
+            linestyle=ls,
+        )
+    )
     if text:
         mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-        ax.text(mx, my + 0.06 + abs(rad) * 0.8, text, ha="center", va="bottom",
-                fontsize=fs, color=color, style="italic")
+        ax.text(
+            mx,
+            my + 0.06 + abs(rad) * 0.8,
+            text,
+            ha="center",
+            va="bottom",
+            fontsize=fs,
+            color=color,
+            style="italic",
+        )
 
 
 # ── Figure 3: MPC block diagram ──────────────────────────────────────────────
@@ -232,8 +318,15 @@ def fig_mpc_diagram():
     arrow(ax, (7.0, 2.6), (8.3, 2.6), "1st command\n[r, p, y, T]")
     # Feedback loop: drone state back into the MPC.
     arrow(ax, (9.6, 2.0), (5.4, 2.0), "", color="#888", rad=-0.3)
-    ax.text(7.5, 0.7, "state feedback (pos, vel, attitude)", ha="center",
-            fontsize=9, color="#555", style="italic")
+    ax.text(
+        7.5,
+        0.7,
+        "state feedback (pos, vel, attitude)",
+        ha="center",
+        fontsize=9,
+        color="#555",
+        style="italic",
+    )
     fig.tight_layout()
     save(fig, "mpc_blockdiagram")
 
@@ -260,11 +353,27 @@ def fig_rl_diagram():
 
     # RL wiring: state in (from drone), weight multipliers out (into MPC).
     arrow(ax, (9.2, 2.8), (7.5, 3.9), "", color="#c0392b", rad=-0.25)
-    ax.text(8.9, 3.35, "state\n(error, speed,\ngate/obstacle)", ha="left", va="center",
-            fontsize=8.5, color="#c0392b", style="italic")
+    ax.text(
+        8.9,
+        3.35,
+        "state\n(error, speed,\ngate/obstacle)",
+        ha="left",
+        va="center",
+        fontsize=8.5,
+        color="#c0392b",
+        style="italic",
+    )
     arrow(ax, (4.9, 3.7), (5.5, 2.85), "", color="#c0392b", rad=0.1)
-    ax.text(4.05, 3.25, "weight\nmultipliers", ha="center", va="center",
-            fontsize=8.5, color="#c0392b", style="italic")
+    ax.text(
+        4.05,
+        3.25,
+        "weight\nmultipliers",
+        ha="center",
+        va="center",
+        fontsize=8.5,
+        color="#c0392b",
+        style="italic",
+    )
     fig.tight_layout()
     save(fig, "rl_blockdiagram")
 

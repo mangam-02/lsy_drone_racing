@@ -722,11 +722,9 @@ class SimplePlanner:
         gates_pos, gates_quat = obs["gates_pos"], obs["gates_quat"]
         obstacles_xy = [(float(p[0]), float(p[1])) for p in obs["obstacles_pos"]]
         bias = np.array([0.0, 0.0, self.GATE_Z_BIAS])  # aim a touch high to cancel the sag
-        data, prev = [], self._start_pos.copy()
+        data = []
         for i in range(len(gates_pos)):
             x_axis = R.from_quat(gates_quat[i]).apply([1.0, 0.0, 0.0])
-            #if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
-                #x_axis = -x_axis
             center = gates_pos[i] + bias
             # Keep the entry/exit waypoints out of any obstacle's keep-out (see GATE_WP_MIN_DIST):
             # a pole on the approach/departure line otherwise forces a contorted swerve. The exit
@@ -743,7 +741,6 @@ class SimplePlanner:
                 center, x_axis, self.DEPART_DIST, obstacles_xy, self.GATE_EXIT_MIN_DIST
             )
             data.append((center, x_axis.copy(), entry, exit_))
-            prev = exit_
         return data
 
     def _clear_waypoint(

@@ -23,11 +23,11 @@ LABELS = ["Full", "$-$Boost", "$-$Curv.", "$-$Caution", "All off"]
 
 # Level 2 (fixed track), n=100, seed=0.
 SUCCESS_L2 = [88.0, 83.0, 88.0, 79.0, 62.0]  # %
-TIME_L2 = [7.37, 7.46, 7.15, 6.13, 5.97]      # s
+TIME_L2 = [7.37, 7.46, 7.15, 6.13, 5.97]  # s
 
 # Level 3 (randomised tracks, held-out), n=100, seed=0.
-SUCCESS_L3 = [87.0, 91.0, 83.0, 90.0, 81.0]   # %
-TIME_L3 = [8.51, 8.32, 7.86, 7.46, 7.30]      # s
+SUCCESS_L3 = [87.0, 91.0, 83.0, 90.0, 81.0]  # %
+TIME_L3 = [8.51, 8.32, 7.86, 7.46, 7.30]  # s
 
 
 def save(fig, name: str) -> None:
@@ -41,16 +41,14 @@ def make(success, time, title, name) -> None:
     x = np.arange(len(LABELS))
     fig, ax1 = plt.subplots(figsize=(5.6, 3.4))
 
-    ax1.bar(x, success, width=0.62, color="#4c78a8",
-            edgecolor="#274c6e", label="success rate")
+    ax1.bar(x, success, width=0.62, color="#4c78a8", edgecolor="#274c6e", label="success rate")
     ax1.set_ylabel("success rate [%]", color="#274c6e", fontsize=11)
     ax1.set_ylim(0, 100)
     ax1.tick_params(axis="y", labelcolor="#274c6e")
     ax1.set_xticks(x)
     ax1.set_xticklabels(LABELS, fontsize=10)
     for xi, s in zip(x, success):
-        ax1.annotate(f"{s:.0f}", (xi, s + 1.5), ha="center", fontsize=9,
-                     color="#274c6e")
+        ax1.annotate(f"{s:.0f}", (xi, s + 1.5), ha="center", fontsize=9, color="#274c6e")
 
     ax2 = ax1.twinx()
     ax2.plot(x, time, "o-", color="#d94801", lw=2.0, ms=7, label="mean lap time")
@@ -60,8 +58,7 @@ def make(success, time, title, name) -> None:
     ax2.set_ylim(lo, hi)
     ax2.tick_params(axis="y", labelcolor="#d94801")
     for xi, t in zip(x, time):
-        ax2.annotate(f"{t:.2f}", (xi + 0.18, t + 0.04), ha="left", fontsize=9,
-                     color="#d94801")
+        ax2.annotate(f"{t:.2f}", (xi + 0.18, t + 0.04), ha="left", fontsize=9, color="#d94801")
 
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
@@ -73,10 +70,8 @@ def make(success, time, title, name) -> None:
 
 
 def main() -> None:
-    make(SUCCESS_L2, TIME_L2, "Leave-one-out ablation (Level 2, $n=100$)",
-         "ablation_bars")
-    make(SUCCESS_L3, TIME_L3, "Held-out ablation (Level 3, $n=100$)",
-         "ablation_bars_l3")
+    make(SUCCESS_L2, TIME_L2, "Leave-one-out ablation (Level 2, $n=100$)", "ablation_bars")
+    make(SUCCESS_L3, TIME_L3, "Held-out ablation (Level 3, $n=100$)", "ablation_bars_l3")
 
 
 if __name__ == "__main__":

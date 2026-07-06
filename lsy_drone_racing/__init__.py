@@ -11,8 +11,8 @@ _acados_dir = Path(__file__).resolve().parent.parent / "acados"
 if _acados_dir.is_dir():
     os.environ.setdefault("ACADOS_SOURCE_DIR", str(_acados_dir))
 
-from crazyflow.utils import enable_cache
+from crazyflow.utils import enable_cache  # noqa: E402
 
-import lsy_drone_racing.envs  # noqa: F401, register environments with gymnasium
+import lsy_drone_racing.envs  # noqa: F401, E402, register environments with gymnasium
 
 enable_cache()  # Enable persistent caching of jax functions

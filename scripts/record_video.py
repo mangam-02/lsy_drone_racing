@@ -186,7 +186,10 @@ def record(
         outcome, crash_gate = "crash", target_gate
     logger.info(f"done: {n_frames} frames, {curr_time:.2f}s flight → {out_path}")
     # Parseable one-liner for shell loops (grep 'RESULT: ... gate=0').
-    print(f"RESULT: outcome={outcome} gate={crash_gate} time={curr_time:.2f} out={out_path}", flush=True)
+    print(
+        f"RESULT: outcome={outcome} gate={crash_gate} time={curr_time:.2f} out={out_path}",
+        flush=True,
+    )
     return str(out_path)
 
 

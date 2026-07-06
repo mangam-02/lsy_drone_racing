@@ -34,10 +34,7 @@ from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.mpc_planner_controller import (
-    _Cylinder,
-    _GateFrame,
-)
+from lsy_drone_racing.control.mpc_planner_controller import _Cylinder, _GateFrame
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

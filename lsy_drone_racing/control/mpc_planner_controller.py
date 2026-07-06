@@ -69,25 +69,32 @@ _VEL_SLACK_QUAD = 1e3
 _CON_SMOOTH_EPS = 0.02
 
 
-def _smooth_abs(x, eps: float = _CON_SMOOTH_EPS):
+def _smooth_abs(x: ca.SX, eps: float = _CON_SMOOTH_EPS) -> ca.SX:
     """C¹ approximation of |x| (=sqrt(x²+ε²)); avoids the kink at 0."""
     return ca.sqrt(x * x + eps * eps)
 
 
-def _smooth_max(a, b, eps: float = _CON_SMOOTH_EPS):
+def _smooth_max(a: ca.SX, b: ca.SX, eps: float = _CON_SMOOTH_EPS) -> ca.SX:
     """C¹ approximation of max(a, b)."""
     return 0.5 * (a + b + ca.sqrt((a - b) ** 2 + eps * eps))
 
 
-def _smooth_relu(z, eps: float = _CON_SMOOTH_EPS):
+def _smooth_relu(z: ca.SX, eps: float = _CON_SMOOTH_EPS) -> ca.SX:
     """C¹ approximation of max(0, z): ~0 for z ≪ 0, ~z for z ≫ 0."""
     return 0.5 * (z + ca.sqrt(z * z + eps * eps))
 
 
 def _create_ocp_solver(
-    Tf: float, N: int, parameters: dict, z_min: float = 0.0, z_max: float = 2.5,
-    verbose: bool = False, n_obstacles: int = 0, n_gates: int = 0,
-    obs_clearance: float = 0.15, gate_drone_r: float = 0.07,
+    Tf: float,
+    N: int,
+    parameters: dict,
+    z_min: float = 0.0,
+    z_max: float = 2.5,
+    verbose: bool = False,
+    n_obstacles: int = 0,
+    n_gates: int = 0,
+    obs_clearance: float = 0.15,
+    gate_drone_r: float = 0.07,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Acados OCP/solver that tracks a reference and keeps the drone above ground.
 
@@ -185,7 +192,12 @@ def _create_ocp_solver(
         for j in range(n_gates):
             o = base + 13 * j
             flag = p[o]
-            c, xax, yax, zax = p[o + 1 : o + 4], p[o + 4 : o + 7], p[o + 7 : o + 10], p[o + 10 : o + 13]
+            c, xax, yax, zax = (
+                p[o + 1 : o + 4],
+                p[o + 4 : o + 7],
+                p[o + 7 : o + 10],
+                p[o + 10 : o + 13],
+            )
             dxyz = ca.vertcat(px - c[0], py - c[1], pz - c[2])
             lx, ly, lz = ca.dot(dxyz, xax), ca.dot(dxyz, yax), ca.dot(dxyz, zax)
             m = _smooth_max(_smooth_abs(ly), _smooth_abs(lz))  # smoothed Chebyshev offset
@@ -196,9 +208,7 @@ def _create_ocp_solver(
         ocp.constraints.lh = np.concatenate(
             [np.full(n_obstacles, obs_clearance**2), np.full(n_gates, -1e9)]
         )
-        ocp.constraints.uh = np.concatenate(
-            [np.full(n_obstacles, 1e9), np.full(n_gates, 0.0)]
-        )
+        ocp.constraints.uh = np.concatenate([np.full(n_obstacles, 1e9), np.full(n_gates, 0.0)])
         # Slack all of them so an infeasible spot is penalised, never rejected.
         ocp.constraints.idxsh = np.arange(n_con)
         zl_parts.append(_CON_SLACK_LIN * np.ones(n_con))
@@ -225,8 +235,11 @@ def _create_ocp_solver(
     ocp.solver_options.tf = Tf
 
     solver = AcadosOcpSolver(
-        ocp, json_file="c_generated_code/mpc_planner_ground.json",
-        verbose=verbose, build=True, generate=True,
+        ocp,
+        json_file="c_generated_code/mpc_planner_ground.json",
+        verbose=verbose,
+        build=True,
+        generate=True,
     )
     return solver, ocp
 
@@ -470,8 +483,15 @@ class BSplinePlanner:
 
         t0 = time.perf_counter()
         opt_intermediates = self._optimize(
-            obs["pos"].copy(), obs["vel"].copy(), gate_data, cyl_tuples, gate_frames,
-            wp_lo=wp_lo, wp_hi=wp_hi, reg_anchor=anchor, x0_override=warm,
+            obs["pos"].copy(),
+            obs["vel"].copy(),
+            gate_data,
+            cyl_tuples,
+            gate_frames,
+            wp_lo=wp_lo,
+            wp_hi=wp_hi,
+            reg_anchor=anchor,
+            x0_override=warm,
         )
         print(f"[BSplinePlanner] optimization done in {(time.perf_counter() - t0) * 1e3:.3f} ms")
 
@@ -487,10 +507,12 @@ class BSplinePlanner:
     def _warm_start(
         self, drone_pos: np.ndarray, gate_data: list[tuple], target_gate: int
     ) -> np.ndarray | None:
-        """Previous optimiser solution aligned to the current segments (dropping segments
-        for gates passed since), with the active segment re-seeded to the straight line.
-        Returns ``None`` (→ optimiser uses its own initial guess) when there is no usable
-        previous solution: the first plan, or the gate count changed."""
+        """Align the previous optimiser solution to the current segments.
+
+        Drops segments for gates passed since and re-seeds the active segment to the
+        straight line. Returns ``None`` (→ optimiser uses its own initial guess) when
+        there is no usable previous solution: the first plan, or the gate count changed.
+        """
         n_seg = len(gate_data)
         prev = self._warm_intermediates
         if prev is None or self._warm_target_gate is None:
@@ -581,8 +603,10 @@ class BSplinePlanner:
     def _pull_in_waypoint(
         self, gate_pos: np.ndarray, direction: np.ndarray, d_max: float, obstacles: list
     ) -> np.ndarray:
-        """Point at ``gate_pos + direction * d``, shrinking d from d_max until the segment
-        to the gate is obstacle-free. Falls back to the minimum offset (never the center).
+        """Point at ``gate_pos + direction * d`` with d shrunk until the path clears obstacles.
+
+        Shrinks d from d_max until the segment to the gate is obstacle-free. Falls back to
+        the minimum offset (never the center).
         """
         d = d_max
         while d >= self.MIN_GATE_OFFSET:
@@ -616,9 +640,7 @@ class BSplinePlanner:
 
         lo = self._WP_LO if wp_lo is None else wp_lo
         hi = self._WP_HI if wp_hi is None else wp_hi
-        bounds = [
-            (float(blo), float(bhi)) for _ in range(n_wps) for blo, bhi in zip(lo, hi)
-        ]
+        bounds = [(float(blo), float(bhi)) for _ in range(n_wps) for blo, bhi in zip(lo, hi)]
 
         def cost(x: np.ndarray) -> float:
             intermediates = x.reshape(n_wps, 3)
@@ -717,9 +739,7 @@ class BSplinePlanner:
                 perp /= pn
             sign = np.sign(np.dot(entry_pt - seg_start, perp)) or 1.0
             bypass = np.clip(
-                seg_start + perp * sign * 0.7 + np.array([0.0, 0.0, 0.1]),
-                self._WP_LO,
-                self._WP_HI,
+                seg_start + perp * sign * 0.7 + np.array([0.0, 0.0, 0.1]), self._WP_LO, self._WP_HI
             )
             pts[seg_i * self.N_INTERMEDIATE] = bypass
             for k in range(1, self.N_INTERMEDIATE):
@@ -787,7 +807,9 @@ class BSplinePlanner:
         # the rest.
         speed = float(np.linalg.norm(drone_vel))
         if speed > self.MOMENTUM_MIN_SPEED:
-            lead = float(np.clip(speed * self.MOMENTUM_TIME, self.MOMENTUM_LEAD_MIN, self.MOMENTUM_LEAD_MAX))
+            lead = float(
+                np.clip(speed * self.MOMENTUM_TIME, self.MOMENTUM_LEAD_MIN, self.MOMENTUM_LEAD_MAX)
+            )
             points.append((drone_pos + (drone_vel / speed) * lead, None))
 
         for seg_i, (gate_center, x_axis, entry_pt, exit_pt) in enumerate(gate_data):
@@ -880,10 +902,14 @@ class BSplinePlanner:
         if d > 1e-6:
             m = s > length - d
             f = (length - s[m]) / d
-            v[m] = np.minimum(v[m], self.V_EDGE + (self.TARGET_SPEED - self.V_EDGE) * (3 * f**2 - 2 * f**3))
+            v[m] = np.minimum(
+                v[m], self.V_EDGE + (self.TARGET_SPEED - self.V_EDGE) * (3 * f**2 - 2 * f**3)
+            )
         return np.clip(v, self.V_EDGE, None)
 
-    def _finalize(self, raw: list[tuple], v_start: float | None = None, n_dense: int = 2000) -> dict:
+    def _finalize(
+        self, raw: list[tuple], v_start: float | None = None, n_dense: int = 2000
+    ) -> dict:
         """Resample the fitted curve at constant time step with the speed profile.
 
         Returns a result dict (``pos``/``vel``/``tick_max``) instead of mutating
@@ -925,11 +951,7 @@ class BSplinePlanner:
         pos[below, 2] = self.MIN_REF_Z
         vel[below, 2] = np.maximum(vel[below, 2], 0.0)
 
-        return {
-            "pos": pos,
-            "vel": vel,
-            "tick_max": n_samp - 1 - self.N,
-        }
+        return {"pos": pos, "vel": vel, "tick_max": n_samp - 1 - self.N}
 
 
 # ── Controller ────────────────────────────────────────────────────────────────
@@ -1012,9 +1034,14 @@ class MPCPlanner(Controller):
         self._n_gates = int(len(obs["gates_pos"])) if self.USE_SOFT_CONSTRAINTS else 0
         self._n_con = self._n_obstacles + self._n_gates
         self._acados_ocp_solver, self._ocp = _create_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params, z_min=self.GROUND_Z,
-            n_obstacles=self._n_obstacles, n_gates=self._n_gates,
-            obs_clearance=self.MPC_OBS_CLEARANCE, gate_drone_r=BSplinePlanner.DRONE_RADIUS,
+            self._T_HORIZON,
+            self._N,
+            self.drone_params,
+            z_min=self.GROUND_Z,
+            n_obstacles=self._n_obstacles,
+            n_gates=self._n_gates,
+            obs_clearance=self.MPC_OBS_CLEARANCE,
+            gate_drone_r=BSplinePlanner.DRONE_RADIUS,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -1089,8 +1116,10 @@ class MPCPlanner(Controller):
         return lo + int(np.argmin(d))
 
     def _nearest_tick(self, drone_pos: np.ndarray, drone_vel: np.ndarray | None = None) -> int:
-        """Trajectory index to resume at after a replan: nearest to the drone, but biased
-        toward points whose tangent runs *with* the drone's velocity.
+        """Trajectory index to resume at after a replan.
+
+        Nearest to the drone, but biased toward points whose tangent runs *with* the
+        drone's velocity.
 
         After a background replan the drone has moved on from the position the plan was
         built from, so we resume at the nearest point. On a self-looping path (e.g. a
@@ -1238,7 +1267,10 @@ class MPCPlanner(Controller):
         self._consec_fail += 1
         if self._last_u is not None and self._consec_fail <= self.MAX_HOLD_TICKS:
             return self._last_u
-        print(f"[MPCPlanner] MPC solve failed (status={status}) at tick {self._tick}; braking to hover")
+        print(
+            f"[MPCPlanner] MPC solve failed (status={status}) at tick {self._tick}; "
+            "braking to hover"
+        )
         return self._hover_cmd
 
     def step_callback(
@@ -1269,15 +1301,16 @@ class MPCPlanner(Controller):
         obs = self._last_obs
         if obs is not None:
             draw_points(
-                sim, np.atleast_2d(obs["gates_pos"]),
-                rgba=np.array([1.0, 1.0, 0.0, 1.0]), size=0.08,
+                sim, np.atleast_2d(obs["gates_pos"]), rgba=np.array([1.0, 1.0, 0.0, 1.0]), size=0.08
             )
             # Gate frames: outer square (cyan) + opening (white), real dimensions.
             for gpos, gquat in zip(obs["gates_pos"], obs["gates_quat"]):
-                self._draw_square(sim, gpos, gquat, _GateFrame.OUTER / 2,
-                                   np.array([0.0, 1.0, 1.0, 1.0]))
-                self._draw_square(sim, gpos, gquat, _GateFrame.OPENING / 2,
-                                   np.array([1.0, 1.0, 1.0, 1.0]))
+                self._draw_square(
+                    sim, gpos, gquat, _GateFrame.OUTER / 2, np.array([0.0, 1.0, 1.0, 1.0])
+                )
+                self._draw_square(
+                    sim, gpos, gquat, _GateFrame.OPENING / 2, np.array([1.0, 1.0, 1.0, 1.0])
+                )
             for opos in np.atleast_2d(obs["obstacles_pos"]):
                 pole = np.array([[opos[0], opos[1], 0.0], [opos[0], opos[1], opos[2]]])
                 orange = np.array([1.0, 0.5, 0.0, 1.0])
@@ -1300,14 +1333,20 @@ class MPCPlanner(Controller):
         draw_line(sim, traj[::step], rgba=np.array([0.0, 1.0, 0.0, 1.0]))
 
     @staticmethod
-    def _draw_square(sim: object, center: np.ndarray, quat: np.ndarray, half: float,
-                     rgba: np.ndarray) -> None:
+    def _draw_square(
+        sim: object, center: np.ndarray, quat: np.ndarray, half: float, rgba: np.ndarray
+    ) -> None:
         """Draw an oriented square outline in the gate plane (local y-z plane)."""
         rot = R.from_quat(quat)
-        local = np.array([
-            [0.0, half, half], [0.0, -half, half],
-            [0.0, -half, -half], [0.0, half, -half], [0.0, half, half],
-        ])
+        local = np.array(
+            [
+                [0.0, half, half],
+                [0.0, -half, half],
+                [0.0, -half, -half],
+                [0.0, half, -half],
+                [0.0, half, half],
+            ]
+        )
         draw_line(sim, center + rot.apply(local), rgba=rgba)
 
     def _cancel_replan(self):
