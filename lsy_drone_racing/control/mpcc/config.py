@@ -159,8 +159,8 @@ RETRY_MAX = 3  # give up after this many retries on one gate (then let it hover 
 REPLAN_TOL = 1e-3  # object move (m) beyond which we replan
 MAX_HOLD_TICKS = 3  # consecutive failed solves held before braking to hover
 #: Prediction-divergence safety net. The MPCC can occasionally return a "successful" (status 0)
-#: solve whose predicted trajectory shoots off the planned path — the terminal "blue marker"
-#: flies away. Executing such a command on real hardware risks slamming a gate frame. We measure
+#: solve whose predicted trajectory shoots off the planned path.
+#: Executing such a command on real hardware risks slamming a gate frame. We measure
 #: DIVERGENCE = how far the prediction strays from the path BEYOND the drone's current offset
 #: (max node deviation − node-0 deviation), NOT absolute deviation. Node 0 is the drone's actual
 #: (lbx-pinned) offset, which may legitimately be large after a disturbance — a correct recovery

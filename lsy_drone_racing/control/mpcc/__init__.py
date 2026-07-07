@@ -1,6 +1,6 @@
 """MPCC drone-racing controller package.
 
-Split out of the former single-file ``mpcc_deploy.py`` for clarity:
+Package layout:
 
 * :mod:`config` — all tuning constants (planner + controller sections).
 * :mod:`planner` — geometry helpers and the :class:`SimplePlanner` path planner.

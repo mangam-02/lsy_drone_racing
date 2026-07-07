@@ -326,10 +326,10 @@ class SimplePlanner:
 
         With ``check_approach`` (entry only), clearance is tested against the whole committed
         approach LINE ``waypoint → center`` instead of just the waypoint point: a pole sitting on
-        the approach line but slightly outside the entry point's own keep-out previously left the
-        entry unmoved (the path still grazed the pole — only MPCC caught it). Checking the segment
-        lets the shorten/nudge actually push the entry aside. The free intermediates handle the
-        path BEFORE the entry, so only the entry→center stretch needs this.
+        the approach line but slightly outside the entry point's own keep-out would otherwise
+        leave the entry unmoved while the path still grazes the pole. Checking the segment lets
+        the shorten/nudge actually push the entry aside. The free intermediates handle the path
+        BEFORE the entry, so only the entry→center stretch needs this.
         """
 
         def clear(p: np.ndarray) -> bool:

@@ -9,11 +9,14 @@ and the *lag* error (longitudinal), and rewards advancing ``theta`` at a target 
 Because there is no time-parameterised reference, the reference can never "run away" from
 the drone — so the reference governor / nearest-tick machinery of the tracking MPC is not
 needed here. The path is **embedded in the model as a function of the progress state**
-``theta`` (formulation A, as in MPCC++ eq. 5): for each shooting node we pass the local
-cubic coefficients of the path around that node's predicted ``theta``, and acados evaluates
-the path point ``p_d(theta)`` and tangent symbolically from the state — so moving ``theta``
-moves the reference and the contouring/lag errors genuinely depend on progress. The cubic
-comes from an internal arc-length spline built from the warm-started :class:`SimplePlanner`.
+``theta`` (MPCC++ eq. (5)): for each shooting node we pass the local cubic coefficients of
+the path around that node's predicted ``theta``, and acados evaluates the path point
+``p_d(theta)`` and tangent symbolically from the state — so moving ``theta`` moves the
+reference and the contouring/lag errors genuinely depend on progress. The cubic comes from
+an internal arc-length spline built from the warm-started :class:`SimplePlanner`.
+
+"MPCC++" citations refer to: Krinner et al., "MPCC++: Model Predictive Contouring Control
+for Time-Optimal Flight with Safety Constraints", RSS 2024.
 """
 
 from __future__ import annotations
@@ -185,7 +188,7 @@ def _build_mpcc_cost(
     a_theta = ocp.model.u[4]
 
     # Embedded path: p_d(theta) and its tangent are evaluated symbolically from the progress
-    # STATE theta via the local cubic — so e_c/e_l genuinely depend on theta (formulation A).
+    # STATE theta via the local cubic — so e_c/e_l genuinely depend on theta (MPCC++ eq. (5)).
     t = theta - theta_i
     p_d = ca.vertcat(
         c_x[0] * t**3 + c_x[1] * t**2 + c_x[2] * t + c_x[3],
@@ -214,7 +217,7 @@ def _build_mpcc_cost(
     # LAST so the weight layout is [weight_diagonals(...), ground_penalty].
     r_ground = ca.fmax(0.0, ground_soft_z - pos[2])
 
-    # Nonlinear least-squares residual (nonlinear in theta now; acados' Gauss-Newton SQP
+    # Nonlinear least-squares residual (nonlinear in theta; acados' Gauss-Newton SQP
     # re-linearises the path each iteration).
     y = ca.vertcat(
         e_c, e_l, rpy, drpy, e_v, rpy_cmd, thrust - hover_thrust, a_theta, y_obs, r_ground
@@ -226,7 +229,7 @@ def _build_mpcc_cost(
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
     # Contouring (q_c, hold the path) and lag (q_l, keep the reference point p_d(theta) tied
-    # to the drone longitudinally). Because theta is now a free inherited STATE (#2), q_l is
+    # to the drone longitudinally). Because theta is a free inherited STATE, q_l is
     # what stops it running away: a strong lag penalty forces the optimiser to slow v_theta
     # whenever the drone falls behind p_d(theta), so theta stays glued to the drone (and the
     # drone slows into corners instead of letting the reference sprint ahead). The progress
@@ -271,8 +274,8 @@ def _build_mpcc_constraints(
     # Soften the velocity and v_theta bounds so a transient overspeed never makes the QP
     # infeasible (positions 4,5,6,7 within idxbx → vel x/y/z and v_theta).
     ocp.constraints.idxsbx = np.array([4, 5, 6, 7])
-    # Slack costs for the softened velocity / v_theta bounds. Obstacle/gate avoidance is now a
-    # cost barrier (above), not a constraint, so there are no keep-out slacks here any more.
+    # Slack costs for the softened velocity / v_theta bounds. Obstacle/gate avoidance is a
+    # cost barrier (see _build_mpcc_cost), not a constraint, so no keep-out slacks are needed.
     ocp.cost.zl = 1e3 * np.ones(4)
     ocp.cost.zu = 1e3 * np.ones(4)
     ocp.cost.Zl = 1e3 * np.ones(4)
@@ -293,18 +296,19 @@ def _set_mpcc_solver_options(
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
-    # Real-time iteration: ONE SQP step per tick (prepare + feedback), instead of iterating a
-    # full SQP to 1e-6 (up to 50 re-linearisations/tick) which blew the ~20 ms control budget.
-    # The shifted warm start lands each tick near the optimum, so a single iteration tracks
-    # well; correctness was already verified with full SQP (#1/#2) before this speed change.
+    # Real-time iteration: ONE SQP step per tick (prepare + feedback). Iterating a full SQP
+    # to 1e-6 takes up to ~50 re-linearisations per tick, far over the ~20 ms control budget;
+    # the shifted warm start lands each tick near the optimum, so a single iteration tracks
+    # well.
     ocp.solver_options.nlp_solver_type = "SQP_RTI"
     ocp.solver_options.tol = 1e-3
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
-    # HPIPM QP iteration cap. At 10 the QP was hitting the limit near gates (status 3 at "QP
-    # iteration 9" → solve fails → braking to hover → crash), so give it room to converge. This
-    # is baked into the generated code, but _solver_signature hashes this function's source, so
-    # editing the value here auto-invalidates the cache and rebuilds the solver.
+    # HPIPM QP iteration cap. Near gates the QP needs the most iterations; a tight cap makes it
+    # hit the limit there (solve fails → brake to hover), so give it headroom to converge.
+    # Note: solver options are compiled into the generated C code, not read at runtime. The
+    # cached solver is still safe to edit against: _solver_signature hashes this function's
+    # source, so changing the value forces a rebuild with the new setting.
     ocp.solver_options.qp_solver_iter_max = 30
     ocp.solver_options.nlp_solver_max_iter = 1
     if time_steps is not None:
@@ -317,13 +321,13 @@ def _set_mpcc_solver_options(
         ocp.solver_options.sim_method_num_steps = 2
         # Cost scaling: acados' default is [time_steps, 1.0] — each stage scaled by its
         # shooting interval and the *terminal* node by 1.0. With a growing grid that terminal
-        # 1.0 is ~50x any single stage (dt=0.02) and ~2x all stages combined, so the cost is
-        # dominated by the last node — which sits ~1.1 s / ~2 m ahead (the blue marker). The
-        # drone then optimises mostly to land that far node on the path and chases it, cutting
-        # corners. Fix: weight *every* node, terminal included, equally by the real control
-        # period dt (= ts[0]). No node dominates → the whole horizon is tracked uniformly and
-        # the near (executed) nodes get their fair share. (Equals the uniform default when
-        # HORIZON_GROWTH == 1.0, except the terminal is now dt-weighted too rather than 1.0.)
+        # 1.0 dwarfs any single dt-scaled stage and rivals all stages combined, so the cost is
+        # dominated by the last node — the farthest point of the horizon. The drone then
+        # optimises mostly to land that far node on the path and chases it, cutting corners.
+        # Instead, weight *every* node, terminal included, equally by the real control period
+        # dt (= ts[0]). No node dominates → the whole horizon is tracked uniformly and the
+        # near (executed) nodes get their fair share. (Equals the uniform default when
+        # HORIZON_GROWTH == 1.0, except the terminal is dt-weighted too rather than 1.0.)
         ocp.solver_options.cost_scaling = ts[0] * np.ones(N + 1)
     else:
         ocp.solver_options.tf = Tf
@@ -629,16 +633,16 @@ class MPCCController(Controller):
 
                 # New path ⇒ the old progress state no longer means the same arc length, so
                 # the inherited θ/positions are stale. Clear them; compute_control then
-                # re-localises by projecting onto the fresh path on the next tick (#2).
+                # re-localises by projecting onto the fresh path on the next tick.
                 self._theta_pred = None
                 self._pos_pred = None
-                # The primal warm start carries the OLD path's progress state θ in column 12 of
+                # The primal warm start carries the old path's progress state θ in column 12 of
                 # every node; on the new path those θ values are meaningless. Seeding the solver
-                # with them (via _shift_warm_start) starts the SQP from an iterate whose θ-state and
-                # the freshly set per-node path cubic disagree, so the prediction (the blue marker)
-                # shoots off the line right after a replan — most visibly where the new path jumps
-                # (e.g. a sudden climb). Clear them too so the next tick re-localises from a clean
-                # warm start and the RTI_BUMP_ITERS burst re-converges within the tick.
+                # with them (via _shift_warm_start) starts the SQP from an iterate whose θ-state
+                # disagrees with the freshly set per-node path cubics, sending the prediction off
+                # the line right after the replan. Clear them too so the next tick re-localises
+                # from a clean warm start and the RTI_BUMP_ITERS burst re-converges within the
+                # tick.
                 self._x_pred = None
                 self._u_pred = None
 
@@ -658,7 +662,7 @@ class MPCCController(Controller):
         """(Re)build the internal arc-length cubic spline of the planner path.
 
         The MPCC cost evaluates p_d(theta) as a function of the progress STATE theta
-        (formulation A / MPCC++ eq. 5). acados does that from per-node local cubic
+        (MPCC++ eq. (5)). acados does that from per-node local cubic
         coefficients, which this spline supplies via ``_path_segment_coeffs``. Built from the
         planner's public ``path_point_tangent`` so it needs no planner internals.
         """
@@ -879,11 +883,10 @@ class MPCCController(Controller):
         Used on a re-localise (first tick / episode reset / right after a replan installs a new
         path), where there is no valid previous trajectory on the *current* path. After a replan
         the receding-horizon shift is skipped (``_x_pred`` was cleared), so acados would otherwise
-        keep its internal iterate from the OLD path — whose progress state ``theta`` no longer
-        matches the freshly swapped per-node path cubics. That primal/parameter mismatch is what
-        drove HPIPM to NaN (QP status 3) right after a replan and sent the terminal prediction (the
-        blue marker) off the line. Overwriting every node with the self-consistent ``x0`` keeps the
-        QP well-conditioned; the ``RTI_BUMP_ITERS`` burst then rolls it out onto the new path.
+        keep its internal iterate from the old path — whose progress state ``theta`` no longer
+        matches the freshly swapped per-node path cubics. That primal/parameter mismatch can drive
+        HPIPM to NaN (QP status 3). Overwriting every node with the self-consistent ``x0`` keeps
+        the QP well-conditioned; the ``RTI_BUMP_ITERS`` burst then rolls it out onto the new path.
         """
         u0 = np.array([0.0, 0.0, 0.0, self._hover_thrust, 0.0])
         for k in range(self._N):
@@ -908,10 +911,10 @@ class MPCCController(Controller):
         tg = int(obs["target_gate"])
         # The gate we're flying at stays a caution source until its true pose is measured AND the
         # replan onto that corrected pose has been installed (no replan still in flight). Keying
-        # only on "not visited" let the drone snap back to full speed the instant the pose was
-        # revealed (at the sensor range, ~0.7 m) while the corrected path was still being computed
-        # in the background — so it committed at cruise speed to the stale nominal line and clipped
-        # the frame. Staying slow until the replan lands gives it room to react to the new path.
+        # only on "not visited" would restore full speed the instant the pose is revealed (at the
+        # sensor range, ~0.7 m) while the corrected path is still being computed in the background
+        # — committing the drone at cruise speed to the stale nominal line. Staying slow until the
+        # replan lands gives it room to react to the new path.
         if tg >= 0:  # the gate we're flying at
             gate_unknown = not bool(obs["gates_visited"][tg]) or self._replan_future is not None
             if gate_unknown:
@@ -1008,7 +1011,7 @@ class MPCCController(Controller):
     def _progress_state(self, obs: dict) -> tuple[float, float, bool]:
         """Initial progress state ``(theta0, v_theta0)`` for this tick, plus the re-localise flag.
 
-        θ is a genuine progress STATE that evolves inside the solve (MPCC++ eq. 6) — it must NOT
+        θ is a genuine progress STATE that evolves inside the solve (MPCC++ eq. (6)) — it must NOT
         be re-pinned to the geometric projection every tick, or its lag dynamics collapse and the
         cost degenerates back to point-tracking. So on a NORMAL tick we INHERIT θ / v_theta from
         the previous solution at node 1 (the node that becomes "now" once the horizon advances one
@@ -1074,8 +1077,8 @@ class MPCCController(Controller):
         barrier so the horizon never references a gate we haven't passed, and v_target is ramped
         linearly to 0 over the last GATE_PASS_LEAD metres before it. The brake is what keeps the
         predicted progress from overshooting the clamped anchors: without it the path cubic gets
-        evaluated far outside its segment and the terminal prediction (the blue marker) shoots
-        off the trajectory. On a clean pass target_gate increments around the gate centre, so the
+        evaluated far outside its segment and the terminal prediction shoots off the
+        trajectory. On a clean pass target_gate increments around the gate centre, so the
         barrier jumps ahead before the brake really bites and cruise speed is barely affected; it
         only slows things when a pass is actually failing. End-of-path hover always wins.
         """
@@ -1086,15 +1089,15 @@ class MPCCController(Controller):
             thetas = np.full(self._N + 1, self.planner.length)
             self._trace_components = (self.V_TARGET, 1.0, 0.0)
         else:
-            # Brake on the gate barrier using the drone's TRUE progress (geometric projection of the
-            # measured position), NOT the inherited progress state theta0. theta0 can lead the real
-            # position (lag), so braking on it slowed the drone to a stop while it was still
-            # physically SHORT of the gate plane — and since the env only registers a pass on a real
-            # x<0 → x>0 crossing, it never confirmed and the barrier never lifted (the drone waited
-            # at the gate). Gating the brake on where the drone actually is makes it bite only once
-            # the body itself is past the gate centre (a genuine missed pass), not merely when the
-            # progress state is. The floor (GATE_BRAKE_FLOOR) then keeps a small forward push so the
-            # drone always creeps the last centimetres through the plane instead of parking short.
+            # Brake on the gate barrier using the drone's TRUE progress (geometric projection of
+            # the measured position), NOT the inherited progress state theta0. theta0 can lead the
+            # real position (lag), so braking on it can stop the drone while it is still physically
+            # SHORT of the gate plane — and since the env only registers a pass on a real gate-plane
+            # crossing, the barrier would never lift. Gating the brake on where the drone actually
+            # is makes it bite only once the body itself is past the gate centre (a genuine missed
+            # pass), not merely when the progress state is. The floor (GATE_BRAKE_FLOOR) keeps a
+            # small forward push so the drone creeps the last centimetres through the plane instead
+            # of parking short.
             theta_phys = self.planner.project_to_theta(
                 obs["pos"], obs["vel"], theta_prev=self._theta_est
             )
@@ -1169,7 +1172,7 @@ class MPCCController(Controller):
             xs = np.array([self._solver.get(k, "x") for k in range(self._N + 1)])
             us = np.array([self._solver.get(k, "u") for k in range(self._N)])
             # Prediction-divergence safety net (real-hardware guard): if the predicted trajectory
-            # has run far off the planned path (the blue marker flying away), DON'T commit it and
+            # has run far off the planned path, DON'T commit it and
             # DON'T warm-start from it — clear the warm-start caches so the next tick re-localises
             # (solver.reset + reseed) and re-converges, and fall through to replay/brake. This stops
             # the controller ever flying a divergent solution into a gate frame. _u_pred is kept
@@ -1214,9 +1217,8 @@ class MPCCController(Controller):
         large after a disturbance — a correct recovery solve STARTS there and converges back. So we
         return the *growth* beyond that start offset (``dev.max() - dev[0]``): ~0 (or negative) for
         a solve that tracks or flies home, large only when the prediction genuinely shoots off the
-        path (the blue marker flying away). Returning absolute deviation instead would reject every
-        solve whenever the drone is merely off-path — blocking the very recovery it needs (the
-        reject loop that left it braking/sinking off-track). Vectorised (one path_point_tangent).
+        path. Returning absolute deviation instead would reject every solve whenever the drone is
+        merely off-path — blocking the very recovery it needs. Vectorised (one path_point_tangent).
         """
         p_path, _ = self.planner.path_point_tangent(xs[:, 12])
         dev = np.linalg.norm(xs[:, 0:3] - p_path, axis=1)
@@ -1240,16 +1242,15 @@ class MPCCController(Controller):
             self._prof = {"proj": 0.0, "setp": 0.0, "solve": 0.0, "n": 0}
 
     def _safe_fallback_cmd(self, obs: dict) -> NDArray[np.floating]:
-        """Stabilising attitude command for when the solver can't be trusted (Befund 2).
+        """Stabilising attitude command for when the solver can't be trusted.
 
-        The old fallback was a zero-attitude hover: level, so it could not arrest the horizontal
-        momentum the drone carried in at cruise speed — it coasted ballistically into a gate
-        frame or out of the arena (the out_of_bounds / frame-streifer cases). Instead, tilt to
-        brake: build a desired specific-force vector that damps the measured velocity and
-        compensates gravity, turn it into a roll/pitch/yaw attitude (geometric reconstruction,
-        round-tripped through the same scipy 'xyz' Euler convention used to read the state) plus a
-        matching collective thrust. With zero velocity this reduces exactly to a heading-aligned
-        hover; with velocity it decelerates and holds altitude.
+        A level zero-attitude hover cannot arrest the horizontal momentum the drone carries in
+        at cruise speed — it would coast ballistically into a gate frame or out of the arena.
+        Instead, tilt to brake: build a desired specific-force vector that damps the measured
+        velocity and compensates gravity, turn it into a roll/pitch/yaw attitude (geometric
+        reconstruction, round-tripped through the same scipy 'xyz' Euler convention used to read
+        the state) plus a matching collective thrust. With zero velocity this reduces exactly to
+        a heading-aligned hover; with velocity it decelerates and holds altitude.
         """
         g = float(-self.drone_params["gravity_vec"][-1])
         vel = np.asarray(obs["vel"], dtype=float)
