@@ -178,7 +178,7 @@ centre, after) along the gate normal, plus $N_f=4$ free intermediate waypoints
 whose positions are optimised with L-BFGS-B against a cost that penalises
 proximity to obstacles and gate frames and deviation from the straight
 connection. A weighted cubic B-spline is fitted through the waypoints
-\cite{mellinger2011minsnap} and reparameterised by arc length $\theta$, giving a
+\cite{dierckx1993splines} and reparameterised by arc length $\theta$, giving a
 $C^2$ reference curve $\mathbf{p}_d(\theta)$ with unit tangent
 $\mathbf{t}(\theta)=\mathbf{p}_d'(\theta)$. Arc-length parameterisation makes the
 progress state physically meaningful and decouples the path geometry from the
@@ -268,7 +268,7 @@ and solver settings is summarised in Table~\ref{tab:params}.
 
 \begin{table}[t]
 \centering
-\caption{Main MPCC weights and solver settings (single source of truth:
+\caption{Main MPCC weights and solver settings from:
 \texttt{mpcc/config.py}).}
 \label{tab:params}
 \begin{tabular}{llll}
@@ -289,20 +289,6 @@ $\kappa_c$ / $R_c$ (caution) & $0.5$ / $1.3$\,m & $V_{\mathrm{tgt}}$ & $2.5$\,m/
 
 
 \subsection{Real-time solver}
-Problem \eqref{eq:cost} is transcribed with direct multiple shooting
-(explicit Runge--Kutta integration) and solved with \texttt{acados}
-\cite{verschueren2022acados} using a Gauss--Newton Hessian and the
-Real-Time Iteration (RTI) scheme \cite{diehl2005rti}: a single SQP iteration per
-control tick, split into a preparation and a feedback phase, with the resulting
-QP solved by \texttt{HPIPM} \cite{frison2020hpipm} in full-condensing mode. The
-symbolic model and cost are built with CasADi \cite{andersson2019casadi}. A
-receding-horizon warm start shifts the previous solution by one node; on a path
-swap the solver is re-seeded and given a short burst of extra iterations to
-reconverge within one tick. The generated C solver is cached by a
-source-and-settings hash and reused across episodes, so only the first run pays
-the code-generation cost, and the resulting solve times are compatible with the
-$50\,\mathrm{Hz}$ loop.
-
 Problem \eqref{eq:cost} is transcribed with direct multiple shooting
 (explicit Runge--Kutta integration) and solved with \texttt{acados}
 \cite{verschueren2022acados} using a Gauss--Newton Hessian and the Real-Time
