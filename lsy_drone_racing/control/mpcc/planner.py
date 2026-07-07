@@ -2,8 +2,8 @@
 
 Contains the :class:`SimplePlanner` (waypoint placement, obstacle-aware optimisation,
 weighted cubic B-spline fit, trapezoidal speed profile) and the small geometry helpers
-:class:`_Cylinder` / :class:`_GateFrame` used by both the planner cost and the controller's
-render overlay / capsule avoidance. All tunable constants live in :mod:`mpcc.config`.
+:class:`_Cylinder` / :class:`_GateFrame` used by the planner cost, the controller's capsule
+avoidance and the :mod:`.viz` overlay. All tunable constants live in :mod:`mpcc.config`.
 """
 
 from __future__ import annotations
@@ -284,8 +284,6 @@ class SimplePlanner:
         data = []
         for i in range(len(gates_pos)):
             x_axis = R.from_quat(gates_quat[i]).apply([1.0, 0.0, 0.0])
-            # if np.dot(gates_pos[i] - prev, x_axis) < 0:  # orient so entry is on the near side
-            # x_axis = -x_axis
             center = gates_pos[i] + bias
             # Keep the entry/exit waypoints out of any obstacle's keep-out (see GATE_WP_MIN_DIST):
             # a pole on the approach/departure line otherwise forces a contorted swerve. The exit
@@ -533,9 +531,9 @@ class SimplePlanner:
         below = pos[:, 2] < self.MIN_REF_Z
         pos[below, 2] = self.MIN_REF_Z
         vel[below, 2] = np.maximum(vel[below, 2], 0.0)
-        # Also keep the raw geometric path (B-spline + arc-length LUT) so a contouring
-        # controller (MPCC) can query the path by arc length θ; the reference-tracking MPC
-        # ignores these and just uses pos/vel.
+        # Also keep the raw geometric path (B-spline + arc-length LUT) so the contouring
+        # controller (MPCC) can query the path by arc length θ; pos/vel feed the viz path
+        # overlay and the analysis/figure scripts.
         return {
             "pos": pos,
             "vel": vel,
