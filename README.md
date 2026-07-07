@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue?logo=python&logoColor=white)
 ![acados](https://img.shields.io/badge/acados-SQP--RTI%20%2F%20HPIPM-00897b)
 ![CasADi](https://img.shields.io/badge/CasADi-symbolic%20dynamics-ff6f00)
-![Status](https://img.shields.io/badge/Status-Controller%20Working%20%C2%B7%20RL%20Partial-yellow)
+![Status](https://img.shields.io/badge/Status-Sim%20%2B%20Real%20Validated%20%C2%B7%20RL%20Partial-brightgreen)
 ![Course](https://img.shields.io/badge/TUM-Autonomous%20Drone%20Racing-0065BD)
 
 > **Note — this is a fork.** This repository is a fork of the
@@ -88,9 +88,9 @@ solvers are hard to vectorise). The plumbing is in place; it needs compute.
 | Receding-horizon primal warm start (shifted previous solution) | ✅ Done |
 | Jump-free path projection (local, forward-biased `θ` window) | ✅ Done |
 | Live visualisation overlay (path, gates, obstacles, progress marker) | ✅ Done |
-| Refactor into a clean `mpcc/` package (config / planner / controller) | ✅ Done |
+| Refactor into a clean `mpcc/` package (config / planner / ocp / controller / viz) | ✅ Done |
 | **RL layer that adapts the MPCC cost weights in-flight** | 🧩 Implemented, **training not completed** (compute-bound on Mac/acados) |
-| Quantitative evaluation (lap time vs. tracking-MPC baseline) | 🚧 Planned |
+| Quantitative evaluation (sim Level 2/3, real deployment, leave-one-out ablation, speed sweep) | ✅ Done |
 
 ---
 
@@ -211,6 +211,61 @@ from sinking into the floor while it accelerates off the start.
 
 ---
 
+## Results
+
+The controller is evaluated in the `crazyflow` simulator (JAX / MuJoCo-MJX Crazyflie 2.1) and on
+the physical Crazyflie. All simulation numbers are over `n = 100` episodes at a fixed seed
+(paired comparisons across variants): **Level 2** is the development track (fixed four-gate
+layout, per-episode pose/inertia jitter), **Level 3** (fully randomised geometry every episode) is
+the held-out generalisation test. A run is a success iff all four gates are passed. Full details,
+tables, and figures are in the write-up under [`report/`](report/).
+
+### Nominal performance
+
+| Track | Success | Mean lap [s] | Median [s] |
+|---|---|---|---|
+| Level 2 (fixed) | 88.0% | 7.37 | 7.30 |
+| Level 3 (randomised) | 87.0% | 8.51 | 8.50 |
+
+Success barely moves from the fixed to the fully randomised track (88% to 87%), so the method
+does not overfit the single Level 2 geometry; the higher Level 3 lap time mostly reflects the
+random tracks being longer on average, not a more conservative controller.
+
+### Real-world deployment
+
+The exact controller (`final.toml`, `V_tgt = 2.5 m/s`, **no re-tuning**) was flown on the physical
+Crazyflie with a motion-capture state estimate: **8 / 8 consecutive flights completed**, mean lap
+time **8.70 s** (median 8.71 s, std 0.30 s), within 0.2 s of the Level 3 simulation mean (8.51 s).
+The RTI solve held the 50 Hz deadline apart from occasional `<= 10 ms` overruns. The controller
+transfers to hardware without modification, validating the simulation results.
+
+### Ablation (Level 2, leave-one-out)
+
+| Configuration | Success | Mean [s] | Frame clips | Collisions |
+|---|---|---|---|---|
+| Full (all on) | 88.0% | 7.37 | 4 | 5 |
+| no gate-track boost | 83.0% | 7.46 | 10 | 8 |
+| no curvature cap | 88.0% | 7.15 | 6 | 7 |
+| no caution mode | 79.0% | 6.13 | 15 | 17 |
+| all off (raw MPCC) | 62.0% | 5.97 | 25 | 27 |
+
+The geometric heuristics, not the base solver, are the source of robustness: stacking them turns
+raw MPCC (62% / 5.97 s) into the full controller (88% / 7.37 s), i.e. +26 points of success for
++1.4 s. **Caution mode** is the dominant robustness lever (removing it nearly triples collisions);
+the **gate-track boost** buys gate-frame clearance almost for free; the **curvature cap** is a
+speed-scaling safety margin that becomes essential once `V_tgt` is raised.
+
+### Speed / robustness trade-off
+
+Sweeping the cruise target `V_tgt` only slides the controller along a success/lap-time Pareto front
+and saturates quickly: below the matched value it trades ~0.7 s of lap time for ~2 points of
+success, while pushing past it falls off a cliff (79% at 3.0 m/s, 74% at 3.5 m/s) for almost no
+extra speed. The best trade matches `V_tgt` to the actuation limit, hence `V_tgt = 2.5 m/s`. The
+identical monotone shape on the held-out Level 3 confirms this corner-limited behaviour is not an
+artefact of the single development track.
+
+---
+
 ## RL-Tuned MPCC Weights (implemented, training incomplete)
 
 The MPCC cost weights (`q_c, q_l, q_v, …`) are, at deployment, **static hand-tuned baselines**.
@@ -235,7 +290,8 @@ off (the default) the controller uses the baseline weights verbatim.
 - **Key risk:** solver robustness — extreme weights stiffen the QP. Bounded actions are
   near-mandatory, since failed solves fall back to the last command and poison the learning signal.
 - **Training:** offline in simulation (reward: gate-pass time, crashes, tracking error), policy
-  frozen at deployment. Lit. pointers: RL-tuned MPC, Gros & Zanon, differentiable MPC (Amos).
+  frozen at deployment. Lit. pointers: weights-varying MPC via deep RL (Zarrouki et al., 2021),
+  automated NMPC tuning by RL (Mehndiratta et al., 2018), safe RL-MPC (Zanon & Gros, 2020).
 
 > Status: **implemented, not fully trained.** The wiring, feature builder, network, and training
 > loop exist; completing training needs GPU-backed compute or a vectorisable simulator.
@@ -254,7 +310,9 @@ lsy_drone_racing/
 |   |   +-- mpcc/                     # ★ THIS WORK
 |   |   |   +-- config.py             # all tuning constants (planner / controller / weights)
 |   |   |   +-- planner.py            # geometry helpers + SimplePlanner (B-spline path)
-|   |   |   +-- controller.py         # acados MPCC solver builders + MPCCController (entry point)
+|   |   |   +-- ocp.py                # acados OCP construction (model / cost / constraints) + solver cache
+|   |   |   +-- controller.py         # MPCCController runtime loop (entry point)
+|   |   |   +-- viz.py                # viewer overlay (scene + weight box) + speed-trace dump
 |   |   |   +-- weight_policy.py      # RL weight-scaling policy (feature builder + network)
 |   |   |   +-- train_weights.py      # RL training loop (compute-bound, see status)
 |   |   +-- controller.py             # base Controller interface (upstream)
@@ -354,12 +412,13 @@ there changes behaviour without touching any logic.
 ## Future Work
 
 - **Finish RL weight training** — on GPU-backed compute / a vectorisable simulator, then quantify
-  RL-vs-baseline success rate, lap time, and solve time.
-- **Quantitative evaluation** — lap time, gate-pass rate, and solve time vs. the
-  reference-tracking MPC baseline across levels 0–3.
-- **Higher cruise speeds** — tighter curvature and gate-boost tuning on level 3.
-- **sim2real transfer** — further deployment on the physical Crazyflie with the level-2/sim2real
-  configs.
+  RL-vs-baseline success rate, lap time, and solve time (evaluation harness already in place, see
+  *Results*).
+- **Move the Pareto front, not just slide along it** — the `V_tgt` sweep shows a single scalar only
+  slides success vs. lap time; raising the underlying front needs tighter curvature / gate-boost
+  tuning (and, prospectively, the RL layer) rather than a faster cruise target.
+- **Reduce the remaining failure modes** — most crashes are gate-frame clips at the tight 180°
+  reversal and at the final gate's late pose reveal; earlier pose handling / caution shaping there.
 
 ---
 
@@ -374,11 +433,14 @@ there changes behaviour without touching any logic.
 
 ## References
 
-1. Lam, D., Manzie, C., Good, M. **Model predictive contouring control.** CDC, 2010.
-2. Liniger, A., Domahidi, A., Morari, M. **Optimization-based autonomous racing of 1:43 scale RC cars.** Optimal Control Applications and Methods, 2015.
-3. Romero, A. et al. **Model Predictive Contouring Control for Time-Optimal Quadrotor Flight.** IEEE T-RO, 2022.
-4. Verschueren, R. et al. **acados — a modular open-source framework for fast embedded optimal control.** Mathematical Programming Computation, 2022.
-5. Gros, S., Zanon, M. **Data-driven economic NMPC using reinforcement learning.** IEEE TAC, 2020.
+1. Lam, D., Manzie, C., Good, M. **Model predictive contouring control.** 49th IEEE Conference on Decision and Control (CDC), 2010.
+2. Liniger, A., Domahidi, A., Morari, M. **Optimization-based autonomous racing of 1:43 scale RC cars.** Optimal Control Applications and Methods, 2014.
+3. Romero, A., Sun, S., Foehn, P., Scaramuzza, D. **Model Predictive Contouring Control for Near-Time-Optimal Quadrotor Flight.** arXiv:2108.13205, 2021.
+4. Krinner, M., Romero, A., … Scaramuzza, D. **MPCC++: Model Predictive Contouring Control for Time-Optimal Flight with Safety Constraints.** Robotics: Science and Systems (RSS), 2024.
+5. Verschueren, R. et al. **acados — a modular open-source framework for fast embedded optimal control.** Mathematical Programming Computation, 2022.
+6. Zanon, M., Gros, S. **Safe reinforcement learning using robust MPC.** IEEE Transactions on Automatic Control, 2020.
+7. Zarrouki, B. et al. **Weights-varying MPC for Autonomous Vehicle Guidance: a Deep Reinforcement Learning Approach.** European Control Conference (ECC), 2021.
+8. Mehndiratta, M., Camci, E., Kayacan, E. **Automated Tuning of Nonlinear Model Predictive Controller by Reinforcement Learning.** IEEE/RSJ IROS, 2018.
 
 ---
 
