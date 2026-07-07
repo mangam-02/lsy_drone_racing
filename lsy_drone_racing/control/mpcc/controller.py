@@ -1,14 +1,15 @@
 """Model Predictive Contouring Control (MPCC) for drone racing.
 
-Unlike the reference-tracking MPC (:mod:`mpc_planner_controller`), this controller tracks
-the **geometric path** produced by the planner and optimises **progress** along it. The
-acados model is augmented with a progress state ``theta`` (arc length) and its speed
-``v_theta``; the cost penalises the *contouring* error (perpendicular distance to the path)
-and the *lag* error (longitudinal), and rewards advancing ``theta`` at a target speed.
+Unlike a reference-tracking MPC, which chases a time-parameterised trajectory, this
+controller tracks the **geometric path** produced by the planner and optimises **progress**
+along it. The acados model is augmented with a progress state ``theta`` (arc length) and its
+speed ``v_theta``; the cost penalises the *contouring* error (perpendicular distance to the
+path) and the *lag* error (longitudinal), and rewards advancing ``theta`` at a target speed.
 
 Because there is no time-parameterised reference, the reference can never "run away" from
-the drone — so the reference governor / nearest-tick machinery of the tracking MPC is not
-needed here. The path is **embedded in the model as a function of the progress state**
+the drone — no machinery is needed to keep the drone in sync with a reference clock, and a
+disturbance is recovered by re-projecting onto the path instead of chasing a time index.
+The path is **embedded in the model as a function of the progress state**
 ``theta`` (MPCC++ eq. (5)): for each shooting node we pass the local cubic coefficients of
 the path around that node's predicted ``theta``, and acados evaluates the path point
 ``p_d(theta)`` and tangent symbolically from the state — so moving ``theta`` moves the
@@ -1512,8 +1513,9 @@ class MPCCController(Controller):
         dense = np.asarray(self.planner._path_dense, float)
         s_dense = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(dense, axis=0), axis=1))))
         obst = np.asarray(self._last_obs.get("obstacles_pos", []), float).reshape(-1, 3)
-        obst_thetas = np.array([s_dense[np.argmin(np.linalg.norm(dense[:, :2] - o[:2], axis=1))]
-                                for o in obst])
+        obst_thetas = np.array(
+            [s_dense[np.argmin(np.linalg.norm(dense[:, :2] - o[:2], axis=1))] for o in obst]
+        )
         obst_clear = np.array([np.min(np.linalg.norm(dense[:, :2] - o[:2], axis=1)) for o in obst])
         np.savez(
             self._trace_path,
