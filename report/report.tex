@@ -352,12 +352,14 @@ to this cap (Fig.~\ref{fig:speed}).
 
 \begin{figure}[!ht]
   \centering
-  \includegraphics[width=\columnwidth]{figures/speed_profile.pdf}
-  \caption{Speed along the planned path: the planner cruises at the target
-    $V_{\mathrm{tgt}}$ (trapezoidal, with accel/decel ramps), while the controller's
+  \includegraphics[width=\columnwidth]{figures/speed_profile_run_l3.pdf}
+  \caption{Speed along a level-3 run: starting from the cruise ceiling
+    $V_{\mathrm{tgt}}$, the effective target $v_{\mathrm{tgt}}$ is lowered by the
     curvature cap $v_{\mathrm{cap}}(s)=\sqrt{a_{\mathrm{lat}}^{\max}/\kappa(s)}$
-    lowers the effective target into corners (down to the floor
-    $v_{\min}$) and leaves straights at full speed.}
+    (curvature-cap reduction) and by the caution scaling near
+    not-yet-revealed gates and obstacles (caution reduction), while straights
+    keep the full cruise speed. The actual drone speed tracks this modulated
+    target; gates (G1--G4) and the nearest obstacle to the path are marked.}
   \label{fig:speed}
 \end{figure}
 
@@ -376,7 +378,8 @@ baseline weighting.
 \emph{Caution mode.} While the true pose of a gate/obstacle is still unknown, the
 target speed is scaled down toward a fraction $\kappa_c$ of $V_{\mathrm{tgt}}$ as
 the drone closes within a radius $R_c$ of it, so that it is already slow when the
-true pose is revealed at $r_s$ and the path is corrected.
+true pose is revealed at $r_s$ and the path is corrected (caution reduction in
+Fig.~\ref{fig:speed}).
 
 \subsection{Online replanning}
 A change in any measured gate/obstacle pose (detected when the true pose is
