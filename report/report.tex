@@ -300,8 +300,7 @@ solution one node forward, keeping each tick near the previous optimum, so a sin
 iteration suffices and the optimiser converges \emph{across} control ticks rather
 than within one. On a path swap, where this no longer holds, the solver is re-seeded
 and re-converged with a short iteration burst. The fixed per-tick cost is what keeps
-the $50\,\mathrm{Hz}$ deadline reliable, whereas a fully converged SQP would spend a
-data-dependent number of iterations and risk missing it.
+the $50\,\mathrm{Hz}$ deadline reliable.
 
 
 
@@ -314,9 +313,7 @@ MPC chased a far-ahead point at full thrust and the reference effectively "ran
 away", requiring a hand-tuned reference governor to hold it back. MPCC removes
 this failure mode structurally: the reference is $\mathbf{p}_d(\theta)$, a
 function of a \emph{state the optimiser itself controls}, so it can never outrun
-the drone \cite{romero2022mpcc}. This is the central reason we adopted MPCC; it
-also aligns naturally with the model-predictive path-following formulation of
-\cite{faulwasser2016mpfc}.
+the drone \cite{romero2022mpcc}. This is the central reason we adopted MPCC.
 
 Intuitively, $\theta$ is a virtual particle running along the racing line whose
 speed the optimiser sets, with the drone tethered to it by the contouring and lag
@@ -379,6 +376,10 @@ true pose is revealed at $r_s$ and the path is corrected (caution reduction in
 Fig.~\ref{fig:speed}).
 
 \subsection{Online replanning}
+A key departure from the prior MPCC racing work
+\cite{romero2022mpcc,krinner2024mpccpp}, which plans a single reference around a
+fully known track and then only tracks it, is that we replan the reference online
+during the run as the track is revealed.
 A change in any measured gate/obstacle pose (detected when the true pose is
 revealed within $r_s$) triggers a full-track replan in a background thread, so
 the $50\,\mathrm{Hz}$ loop never stalls. When the new path is ready it is swapped
