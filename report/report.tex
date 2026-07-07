@@ -41,9 +41,9 @@ reference-tracking Model Predictive Control (MPC). On top of the nominal MPCC we
 context-dependent mechanisms: a curvature-based speed cap, a near-gate
 contouring boost, and a caution mode that slows the drone near unmeasured
 objects. We also implemented a reinforcement-learning (RL) layer that adapts the
-MPCC cost weights online, but found end-to-end training impractical because the
-embedded solver is sequential; the hand-designed context heuristics distil the
-same idea at negligible cost. On a fixed racing track our controller finishes
+MPCC cost weights online, but found training it end-to-end impractical because the
+embedded solver runs one step at a time; the hand-designed context rules capture
+the same idea at almost no cost. On a fixed racing track our controller finishes
 $88\%$ of runs at a $7.37\,\mathrm{s}$ average lap time, and generalises to
 fully randomised tracks at $87\%$. Deployed unchanged on the physical
 Crazyflie, it completed all eight test flights at an $8.70\,\mathrm{s}$ mean lap
@@ -67,8 +67,8 @@ In this work we consider the drone-racing task posed by the course simulator: a
 Crazyflie~2.1 quadrotor must pass four gates in a fixed order and reach the
 finish, while avoiding four pole obstacles. The challenge is threefold. First,
 the flight is \emph{time-critical}: the objective is to minimise lap time, which
-drives the drone to the edge of its actuation envelope, where tracking errors
-translate directly into gate-frame collisions. Second, the environment is only
+pushes the drone to the limits of what its motors can deliver, where even small
+tracking errors lead straight to gate-frame collisions. Second, the environment is only
 \emph{partially observed}: gates and obstacles are known only at nominal poses
 until the drone comes within a short sensor range, at which point the true pose
 is revealed and the planned path must be corrected online. Third, the controller
@@ -630,8 +630,7 @@ Table~\ref{tab:crash} breaks the failures down by the nearest physical object at
 the moment of the crash, aggregated over the full-controller runs of both levels.
 Gate-frame clips dominate on both tracks and concentrate on gate~2 (the tight
 $180^\circ$ reversal) and the final gate, where the true pose is revealed latest
-and the drone has the least room to correct. Obstacle hits are the second source
-and grow slightly under the wider lines the planner draws on Level~3. Ground and
+and the drone has the least room to correct. Obstacle hits are the second source but stay low on both tracks (4 and 3), so the capsule avoidance keeps clearing the poles even on the randomised Level 3 layouts. Ground and
 out-of-bounds terminations are rare. The limiting factor is thus
 \emph{contouring precision at speed in corners}, not straight-line velocity,
 which each geometric heuristic attacks directly, explaining why they compound so
