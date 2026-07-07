@@ -22,7 +22,7 @@
 Munich, Germany}
 \and
 \IEEEauthorblockN{2\textsuperscript{nd} Kenny Jeffrey}
-\IEEEauthorblockA{\textit{School of Computation, Information and Technology} \\
+\IEEEauthorblockA{\textit{School of Engineering and Design} \\
 \textit{Technical University of Munich}\\
 Munich, Germany}
 }
@@ -58,10 +58,10 @@ limits, and hard geometric constraints (the gates) in a single task
 \cite{hanover2024survey}. Recent work has pushed quadrotors to champion-level
 performance using both learning-based \cite{kaufmann2023champion} and
 optimisation-based \cite{foehn2021timeoptimal,romero2022mpcc} approaches, and the
-gap between the two is an active research direction. Beyond racing, the
-underlying problem (flying a prescribed path as fast as possible while
-respecting dynamics and safety limits) is representative of a broad class of
-agile aerial applications such as inspection and delivery.
+gap between the two is an active research direction. Beyond racing, the same
+problem (flying a prescribed path as fast as possible within dynamics and safety
+limits) underlies a broad class of agile aerial applications such as inspection
+and delivery.
 
 In this work we consider the drone-racing task posed by the course simulator: a
 Crazyflie~2.1 quadrotor must pass four gates in a fixed order and reach the
@@ -268,7 +268,7 @@ and solver settings is summarised in Table~\ref{tab:params}.
 
 \begin{table}[t]
 \centering
-\caption{Main MPCC weights and solver settings from:
+\caption{Main MPCC weights and solver settings (from
 \texttt{mpcc/config.py}).}
 \label{tab:params}
 \begin{tabular}{llll}
@@ -293,18 +293,15 @@ Problem \eqref{eq:cost} is transcribed with direct multiple shooting
 (explicit Runge--Kutta integration) and solved with \texttt{acados}
 \cite{verschueren2022acados} using a Gauss--Newton Hessian and the Real-Time
 Iteration (RTI) scheme \cite{diehl2005rti}, which replaces a fully converged SQP
-solve with a single SQP iteration per control tick, split into a preparation and a
-feedback phase; the resulting QP is solved by \texttt{HPIPM} \cite{frison2020hpipm}
-in full-condensing mode, and the symbolic model and cost are built with CasADi
-\cite{andersson2019casadi}. A receding-horizon warm start shifts the previous
+solve with a single SQP iteration per control tick; the resulting QP is solved by
+\texttt{HPIPM} \cite{frison2020hpipm} in full-condensing mode, with the symbolic
+model and cost built in CasADi \cite{andersson2019casadi}. A receding-horizon warm start shifts the previous
 solution one node forward, keeping each tick near the previous optimum, so a single
 iteration suffices and the optimiser converges \emph{across} control ticks rather
 than within one. On a path swap, where this no longer holds, the solver is re-seeded
 and re-converged with a short iteration burst. The fixed per-tick cost is what keeps
 the $50\,\mathrm{Hz}$ deadline reliable, whereas a fully converged SQP would spend a
-data-dependent number of iterations and risk missing it. The generated C solver is
-cached by a source-and-settings hash and reused across episodes, so only the first
-run pays the code-generation cost.
+data-dependent number of iterations and risk missing it.
 
 
 
@@ -326,12 +323,12 @@ speed the optimiser sets, with the drone tethered to it by the contouring and la
 costs. Because the far horizon nodes are evaluated at $\mathbf{p}_d(\theta)$ inside
 an upcoming corner (where a small contouring error at high speed would demand
 infeasible attitude), the optimiser slows $\theta$ before the apex and
-accelerates out, so MPCC already brakes implicitly through corners \cite{romero2022mpcc,krinner2024mpccpp}. This only works
-if the path enters the cost as the live function $\mathbf{p}_d(\theta)$;
-freezing a per-tick reference point drops $\theta$ from the objective and silently
-reduces the controller to point-tracking MPC, the very failure mode above. The lag
-weight $q_l\!\gg\!q_v$ is the soft anchor that keeps $\theta$ glued to the drone
-through the turn. Because our progress reward tracks a target speed rather than maximising raw progress, this implicit braking alone still carries too much speed into sharp turns; the explicit curvature cap of the next subsection lowers that target into corners. 
+accelerates out, so MPCC already brakes implicitly through corners
+\cite{romero2022mpcc,krinner2024mpccpp}, with the lag weight $q_l\!\gg\!q_v$
+keeping $\theta$ glued to the drone through the turn. Because our progress reward
+tracks a target speed rather than maximising raw progress, this implicit braking
+alone still carries too much speed into sharp turns; the explicit curvature cap of
+the next subsection lowers that target into corners.
 
 \subsection{Context-dependent adaptation}
 Two properties of the track are known to the planner but not encoded in the
@@ -443,11 +440,10 @@ runs, and a breakdown of failures by the nearest physical object at the crash.
 Table~\ref{tab:main} reports the full controller. On the fixed track it finishes
 $88\%$ of runs at $7.37\,\mathrm{s}$ mean lap time, and, importantly, it
 retains $87\%$ on the fully randomised track, indicating that the method does not
-overfit the single Level~2 geometry. The mean lap time on Level~3
-($8.51\,\mathrm{s}$) is higher than on Level~2, but the two are not directly
-comparable: the randomised Level~3 tracks are on average longer than the fixed
-Level~2 layout, so the difference chiefly reflects track length rather than a
-slower or more conservative controller. Failures are dominated by gate-frame clips at the tight
+overfit the single Level~2 geometry. The higher Level~3 mean lap time
+($8.51\,\mathrm{s}$) chiefly reflects the randomised tracks being on average
+longer than the fixed Level~2 layout, not a slower or more conservative
+controller. Failures are dominated by gate-frame clips at the tight
 $180^\circ$ reversal (gate~2) and at the final gate, where a late pose reveal
 leaves the least room to correct.
 
@@ -475,8 +471,8 @@ $\{8.20, 8.53, 8.54, 8.71, 8.72, 8.79, 8.84, 9.24\}\,\mathrm{s}$
 $0.2\,\mathrm{s}$ of the Level-3 simulation mean ($8.51\,\mathrm{s}$), a small
 sim-to-real gap: the physical laps are marginally slower and more variable,
 consistent with unmodelled aerodynamics, battery sag, and estimator latency. The
-RTI solve held the $50\,\mathrm{Hz}$ deadline, with only occasional overruns of a
-few milliseconds ($\le 10\,\mathrm{ms}$) that did not affect completion. The controller thus
+RTI solve held the $50\,\mathrm{Hz}$ deadline apart from occasional
+$\le 10\,\mathrm{ms}$ overruns that did not affect completion, so the controller
 transfers to hardware without modification, validating the simulation results.
 
 \begin{table}[t]
@@ -547,11 +543,10 @@ $+26$ points of success for $+1.4\,\mathrm{s}$, which shows that the heuristics,
 not the base solver, are the source of robustness.
 
 \subsection{Speed/robustness trade-off}
-The ablation shows that the geometric rules improve the underlying trade-off
-between success rate and lap time, rather than merely exchanging one for the
-other. A natural follow-up is whether a single scalar speed parameter, the
-cruise target $V_{\mathrm{tgt}}$, could achieve the same gains on its own.
-Table~\ref{tab:sweep} sweeps the cruise target $V_{\mathrm{tgt}}$ of the full
+The ablation shows the geometric rules improve the underlying success/lap-time
+trade-off, rather than merely exchanging one for the other. Could a single scalar,
+the cruise target $V_{\mathrm{tgt}}$, achieve the same on its own?
+Table~\ref{tab:sweep} sweeps it for the full
 controller. Lowering it to $2.0\,\mathrm{m/s}$ trades $0.7\,\mathrm{s}$ of lap
 time for $2$ points of success, i.e.\ it stays on the same Pareto front. Pushing
 it past the matched value, however, falls off a cliff: at $3.0\,\mathrm{m/s}$
@@ -598,9 +593,9 @@ actually binds. In contrast, the \emph{gate-track boost} and \emph{caution mode}
 spacing) do not help on Level~3; removing either even nudges success up ($+4$ and
 $+3$ points), i.e.\ they are mildly specialised to the development geometry. We
 keep them because they are strongly positive on the realistic fixed-track setting
-the controller is ultimately graded on, and are not harmful in aggregate, but
-this is a clear pointer to make them geometry-adaptive, a natural fit for the
-learned weight policy that motivated them.
+the controller is ultimately graded on and not harmful in aggregate, but this
+points to making them geometry-adaptive via the learned weight policy that
+motivated them.
 
 \begin{table}[t]
 \centering
@@ -637,11 +632,10 @@ Gate-frame clips dominate on both tracks and concentrate on gate~2 (the tight
 $180^\circ$ reversal) and the final gate, where the true pose is revealed latest
 and the drone has the least room to correct. Obstacle hits are the second source
 and grow slightly under the wider lines the planner draws on Level~3. Ground and
-out-of-bounds terminations are rare. This confirms that the limiting factor is
-\emph{contouring precision at speed in corners}, not straight-line velocity:
-the geometric heuristics that raise precision (boost) or reduce corner entry
-speed (curvature cap, caution) each attack this dominant failure mode, which is
-why they compound so strongly in the ablation of Table~\ref{tab:ablation}.
+out-of-bounds terminations are rare. The limiting factor is thus
+\emph{contouring precision at speed in corners}, not straight-line velocity,
+which each geometric heuristic attacks directly, explaining why they compound so
+strongly in the ablation of Table~\ref{tab:ablation}.
 
 \begin{table}[t]
 \centering
@@ -658,13 +652,11 @@ Level~3 & $9$ & $3$ & $0$ & $2$ & $1$\\
 \end{table}
 
 \subsection{Discussion}
-Across every configuration the dominant failure is a gate-frame clip at the tight
-reversal (Table~\ref{tab:crash}), i.e.\ the task is \emph{corner}-limited, not
-velocity-limited: the scalar cruise target only slides the controller along a
-Pareto front (Table~\ref{tab:sweep}), whereas the geometric rules
-(Table~\ref{tab:ablation}) move that front outward. On held-out random tracks the
-layer still improves robustness overall, though the two geometry-tuned rules lose
-their edge (Table~\ref{tab:ablation3}). This motivates the future directions in
+The task is thus \emph{corner}-limited, not velocity-limited: the scalar cruise
+target only slides the controller along a Pareto front (Table~\ref{tab:sweep}),
+whereas the geometric rules (Table~\ref{tab:ablation}) move that front outward,
+though on held-out random tracks the two geometry-tuned rules lose their edge
+(Table~\ref{tab:ablation3}). This motivates the future directions in
 Section~\ref{sec:conclusion}.
 
 
