@@ -541,6 +541,14 @@ class MPCCController(Controller):
         self._last_mult = None  # last weight multipliers actually applied (None ⇒ baseline/RL off)
         self.last_solve_ok = False  # whether the most recent solve succeeded (training reward)
 
+        # Opt-in per-tick speed-target trace: set MPCC_SPEED_TRACE=<out.npz> to record one episode
+        # (curvature cap / caution / gate-brake decomposition for the speed-profile figure). The
+        # whole feature is a no-op when the env var is unset, so eval runs are unaffected.
+        self._trace_path = os.environ.get("MPCC_SPEED_TRACE")
+        self._trace_saved = False
+        self._trace_components = (self.V_TARGET, 1.0, 1.0)  # last (v_cruise, caution, brake)
+        self._speed_trace: list[tuple[float, ...]] = []
+
         # Per-episode state (planner, embedded path, warm start). Factored out so the trainer
         # can reuse the (expensive) acados solver across episodes / randomized tracks.
         self.reset_for_new_episode(obs)
@@ -563,6 +571,7 @@ class MPCCController(Controller):
         self._build_cubic()
         self._snapshot_objects(obs)
         self._replan_future = None
+        self._speed_trace = []  # fresh per-tick speed-target trace for this episode
 
         # Near-gate contouring boost: re-base every stage's weight and clear the boost tracker so a
         # reused solver doesn't carry the previous episode's boosts (no-op under RL).
@@ -977,6 +986,12 @@ class MPCCController(Controller):
         self._apply_tick_weights(obs, thetas)
         t_setp = time.perf_counter()
 
+        if self._trace_path is not None and not self._trace_saved:
+            vc, caut, brk = self._trace_components
+            self._speed_trace.append(
+                (theta0, self.V_TARGET, vc, caut, brk, v_target, float(np.linalg.norm(obs["vel"])))
+            )
+
         status = self._run_sqp(relocalize)
         if self.PROFILE:
             self._profile_tick(t_proj - tic, t_setp - t_proj, time.perf_counter() - t_setp)
@@ -1069,6 +1084,7 @@ class MPCCController(Controller):
         if finishing:
             v_target = 0.0
             thetas = np.full(self._N + 1, self.planner.length)
+            self._trace_components = (self.V_TARGET, 1.0, 0.0)
         else:
             # Brake on the gate barrier using the drone's TRUE progress (geometric projection of the
             # measured position), NOT the inherited progress state theta0. theta0 can lead the real
@@ -1085,8 +1101,10 @@ class MPCCController(Controller):
             brake = float(np.clip((theta_cap - theta_phys) / self.GATE_PASS_LEAD, 0.0, 1.0))
             brake = max(brake, self.GATE_BRAKE_FLOOR)
             v_cruise = self._curvature_speed_cap(theta0)  # slow into sharp turns, full on straights
-            v_target = v_cruise * self._caution_factor(obs) * brake
+            caution = self._caution_factor(obs)  # slow near still-unmeasured objects
+            v_target = v_cruise * caution * brake
             thetas = np.minimum(self._stage_thetas(theta0), theta_cap)
+            self._trace_components = (v_cruise, caution, brake)
         caps = self._build_capsule_params(obs) if self._n_caps else None
         for k in range(self._N + 1):
             theta_i, cx, cy, cz = self._path_segment_coeffs(thetas[k])
@@ -1477,8 +1495,49 @@ class MPCCController(Controller):
         )
         draw_line(sim, center + rot.apply(local), rgba=rgba)
 
+    def _save_speed_trace(self) -> None:
+        """Dump the finished episode's per-tick speed-target trace to ``MPCC_SPEED_TRACE`` (npz).
+
+        Columns let a plot attribute each drop separately: ``v_tgt`` is the flat cruise ceiling,
+        ``v_cruise`` = ceiling after the curvature cap, ``caution``/``brake`` are the two remaining
+        multipliers, and ``v_target`` = v_cruise*caution*brake is what the MPCC actually used.
+        """
+        tr = np.asarray(self._speed_trace, dtype=float)  # (T, 7)
+        gate_thetas = getattr(self.planner, "gate_thetas", None)
+        gate_thetas = np.asarray(gate_thetas, float) if gate_thetas is not None else np.array([])
+
+        # Project each obstacle onto the path: its nearest arc length (the point where the pole sits
+        # tangential to the racing line) and the in-plane clearance there, so the plot can mark it.
+        dense = np.asarray(self.planner._path_dense, float)
+        s_dense = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(dense, axis=0), axis=1))))
+        obst = np.asarray(self._last_obs.get("obstacles_pos", []), float).reshape(-1, 3)
+        obst_thetas = np.array([s_dense[np.argmin(np.linalg.norm(dense[:, :2] - o[:2], axis=1))]
+                                for o in obst])
+        obst_clear = np.array([np.min(np.linalg.norm(dense[:, :2] - o[:2], axis=1)) for o in obst])
+        np.savez(
+            self._trace_path,
+            theta=tr[:, 0],
+            v_tgt=tr[:, 1],
+            v_cruise=tr[:, 2],
+            caution=tr[:, 3],
+            brake=tr[:, 4],
+            v_target=tr[:, 5],
+            speed=tr[:, 6],
+            gate_thetas=gate_thetas,
+            obstacle_thetas=obst_thetas,
+            obstacle_clear=obst_clear,
+            path_length=float(self.planner.length),
+            freq=float(1.0 / self._dt),
+            caution_factor=float(self.CAUTION_SPEED_FACTOR),
+            caution_radius=float(self.CAUTION_RADIUS),
+        )
+        print(f"[MPCC] saved speed trace ({len(tr)} ticks) -> {self._trace_path}")
+
     def episode_callback(self) -> None:
         """Clear the warm-start caches and cancel any in-flight replan between episodes."""
+        if self._trace_path is not None and self._speed_trace and not self._trace_saved:
+            self._save_speed_trace()
+            self._trace_saved = True
         self._theta_pred = None
         self._pos_pred = None
         self._x_pred = None
